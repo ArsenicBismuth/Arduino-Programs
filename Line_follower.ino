@@ -17,9 +17,10 @@ const int linec=1;            //1 or -1, -1 for white line
 const int ltrange=20;         //The count of light sensor data evaluated before averaged, remember 32767.
 const int calibrange=30;      //The count of light sensor data evaluated for calibrating, remember 32767.
 const bool idle=false;        //For debugging lights, turning off motor
+const int controldur=200;     //Duration for control procedure to change it's behavior
 
 //Calibration
-int whitethreshold[lts+1]={980,375,980};
+int whitethreshold[lts+1]={980,375,980};  //Left, middle, and right threshold respectively
 int redthreshold=200;
 
 //Calculation variables
@@ -28,13 +29,15 @@ int analogavg[lts+1]={999};
 int normal=255*speedratio/10;           //Maximum speed tweaked by speedratio
 int slower=(255-turnc)*speedratio/10;   //Reduced maximum speed for turning purpose
 
-unsigned long prevmillis=0;
 int priority=0;                         //Light sensor priority, refers to the index from lightpin
 int temp;
 int dored=true;
 bool docolor=false;
 int prevcl=redthreshold+1;
 int counter=0;
+int previndex=-1;
+unsigned long prevmil[2]={0};
+unsigned long mil[2]={0};
 
 void setup() {
   Serial.begin(9600);
@@ -54,6 +57,7 @@ void loop() {
 }
 
 int ltsens() {
+  //Returns the light index
   //Error handling
   for (int i=0;i<=lts;i++) {
     analogsum[i]+=analogRead(lightpin[i]);
@@ -62,7 +66,7 @@ int ltsens() {
   }
   Serial.println();
   counter+=1;
-  //Gather 10 data, then average them. Reduce fluctation for bad sensors.
+  //Gather 10 data, then average them. Reducing fluctation.
   if (counter>=ltrange) {
     for (int i=0;i<=lts;i++) analogavg[i]=analogsum[i]/counter;
     memset(analogsum,0,sizeof(analogsum));  //Fill with zeros
@@ -79,12 +83,17 @@ int ltsens() {
 }
 
 void control(int index) {
+  mil[1]=millis();
   //Remember that light indexes are 0, .. ,x, .. ,lts-1 or direction-wise leftmost, .. ,middle, .. ,rightmost
+  if (mil[1]-prevmil[1]>=controldur) {  //Change control behavior only after a duration of time
+    prevmil[1]=mil[1];
+    previndex=index;
+  } else index=previndex;
   switch (index) {
-    case -1: motor(0,0); break;           //Stop command
-    case 0: motor(slower,normal); break;  //Leftmost
-    case 2: motor(normal,slower); break;  //Rightmost
-    default: motor(normal,normal); break; //Middle, or 1 as index
+      case -1: motor(0,0); break;           //Stop command
+      case 0: motor(slower,normal); break;  //Leftmost
+      case 2: motor(normal,slower); break;  //Rightmost
+      default: motor(normal,normal); break; //Middle, or 1 as index
   }
 }
 
@@ -122,9 +131,9 @@ void noline() {
 }
 
 void clcontrol() {
-  unsigned long currmillis = millis();
-  if (currmillis-prevmillis>=clinterval){
-    prevmillis=currmillis; //Store prev time it blinked
+  mil[0] = millis();
+  if (mil[0]-prevmil[0]>=clinterval){
+    prevmil[0]=mil[0]; //Store prev time it blinked
     //Since only one LED at a time, this is the algorithm used
     digitalWrite(redpin,dored);
     digitalWrite(greenpin,!dored);
