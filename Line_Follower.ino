@@ -1,8 +1,20 @@
+//Libraries
+
+//Structures
+struct sensor{
+  int pin;
+  int thold;
+};
+
 //Hardware specs
-const int lightpin[]={1,2,3};       //Left, middle, & right light sensors (analog)
-const int lts=sizeof(lightpin)/sizeof(int)-1;   //Total element in lightpin minus by 1
+const int lts=3-1;    //Don't erase the -1
+sensor light[]={      //Analog pin
+  {1,980},  //Left
+  {2,375},  //Middle
+  {3,980}   //Right
+};
+sensor color={5,200};
 const int motorpin[]={5,6,9,10};    //Motors (PWM, digital)
-const int colorpin=5;               //Color sensor (analog)
 const int redpin=8;                 //red LED (digital)
 const int greenpin=7;               //green LED (digital)
 const int prioritypin=2;            //Priority switch (digital)
@@ -19,11 +31,7 @@ const int calibrange=30;      //The count of light sensor data evaluated for cal
 const bool idle=false;        //For debugging lights, turning off motor
 const int controldur=200;     //Duration for control procedure to change it's behavior
 
-//Calibration
-int whitethreshold[lts+1]={980,375,980};  //Left, middle, and right threshold respectively
-int redthreshold=200;
-
-//Calculation variables
+//Calculation
 int analogsum[lts+1]={0};
 int analogavg[lts+1]={999};
 int normal=255*speedratio/10;           //Maximum speed tweaked by speedratio
@@ -33,7 +41,7 @@ int priority=0;                         //Light sensor priority, refers to the i
 int temp;
 int dored=true;
 bool docolor=false;
-int prevcl=redthreshold+1;
+int prevcl=color.thold+1;
 int counter=0;
 int previndex=-1;
 unsigned long prevmil[2]={0};
@@ -75,7 +83,7 @@ int ltsens() {
   //Returns the light index
   //Error handling
   for (int i=0;i<=lts;i++) {
-    analogsum[i]+=analogRead(lightpin[i]);
+    analogsum[i]+=analogRead(light[i].pin);
     Serial.print(analogsum[i]); Serial.print(' ');
     Serial.print(analogavg[i]); Serial.print(" | ");
   }
@@ -91,7 +99,7 @@ int ltsens() {
   //Checks light sensors. Starts from the highest priority.
   int i=priority;
   while ((i>=0) and (i<=lts)) {
-    if ((analogavg[i]*linec)<(whitethreshold[i]*linec)) return i; //If current sensor is true, directly returns the sensor index.
+    if ((analogavg[i]*linec)<(light[i].thold*linec)) return i; //If current sensor is true, directly returns the sensor index.
     if (priority == lts) i--; else i++;
   }
   return 99;  //If nothing found
@@ -167,15 +175,15 @@ void clsens() {
   /* If current red light is on and current color sensor passed the red threshold meanshile the
    *  previous color sensor data showed a lower-than-threshold value, then it's genuinely in a red
    *  area. */
-  Serial.write(analogRead(colorpin));
-  if((dored)&&(analogRead(colorpin)>redthreshold)&&(prevcl<redthreshold)) {
+  Serial.write(analogRead(color.pin));
+  if((dored)&&(analogRead(color.pin)>color.thold)&&(prevcl<color.thold)) {
     //If it's in red area, delay for 4s.
     control(-1);  //Making sure the motors are stopped
     delay(4000);
     //Disable further color control until new session, since there's only one red area.
     docolor=false;
   }
-  prevcl=analogRead(colorpin);
+  prevcl=analogRead(color.pin);
 }
 
 void calibrate(){
@@ -214,8 +222,8 @@ void calibrate(){
   Serial.println("Result:");
   //Setting new light thresholds value, current method: Getting the middle value between averages
   for (int i=0;i<=lts;i++) {
-    whitethreshold[i]=(lightavg[i]+analogavg[i])/2;
-    Serial.println(whitethreshold[i]);
+    light[i].thold=(lightavg[i]+analogavg[i])/2;
+    Serial.println(light[i].thold);
   }
   
   //Currently, the calibrating evaluation method is pretty simple. Might changes if it isn't good enough.
@@ -232,7 +240,7 @@ void getanalogavg(int avgrange){  //Fill in analogsum and analogavg
   
   for (int j=0;j<=avgrange;j++) {
     for (int i=0;i<=lts;i++) {
-      analogsum[i]+=analogRead(lightpin[i]);
+      analogsum[i]+=analogRead(light[i].pin);
       Serial.print(analogsum[i]); Serial.print(' ');
       if (j>=avgrange) analogavg[i]=analogsum[i]/j;
     }
