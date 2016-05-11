@@ -44,6 +44,7 @@ void setup() {
   Serial.println();
   pinMode(redpin,OUTPUT);
   pinMode(greenpin,OUTPUT); 
+  pinMode(13,OUTPUT);
 
   /* Using internal pull-up resistors, no addiional resistor needed.
    * Configuring the switch using this method: pin-switch-ground, or just short/unshort it.
@@ -98,13 +99,16 @@ int ltsens() {
 
 void control(int index) {
   mil[1]=millis();
+  if (index==-1) { //Stop command is absolute, no need to wait
+    motor(0,0);
+    return;
+  }
   //Remember that light indexes are 0, .. ,x, .. ,lts-1 or direction-wise leftmost, .. ,middle, .. ,rightmost
   if (mil[1]-prevmil[1]>=controldur) {  //Change control behavior only after a duration of time
     prevmil[1]=mil[1];
     previndex=index;
   } else index=previndex;
   switch (index) {
-      case -1: motor(0,0); break;           //Stop command
       case 0: motor(slower,normal); break;  //Leftmost
       case 2: motor(normal,slower); break;  //Rightmost
       default: motor(normal,normal); break; //Middle, or 1 as index
@@ -197,11 +201,11 @@ void calibrate(){
     //Make sure the sensors are facing the dark surface
     for (int i=0;i<3;i++){  //Blink 3 times
       digitalWrite(13,HIGH);
-      delay(20);
+      delay(10);
       digitalWrite(13,LOW);
-      delay(20);
+      delay(10);
     }
-    delay(500);
+    delay(100);
   }
   
   Serial.println("Dark area");
@@ -221,7 +225,7 @@ void calibrate(){
   memset(analogavg,0,sizeof(analogavg));
 }
 
-void getanalogavg(int avgrange){
+void getanalogavg(int avgrange){  //Fill in analogsum and analogavg
   //Resetting used variables
   memset(analogsum,0,sizeof(analogsum));  //Fill with zeros
   memset(analogavg,0,sizeof(analogavg));
@@ -230,8 +234,9 @@ void getanalogavg(int avgrange){
     for (int i=0;i<=lts;i++) {
       analogsum[i]+=analogRead(lightpin[i]);
       Serial.print(analogsum[i]); Serial.print(' ');
-      if (j>=calibrange) analogavg[i]=analogsum[i]/j;
+      if (j>=avgrange) analogavg[i]=analogsum[i]/j;
     }
     Serial.println();
+    delay(30);
   }
 }
