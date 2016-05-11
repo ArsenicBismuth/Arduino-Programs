@@ -10,16 +10,17 @@ const int calibratepin=3;           //Calibrate switch or button (digital)
 
 //Settings
 const int speedratio=10;      //0 until 10
-const int turnc=255;          //The sharpness of turning. Range of 0-510, with 510 being centered turn and 0 being straight
+const int turnc=150;          //The sharpness of turning. Range of 0-510, with 510 being centered turn and 0 being straight
 const int delayc=50;          //The repetition of 10ms delay before turning when no line is detected. Ex for dotted lines
 const int clinterval=60;      //interval of coloured led blink (ms)
 const int linec=1;            //1 or -1, -1 for white line
 const int ltrange=20;         //The count of light sensor data evaluated before averaged, remember 32767.
 const int calibrange=30;      //The count of light sensor data evaluated for calibrating, remember 32767.
 const bool idle=false;        //For debugging lights, turning off motor
+const int controldur=200;     //Duration for control procedure to change it's behavior
 
 //Calibration
-int whitethreshold[lts+1]={980,375,980};
+int whitethreshold[lts+1]={980,375,980};  //Left, middle, and right threshold respectively
 int redthreshold=200;
 
 //Calculation variables
@@ -28,32 +29,49 @@ int analogavg[lts+1]={999};
 int normal=255*speedratio/10;           //Maximum speed tweaked by speedratio
 int slower=(255-turnc)*speedratio/10;   //Reduced maximum speed for turning purpose
 
-unsigned long prevmillis=0;
 int priority=0;                         //Light sensor priority, refers to the index from lightpin
 int temp;
 int dored=true;
 bool docolor=false;
 int prevcl=redthreshold+1;
 int counter=0;
+int previndex=-1;
+unsigned long prevmil[2]={0};
+unsigned long mil[2]={0};
 
 void setup() {
   Serial.begin(9600);
   Serial.println();
-  pinMode(redpin, OUTPUT);
-  pinMode(greenpin, OUTPUT); 
+  pinMode(redpin,OUTPUT);
+  pinMode(greenpin,OUTPUT); 
+
+  /* Using internal pull-up resistors, no addiional resistor needed.
+   * Configuring the switch using this method: pin-switch-ground, or just short/unshort it.
+   * This causes the pin to read HIGH when the switch is open, instead of the opposite.
+   */
+  pinMode(calibratepin,INPUT);
+  pinMode(prioritypin,INPUT);
+  digitalWrite(calibratepin,HIGH);  //Turns on pull-up resistors in the chip
+  digitalWrite(prioritypin,HIGH);
+  
   delay(10);
-  priority=lts*digitalRead(prioritypin);  //Priority switch. Making priority 0 or lts
+  priority=lts*!digitalRead(prioritypin);  //Priority switch. Making priority 0 or lts
   Serial.println(priority);
 }
 
 void loop() {
-  if (digitalRead(calibratepin)) calibrate();
+  if (!digitalRead(calibratepin)) {
+    control(-1);
+    calibrate();
+    return;     //Ignore another command this loop
+  }
   if ((temp=ltsens())!=99) control(temp); //Pass the light sensor index into control if ltsens is other than 99.
   else noline();                          //If ltsens returns 99, light sensor doesn't catch anything.
   clcontrol();                            //Process color control
 }
 
 int ltsens() {
+  //Returns the light index
   //Error handling
   for (int i=0;i<=lts;i++) {
     analogsum[i]+=analogRead(lightpin[i]);
@@ -62,7 +80,7 @@ int ltsens() {
   }
   Serial.println();
   counter+=1;
-  //Gather 10 data, then average them. Reduce fluctation for bad sensors.
+  //Gather 10 data, then average them. Reducing fluctation.
   if (counter>=ltrange) {
     for (int i=0;i<=lts;i++) analogavg[i]=analogsum[i]/counter;
     memset(analogsum,0,sizeof(analogsum));  //Fill with zeros
@@ -79,12 +97,17 @@ int ltsens() {
 }
 
 void control(int index) {
+  mil[1]=millis();
   //Remember that light indexes are 0, .. ,x, .. ,lts-1 or direction-wise leftmost, .. ,middle, .. ,rightmost
+  if (mil[1]-prevmil[1]>=controldur) {  //Change control behavior only after a duration of time
+    prevmil[1]=mil[1];
+    previndex=index;
+  } else index=previndex;
   switch (index) {
-    case -1: motor(0,0); break;           //Stop command
-    case 0: motor(slower,normal); break;  //Leftmost
-    case 2: motor(normal,slower); break;  //Rightmost
-    default: motor(normal,normal); break; //Middle, or 1 as index
+      case -1: motor(0,0); break;           //Stop command
+      case 0: motor(slower,normal); break;  //Leftmost
+      case 2: motor(normal,slower); break;  //Rightmost
+      default: motor(normal,normal); break; //Middle, or 1 as index
   }
 }
 
@@ -122,9 +145,9 @@ void noline() {
 }
 
 void clcontrol() {
-  unsigned long currmillis = millis();
-  if (currmillis-prevmillis>=clinterval){
-    prevmillis=currmillis; //Store prev time it blinked
+  mil[0] = millis();
+  if (mil[0]-prevmil[0]>=clinterval){
+    prevmil[0]=mil[0]; //Store prev time it blinked
     //Since only one LED at a time, this is the algorithm used
     digitalWrite(redpin,dored);
     digitalWrite(greenpin,!dored);
@@ -160,17 +183,16 @@ void calibrate(){
    * 5.Turn off switch
    * 6.Wait until robot somehow moves
    */
-   
   Serial.println("Gathering data for calibration.");
   
   //Make sure the sensors are facing the light surface
   int lightavg[lts+1]={0};
   Serial.println("Light area");
-  getanalogavg();
+  getanalogavg(calibrange);
   memcpy(lightavg,analogavg,sizeof(analogavg)); //Copying array
 
   //Indicator
-  while (digitalRead(calibratepin)){
+  while (!digitalRead(calibratepin)){ //Remember it's inverted
     //Waiting for the calibrate switch to be turned off
     //Make sure the sensors are facing the dark surface
     for (int i=0;i<3;i++){  //Blink 3 times
@@ -183,10 +205,14 @@ void calibrate(){
   }
   
   Serial.println("Dark area");
-  getanalogavg();
+  getanalogavg(calibrange);
 
+  Serial.println("Result:");
   //Setting new light thresholds value, current method: Getting the middle value between averages
-  for (int i=0;i<=lts;i++) whitethreshold[i]=(lightavg[i]+analogavg[i])/2;
+  for (int i=0;i<=lts;i++) {
+    whitethreshold[i]=(lightavg[i]+analogavg[i])/2;
+    Serial.println(whitethreshold[i]);
+  }
   
   //Currently, the calibrating evaluation method is pretty simple. Might changes if it isn't good enough.
 
@@ -195,12 +221,12 @@ void calibrate(){
   memset(analogavg,0,sizeof(analogavg));
 }
 
-void getanalogavg(){
+void getanalogavg(int avgrange){
   //Resetting used variables
   memset(analogsum,0,sizeof(analogsum));  //Fill with zeros
   memset(analogavg,0,sizeof(analogavg));
   
-  for (int j=0;j<=calibrange;j++) {
+  for (int j=0;j<=avgrange;j++) {
     for (int i=0;i<=lts;i++) {
       analogsum[i]+=analogRead(lightpin[i]);
       Serial.print(analogsum[i]); Serial.print(' ');
