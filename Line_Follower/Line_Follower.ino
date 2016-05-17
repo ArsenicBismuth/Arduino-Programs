@@ -28,13 +28,11 @@ const int speedratio=10;      //0 until 10
 const int turnc=255;          //The sharpness of turning. Range of 0-510, with 510 being centered turn and 0 being straight
 const int delayc=50;          //The repetition of 10ms delay before turning when no line is detected. Ex for dotted lines
 const int clinterval=60;      //interval of coloured led blink (ms)
-const int linec=-1;           //1 or -1, -1 for white line. Update: Not necessarily true.
-                              //Just do a check with computer once to make sure which area returns higher value.
-                              //Thus, 1 if line value < surrounding and the opposite for -1.
 const int ltrange=1;          //The count of light sensor data evaluated before averaged, remember 32767.
 const int calibrange=30;      //The count of light sensor data evaluated for calibrating, remember 32767.
 const bool idle=false;        //For debugging lights, turning off motor
 const int controldur=0;       //Duration for control procedure to change it's behavior
+int linec=-1;                 //1 or -1, -1 for white line. Update: Not necessarily true. 1 if line value < surrounding.
 
 //Calculation
 int analogsum[lts+1]={0};
@@ -159,11 +157,13 @@ void noline() {
     delay(10);
     control(previndex);       //Continue previous action
     if (ltsens()!=99) return; //until it detects new line
+    if (!digitalRead(calibratepin)) return; //If calibrate switch is on
     Serial.print("No ");
   }                           //or the specified time passed
   //If loop ends without finding anything
   //turns in the direction of priority until it actually catches anything
-  while (ltsens()==99) control(priority);
+  //Also directly stop if calibrate switch is on
+  while ((ltsens()==99)&&(digitalRead(calibratepin))) control(priority);
 }
 
 void clcontrol() {
@@ -197,28 +197,20 @@ void clsens() {
 }
 
 void calibrate(){
-  /* The order is free, but make sure to start with the area that
-   * makes all motors stop.
-   * Continously moving motor(s) is caused by the noline procedure
-   * in which it'll only stop if it's detecting a line.
-   */
   /* Calibrating light threshold. Procedure:
-   * 1.Face all sensors into one of the areas (dark or light)
+   * 1.Face all sensors into the line
    * 2.Turn on switch
-   * 3.Make sure no motor is moving
-   * 4.If it's still moving, restart the procedure but with the other area
    * 4.Wait until Arduino built-in LED blinks 3 times
-   * 5.Face all sensors into another area
+   * 5.Face all sensors into surrounding area
    * 6.Turn off switch
    * 7.Wait until robot somehow moves
    */
   Serial.println("Gathering data for calibration.");
   
-  //Make sure the sensors are facing the light surface
-  int lightavg[lts+1]={0};
+  int lineavg[lts+1]={0};
   Serial.println("First area");
   getanalogavg(calibrange);
-  memcpy(lightavg,analogavg,sizeof(analogavg)); //Copying array
+  memcpy(lineavg,analogavg,sizeof(analogavg)); //Copying array
 
   //Indicator
   while (!digitalRead(calibratepin)){ //Remember it's inverted
@@ -236,12 +228,16 @@ void calibrate(){
   Serial.println("Second area");
   getanalogavg(calibrange);
 
+  linec=1-(lineavg[0]>analogavg[0])*2;  //Will be -1 if surrounding[0] is smaller than line[0]
+  
   Serial.println("Result:");
+  Serial.print(linec);
   //Setting new light thresholds value, current method: Getting the middle value between averages
   for (int i=0;i<=lts;i++) {
-    light[i].thold=(lightavg[i]+analogavg[i])/2;
+    light[i].thold=(lineavg[i]+analogavg[i])/2;
     Serial.println(light[i].thold);
   }
+  
   
   //Currently, the calibrating evaluation method is pretty simple. Might changes if it isn't good enough.
 
