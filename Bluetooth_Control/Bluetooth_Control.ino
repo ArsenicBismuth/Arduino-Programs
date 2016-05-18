@@ -19,7 +19,7 @@ int turnratio=0;                  //Ranges from -mxtrn to mxtrn, with mxtrn bein
 
 //Calculation
 
-int code=-1;
+int code=0;
 int temp;
 int counter=0;
 String s;
@@ -47,13 +47,11 @@ void loop() {
     }
   }
   Serial.println();
-  speedratio=10;
-  turnratio=51;
+  control(code);
   int normal=255*speedratio/mxspd;                  //Maximum speed tweaked by speedratio
   int reducer=255*2*turnratio/mxtrn;
   int slower=(255-abs(reducer))*speedratio/mxspd;   //Reduced maximum speed for turning purpose
   motor((turnratio>=0)*normal+(turnratio<0)*slower,(turnratio<=0)*normal+(turnratio>0)*slower);
-  control(code);
 }
 
 void control(int index) {
