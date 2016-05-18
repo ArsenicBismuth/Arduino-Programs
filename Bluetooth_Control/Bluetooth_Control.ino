@@ -4,9 +4,8 @@
 //Structures
 
 //Hardware specs
-SoftwareSerial bt(8,12);             //RX, TX; thus the opposite for the BT module
-const int motorpin[] {4,6,10,11};   //Motors (digital), use inverter to get 2 more spaces
-const int motorpwmpin[] {5,9};      //Enable pin for IC (PWM), smooth voltage change.
+SoftwareSerial bt(8,12);          //RX, TX; thus the opposite for the BT module
+const int motorpin[] {5,6,9,10}; //Motors (PWM)
 
 //App specs
 const int mxspd=10;
@@ -19,9 +18,6 @@ int speedratio=0;                 //-mcspd until mcspd
 int turnratio=0;                  //Ranges from -mxtrn to mxtrn, with mxtrn being centered right turn and 0 being straight.
 
 //Calculation
-int reducer=turnratio*(255*2/mxtrn);
-int normal=255*speedratio/mxspd;               //Maximum speed tweaked by speedratio
-int slower=(255-reducer)*speedratio/mxspd;   //Reduced maximum speed for turning purpose
 
 int code=-1;
 int temp;
@@ -37,7 +33,6 @@ void setup() {
   
   pinMode(13,OUTPUT); //Indicator light
   for (int i=0;i<sizeof(motorpin)/sizeof(const int);i++) pinMode(motorpin[i],OUTPUT);
-  for (int i=0;i<sizeof(motorpwmpin)/sizeof(const int);i++) pinMode(motorpwmpin[i],OUTPUT);
   delay(10);
 }
 
@@ -52,11 +47,11 @@ void loop() {
     }
   }
   Serial.println();
-  speedratio=9;
+  speedratio=10;
   turnratio=51;
-  normal=255*speedratio/mxspd;                //Maximum speed tweaked by speedratio
-  reducer=255*2*turnratio/mxtrn;
-  slower=(255-abs(reducer))*speedratio/mxspd;   //Reduced maximum speed for turning purpose
+  int normal=255*speedratio/mxspd;                  //Maximum speed tweaked by speedratio
+  int reducer=255*2*turnratio/mxtrn;
+  int slower=(255-abs(reducer))*speedratio/mxspd;   //Reduced maximum speed for turning purpose
   motor((turnratio>=0)*normal+(turnratio<0)*slower,(turnratio<=0)*normal+(turnratio>0)*slower);
   control(code);
 }
@@ -70,12 +65,9 @@ void control(int index) {
 void motor(int left,int right) {
   Serial.print(left);Serial.print(' ');Serial.print(right);Serial.print(' ');
   if (idle) return;
-  //If using an inverter for each direction, remove the 2nd and 4th line
-  digitalWrite(motorpin[0],(left>=0));  //If this is high
-  digitalWrite(motorpin[1],!(left>=0)); //this is low
-  digitalWrite(motorpin[2],(right>=0));
-  digitalWrite(motorpin[3],!(right>=0));
-  //PWM output, allowing speed control
-  analogWrite(motorpwmpin[0],abs(left));
-  analogWrite(motorpwmpin[1],abs(right));
+  //PWM into input pins
+  analogWrite(motorpin[0],(left>=0)*abs(left));  //If this is PWM left
+  analogWrite(motorpin[1],!(left>=0)*abs(left)); //this is 0
+  analogWrite(motorpin[2],(right>=0)*abs(right));
+  analogWrite(motorpin[3],!(right>=0)*abs(right));
 }

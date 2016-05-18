@@ -16,8 +16,7 @@ sensor light[]={      //Analog pin
 };
 const int lts=sizeof(light)/sizeof(sensor)-1;    //Don't erase the -1
 sensor color={5,200};
-const int motorpin[] {4,5,10,11};   //Motors (digital), use inverter to get 2 more spaces
-const int motorpwmpin[] {6,9};      //Enable pin for IC (PWM), smooth voltage change.
+const int motorpin[] {5,6,9,10};   //Motors (PWM)
 const int redpin=8;                 //red LED (digital)
 const int greenpin=7;               //green LED (digital)
 const int prioritypin=2;            //Priority switch (digital)
@@ -56,12 +55,7 @@ void setup() {
   pinMode(redpin,OUTPUT);
   pinMode(greenpin,OUTPUT); 
   pinMode(13,OUTPUT);               //Indicator light
-  for (int i=0;i<sizeof(motorpin)/sizeof(int);i++){
-    pinMode(motorpin[i],OUTPUT);
-  }
-  for (int i=0;i<sizeof(motorpwmpin)/sizeof(int);i++){
-    pinMode(motorpwmpin[i],OUTPUT);
-  }
+  for (int i=0;i<sizeof(motorpin)/sizeof(int);i++) pinMode(motorpin[i],OUTPUT);
 
   /* Using internal pull-up resistors, no addiional resistor needed.
    * Configuring the switch using this method: pin-switch-ground, or just short/unshort it.
@@ -140,14 +134,11 @@ void control(int index) {
 void motor(int left,int right) {
   Serial.print(left);Serial.print(' ');Serial.print(right);Serial.print(' ');
   if (idle) return;
-  //If using an inverter for each direction, remove the 2nd and 4th line
-  digitalWrite(motorpin[0],(left>=0));  //If this is high
-  digitalWrite(motorpin[1],!(left>=0)); //this is low
-  digitalWrite(motorpin[2],(right>=0));
-  digitalWrite(motorpin[3],!(right>=0));
-  //PWM output, allowing speed control
-  analogWrite(motorpwmpin[0],abs(left));
-  analogWrite(motorpwmpin[1],abs(right));
+  //PWM into input pins
+  analogWrite(motorpin[0],(left>=0)*abs(left));  //If this is PWM left
+  analogWrite(motorpin[1],!(left>=0)*abs(left)); //this is 0
+  analogWrite(motorpin[2],(right>=0)*abs(right));
+  analogWrite(motorpin[3],!(right>=0)*abs(right));
 }
 
 void noline() {
