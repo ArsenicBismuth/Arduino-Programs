@@ -141,8 +141,8 @@ void motor(int left,int right) {
   Serial.print(left);Serial.print(' ');Serial.print(right);Serial.print(' ');
   if (idle) return;
   //If using an inverter for each direction, remove the 2nd and 4th line
-  digitalWrite(motorpin[2],(left>=0));  //If this is high
-  digitalWrite(motorpin[3],!(left>=0)); //this is low
+  digitalWrite(motorpin[0],(left>=0));  //If this is high
+  digitalWrite(motorpin[1],!(left>=0)); //this is low
   digitalWrite(motorpin[2],(right>=0));
   digitalWrite(motorpin[3],!(right>=0));
   //PWM output, allowing speed control

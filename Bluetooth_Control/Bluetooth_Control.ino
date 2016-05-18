@@ -4,16 +4,14 @@
 //Structures
 
 //Hardware specs
-SoftwareSerial bt(7,12);             //RX, TX; thus the opposite for the BT module
-const int motorpin[] {4,5,10,11};   //Motors (digital), use inverter to get 2 more spaces
-const int motorpwmpin[] {6,9};      //Enable pin for IC (PWM), smooth voltage change.
+SoftwareSerial bt(8,12);             //RX, TX; thus the opposite for the BT module
+const int motorpin[] {4,6,10,11};   //Motors (digital), use inverter to get 2 more spaces
+const int motorpwmpin[] {5,9};      //Enable pin for IC (PWM), smooth voltage change.
 
 //App specs
 const int mxspd=10;
 const int mxtrn=51;
 //Avoids negative
-
-  
 
 //Settings
 const bool idle=false;            //For debugging, turning off motor
@@ -38,12 +36,8 @@ void setup() {
   bt.println("Connected");
   
   pinMode(13,OUTPUT); //Indicator light
-  for (int i=0;i<sizeof(motorpin)/sizeof(int);i++){
-    pinMode(motorpin[i],OUTPUT);
-  }
-  for (int i=0;i<sizeof(motorpwmpin)/sizeof(int);i++){
-    pinMode(motorpwmpin[i],OUTPUT);
-  }
+  for (int i=0;i<sizeof(motorpin)/sizeof(const int);i++) pinMode(motorpin[i],OUTPUT);
+  for (int i=0;i<sizeof(motorpwmpin)/sizeof(const int);i++) pinMode(motorpwmpin[i],OUTPUT);
   delay(10);
 }
 
@@ -52,14 +46,17 @@ void loop() {
     char c=bt.read();                 //Store chars
     s.concat(c);                      //Combine chars received
     switch(c){
-      case 's':speedratio=s.toInt()-mxspd; s=""; break;  //Input ranges from 0 to 20
-      case 't':speedratio=s.toInt()-mxtrn; s=""; break;  //Ranges from 0 to 102
-      case 'c':code=s.toInt(); s=""; break;
+      case 's':speedratio=s.toInt()-mxspd; Serial.print(s); s=""; break;  //Input ranges from 0 to 20
+      case 't':turnratio=s.toInt()-mxtrn; Serial.print(s); s=""; break;  //Ranges from 0 to 102
+      case 'c':code=s.toInt(); Serial.print(s); s=""; break;
     }
   }
-  normal=255*speedratio/10;                //Maximum speed tweaked by speedratio
-  reducer=turnratio*(255*2/mxtrn);
-  slower=(255-reducer)*speedratio/mxspd;   //Reduced maximum speed for turning purpose
+  Serial.println();
+  speedratio=9;
+  turnratio=51;
+  normal=255*speedratio/mxspd;                //Maximum speed tweaked by speedratio
+  reducer=255*2*turnratio/mxtrn;
+  slower=(255-abs(reducer))*speedratio/mxspd;   //Reduced maximum speed for turning purpose
   motor((turnratio>=0)*normal+(turnratio<0)*slower,(turnratio<=0)*normal+(turnratio>0)*slower);
   control(code);
 }
@@ -74,8 +71,8 @@ void motor(int left,int right) {
   Serial.print(left);Serial.print(' ');Serial.print(right);Serial.print(' ');
   if (idle) return;
   //If using an inverter for each direction, remove the 2nd and 4th line
-  digitalWrite(motorpin[2],(left>=0));  //If this is high
-  digitalWrite(motorpin[3],!(left>=0)); //this is low
+  digitalWrite(motorpin[0],(left>=0));  //If this is high
+  digitalWrite(motorpin[1],!(left>=0)); //this is low
   digitalWrite(motorpin[2],(right>=0));
   digitalWrite(motorpin[3],!(right>=0));
   //PWM output, allowing speed control
