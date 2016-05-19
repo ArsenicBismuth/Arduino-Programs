@@ -56,7 +56,7 @@ void loop() {
 
 void control(int index) {
   switch (index) {
-    case -1: motor(0,0); return;           //Stop
+    case -1: motor(0,0); return;                    //Stop
   }
 }
 
