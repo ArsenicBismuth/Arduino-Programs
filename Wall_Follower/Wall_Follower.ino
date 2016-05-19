@@ -17,7 +17,7 @@ const int motorpin[] {5,6,9,10};   //Motors (PWM)
 const int prioritypin=2;           //Priority switch (digital)
 
 //Settings
-const int dis[]={500,400,500};  //Asked distance (in ms). Left, front, right.
+const int dis[]={500,300,500};  //Asked distance (in ms). Left, front, right.
 const int speedratio=10;        //0 until 10
 const int turncratio=0;         //The sharpness of turning. Range of 0-510, with 510 being centered turn and 0 being straight
 const int maxturn=200;          //Only for side detection
@@ -93,9 +93,10 @@ void ussensor(int single) {
 
 void control() {
   //If there's wall upfront or it isn't straight
-  if (ms[1]<=dis[1]&&ms[1]!=0) {
+  if (ms[1]<=dis[1]&&ms[1]>100) {  //m[1]>100 because of fluctation
     do {
       motor(normal,reduce(510));
+      delay(500);
       ussensor(1);                //Recheck only front
     } while (ms[1]!=0);
     return;
