@@ -1,6 +1,5 @@
 //Libraries
 #include <NewPing.h>
-#include <PID_v1.h>
 
 //Structures
 
@@ -8,9 +7,9 @@
 const int maxdis=300;   //cm
 const int maxdis2=15;   //cm
 NewPing sonar[]={       //Digital pin
-  NewPing(3,4,maxdis),  //Left
-  NewPing(7,8,maxdis2),  //Front
-  NewPing(11,12,maxdis) //Right
+  NewPing(3,4,maxdis2),  //Left
+  NewPing(7,8,maxdis),  //Front
+  NewPing(11,12,maxdis2) //Right
 };
 const int snr=sizeof(sonar)/sizeof(NewPing)-1;    //Don't erase the -1
 const int motorpin[] {5,6,9,10};   //Motors (PWM)
@@ -18,18 +17,19 @@ const int prioritypin=2;           //Priority switch (digital)
 
 //Settings
 const int dis[]={500,400,500};  //Asked distance (in ms). Left, front, right.
-const int speedratio=10;        //0 until 10
-const int turncratio=0;         //The sharpness of turning. Range of 0-510, with 510 being centered turn and 0 being straight
-const int maxturn=200;          //Only for side detection
-const int delayc=50;            //The repetition of 10ms delay before turning when no line is detected. Ex for dotted lines
-const bool idle=false;          //For debugging lights, turning off motor
-const int controldur=0;         //Duration for control procedure to change it's behavior
+const int speedratio=10;      //0 until 10
+const int turncratio=0;       //The sharpness of turning. Range of 0-510, with 510 being centered turn and 0 being straight
+const int delayc=50;          //The repetition of 10ms delay before turning when no line is detected. Ex for dotted lines
+const bool idle=false;        //For debugging lights, turning off motor
+const int controldur=0;       //Duration for control procedure to change it's behavior
 
 //Calculation
-double in,out,setpoint;
-PID pid(&in,&out,&setpoint,0.8,0,0,DIRECT);
 int normal=255*speedratio/10;                     //Maximum speed tweaked by speedratio
 int reduce(int x) {return (255-x)*((double)speedratio/10);} //Function for slower speed, with 255 being pivoted and 510 being centered
+int slower=reduce(0);
+double Ee,inp,out;            //Error sum, previous input, & output
+double kp (0.3),ki (0.03),kd (0.4);  //PID Constants
+int tsample (100);            //PID sample time, 1 sec
 
 int priority=1;
 int temp;
@@ -56,9 +56,6 @@ void setup() {
   //Priority can only changes at initialization. Just restart Arduino to change
   priority=2*!digitalRead(prioritypin); //Priority switch. Making priority 0 or 2 (left or right). Default is left.
   Serial.println(priority);
-  pid.SetMode(AUTOMATIC);
-  pid.SetOutputLimits(-maxturn,maxturn);
-  setpoint=dis[priority];
 }
 
 void loop() {
@@ -67,15 +64,8 @@ void loop() {
   Serial.println();
 }
 
-void ussensor() {ussensor(-1);} //Overloading, allows for default value
-void ussensor(int single) {
-  int i=0;
-  int last=snr;
-  if (single!=-1) {
-    i=single;
-    last=single;
-  }
-  for (i;i<=last;i++){
+void ussensor() {
+  for (int i=0;i<=snr;i++){
     delay(30);
     ms[i]=sonar[i].ping();
     Serial.print(ms[i]); Serial.print(' ');
@@ -93,18 +83,14 @@ void ussensor(int single) {
 
 void control() {
   //If there's wall upfront or it isn't straight
-  if (ms[1]<=dis[1]&&ms[1]!=0) {
-    do {
-      motor(normal,reduce(510));
-      ussensor(1);                //Recheck only front
-    } while (ms[1]!=0);
+  if (ms[1]<=dis[1]) {
+    motor(normal,reduce(510));
     return;
   };
-  in=ms[priority];
-  pid.Compute();
+  slower=reduce(-1*pid(dis[priority],ms[priority]));
   
-  if (ms[priority]<=dis[priority]) motor(normal,reduce(out));
-  else motor(reduce(-out),normal);
+  if (ms[priority]<=dis[priority]) motor(normal,slower);
+  else motor(slower,normal);
 }
 
 void motor(int left,int right) {
@@ -116,3 +102,40 @@ void motor(int left,int right) {
   analogWrite(motorpin[2],(right>=0)*abs(right));
   analogWrite(motorpin[3],!(right>=0)*abs(right));
 }
+
+//Currently can only used by a single sensor
+double pid(int asked, int in){
+  //Change in time
+  mil[0]=millis();
+  int dt=(mil[0]-prevmil[0]);
+  if (dt>=tsample){
+    //Calculate error vars
+    double e=asked-in;
+    Ee+=e;
+    double din=(in-inp);
+
+    //Result
+    out=kp*e + ki*Ee + kd*din;
+    
+    inp=in;               //Save input into previous input
+    prevmil[0]=mil[0];
+  }
+  return out;
+}
+
+//For changing the tunings outside IDE
+void tunings(double nkp, double nki, double nkd){
+  double tsamplesec = ((double)tsample)/1000;
+  kp=nkp; ki=nki; kd=nkd;
+}
+
+//For changing the sample time outside IDE
+void setsamplet(int ntsample){
+  if (ntsample>0){
+    double ratio=(double)ntsample/(double)tsample;
+    ki*=ratio;
+    kd/=ratio;
+    tsample=(unsigned long)ntsample;
+  }
+}
+
