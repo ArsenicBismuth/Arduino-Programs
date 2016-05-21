@@ -1,3 +1,4 @@
+
 //Libraries
 #include <NewPing.h>
 #include <PID_v1.h>
@@ -6,10 +7,9 @@
 
 //Hardware specs
 const int maxdis=300;   //cm
-const int maxdis2=15;   //cm
 NewPing sonar[]={       //Digital pin
   NewPing(3,4,maxdis),  //Left
-  NewPing(7,8,maxdis2),  //Front
+  NewPing(7,8,maxdis), //Front
   NewPing(11,12,maxdis) //Right
 };
 const int snr=sizeof(sonar)/sizeof(NewPing)-1;    //Don't erase the -1
@@ -23,7 +23,6 @@ const int turncratio=0;         //The sharpness of turning. Range of 0-510, with
 const int maxturn=200;          //Only for side detection
 const int delayc=50;            //The repetition of 10ms delay before turning when no line is detected. Ex for dotted lines
 const bool idle=false;          //For debugging lights, turning off motor
-const int controldur=0;         //Duration for control procedure to change it's behavior
 
 //Calculation
 double in,out,setpoint;
@@ -34,7 +33,6 @@ int reduce(int x) {return (255-x)*((double)speedratio/10);} //Function for slowe
 int priority=1;
 int temp;
 int counter=0;
-int previndex=-1;
 unsigned long prevmil[1]={0};
 unsigned long mil[1]={0};
 int ms[snr+1];                //Result of ultrasonic sensor in milisecond
@@ -43,11 +41,13 @@ void setup() {
   Serial.begin(9600);
   Serial.println();
   for (int i=0;i<sizeof(motorpin)/sizeof(int);i++) pinMode(motorpin[i],OUTPUT);
+  pid.SetMode(AUTOMATIC);
+  pid.SetOutputLimits(-maxturn,maxturn);
+  setpoint=dis[priority];
 
   /* Using internal pull-up resistors, no addiional resistor needed.
    * Configuring the switch using this method: pin-switch-ground, or just short/unshort it.
-   * This causes the pin to read HIGH when the switch is open, instead of the opposite.
-   */
+   * This causes the pin to read HIGH when the switch is open, instead of the opposite. */
   pinMode(prioritypin,INPUT);
   digitalWrite(prioritypin,HIGH); //Turns on pull-up resistors in the chip
   
@@ -56,9 +56,6 @@ void setup() {
   //Priority can only changes at initialization. Just restart Arduino to change
   priority=2*!digitalRead(prioritypin); //Priority switch. Making priority 0 or 2 (left or right). Default is left.
   Serial.println(priority);
-  pid.SetMode(AUTOMATIC);
-  pid.SetOutputLimits(-maxturn,maxturn);
-  setpoint=dis[priority];
 }
 
 void loop() {
@@ -80,8 +77,7 @@ void ussensor(int single) {
     ms[i]=sonar[i].ping();
     Serial.print(ms[i]); Serial.print(' ');
     /*  For defective sensor in which it will wait forever
-     *  until the sonar is back. Thus resulting 0.
-     */
+     *  until the sonar is back. Thus resulting 0. */
     if (ms[i]==0) {
       //Echo pins, in this case, it's 4,8,12
       pinMode(4*(i+1),OUTPUT);
@@ -93,7 +89,7 @@ void ussensor(int single) {
 
 void control() {
   //If there's wall upfront or it isn't straight
-  if (ms[1]<=dis[1]&&ms[1]>100) {  //m[1]>100 because of fluctation
+  if (ms[1]<=dis[1]){
     do {
       motor(normal,reduce(510));
       delay(500);
