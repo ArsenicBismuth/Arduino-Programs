@@ -10,7 +10,7 @@ const int maxdis=300;   //cm
 NewPing sonar[]={       //Digital pin
   NewPing(3,4,maxdis),  //Left
   NewPing(7,8,maxdis), //Front
-  NewPing(11,12,maxdis) //Right
+  //NewPing(11,12,maxdis) //Right
 };
 const int snr=sizeof(sonar)/sizeof(NewPing)-1;    //Don't erase the -1
 const int motorpin[] {5,6,9,10};   //Motors (PWM)
@@ -18,22 +18,16 @@ const int prioritypin=2;           //Priority switch (digital)
 
 //Settings
 const int dis[]={500,300,500};  //Asked distance (in ms). Left, front, right.
-int speedratio=10;        //0 until 10
-const int turncratio=0;         //The sharpness of turning. Range of 0-510, with 510 being centered turn and 0 being straight
-const int maxturn=200;          //Only for side detection
-const int delayc=50;            //The repetition of 10ms delay before turning when no line is detected. Ex for dotted lines
+double maxturn=0.6;       //Max ratio of spd in PID limit
+int spd=100;                     //Maximum speed tweaked by spd
 const bool idle=false;          //For debugging lights, turning off motor
 
 //Calculation
 double in,out,setpoint;
-double kp(0.8),ki(0),kd(0);
-PID pid(&in,&out,&setpoint,kp,ki,kd,DIRECT);
-int normal=255*speedratio/10;                     //Maximum speed tweaked by speedratio
-int reduce(int x) {return (255-x)*((double)speedratio/10);} //Function for slower speed, with 255 being pivoted and 510 being centered
+double kp(0.5),ki(0),kd(0);
+PID pid(&in,&out,&setpoint,kp,ki,kd,REVERSE);
 
 int priority=1;
-int temp;
-int counter=0;
 unsigned long prevmil[1]={0};
 unsigned long mil[1]={0};
 int ms[snr+1];                //Result of ultrasonic sensor in milisecond
@@ -44,8 +38,8 @@ void setup() {
   Serial.println();
   for (int i=0;i<sizeof(motorpin)/sizeof(int);i++) pinMode(motorpin[i],OUTPUT);
   pid.SetMode(AUTOMATIC);
-  pid.SetOutputLimits(-maxturn,maxturn);
-  setpoint=dis[priority];
+  pid.SetOutputLimits(0,spd*maxturn);
+  setpoint=0;
 
   /* Using internal pull-up resistors, no addiional resistor needed.
    * Configuring the switch using this method: pin-switch-ground, or just short/unshort it.
@@ -72,15 +66,16 @@ void tuning(){
     char c=Serial.read();                 //Store chars
     s.concat(c);                      //Combine chars received
     switch(c){
-      case 's':speedratio=s.toInt(); Serial.print(s); s=""; break;  //Input ranges from 0 to 10
+      case 's':spd=s.toInt(); Serial.print(s); s=""; break;  //Input ranges from 0 to 10
+      case 't':maxturn=s.toInt()/10; Serial.print(s); s=""; break;  //Input ranges from 0 to 10
       case 'p':kp=s.toInt(); Serial.print(s); s=""; break;
       case 'i':ki=s.toInt(); Serial.print(s); s=""; break;
       case 'd':kd=s.toInt(); Serial.print(s); s=""; break;
     }
     pid.SetTunings(kp,ki,kd);
+    pid.SetOutputLimits(0,spd*maxturn);
   }
-  Serial.println();
-}
+} 
 
 void ussensor() {ussensor(-1);} //Overloading, allows for default value
 void ussensor(int single) {
@@ -107,19 +102,19 @@ void ussensor(int single) {
 
 void control() {
   //If there's wall upfront or it isn't straight
-  if (ms[1]<=dis[1]){
+  if (ms[1]<=dis[1]&&ms[1]>0){
     do {
-      motor(normal,reduce(510));
+      motor(spd,-spd);
       delay(500);
       ussensor(1);                //Recheck only front
-    } while (ms[1]!=0);
+    } while (ms[1]!=0&&ms[1]<=dis[0]);
     return;
-  };
-  in=ms[priority];
+  }
+  in=constrain(abs(ms[priority]-dis[priority]),0,ms[priority]);  //Using the difference as PID instead of directly using input
   pid.Compute();
   
-  if (ms[priority]<=dis[priority]) motor(normal,reduce(out));
-  else motor(reduce(-out),normal);
+  if (ms[priority]<=dis[priority]) motor(spd,spd-out);
+  else motor(spd-out,spd);
 }
 
 void motor(int left,int right) {
