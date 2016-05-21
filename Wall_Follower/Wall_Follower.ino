@@ -18,7 +18,7 @@ const int prioritypin=2;           //Priority switch (digital)
 
 //Settings
 const int dis[]={500,300,500};  //Asked distance (in ms). Left, front, right.
-const int speedratio=10;        //0 until 10
+int speedratio=10;        //0 until 10
 const int turncratio=0;         //The sharpness of turning. Range of 0-510, with 510 being centered turn and 0 being straight
 const int maxturn=200;          //Only for side detection
 const int delayc=50;            //The repetition of 10ms delay before turning when no line is detected. Ex for dotted lines
@@ -26,7 +26,8 @@ const bool idle=false;          //For debugging lights, turning off motor
 
 //Calculation
 double in,out,setpoint;
-PID pid(&in,&out,&setpoint,0.8,0,0,DIRECT);
+double kp(0.8),ki(0),kd(0);
+PID pid(&in,&out,&setpoint,kp,ki,kd,DIRECT);
 int normal=255*speedratio/10;                     //Maximum speed tweaked by speedratio
 int reduce(int x) {return (255-x)*((double)speedratio/10);} //Function for slower speed, with 255 being pivoted and 510 being centered
 
@@ -36,6 +37,7 @@ int counter=0;
 unsigned long prevmil[1]={0};
 unsigned long mil[1]={0};
 int ms[snr+1];                //Result of ultrasonic sensor in milisecond
+String s;
 
 void setup() {
   Serial.begin(9600);
@@ -59,8 +61,24 @@ void setup() {
 }
 
 void loop() {
+  tuning();
   ussensor();
   control();
+  Serial.println();
+}
+
+void tuning(){
+  while(Serial.available()){
+    char c=Serial.read();                 //Store chars
+    s.concat(c);                      //Combine chars received
+    switch(c){
+      case 's':speedratio=s.toInt(); Serial.print(s); s=""; break;  //Input ranges from 0 to 10
+      case 'p':kp=s.toInt(); Serial.print(s); s=""; break;
+      case 'i':ki=s.toInt(); Serial.print(s); s=""; break;
+      case 'd':kd=s.toInt(); Serial.print(s); s=""; break;
+    }
+    pid.SetTunings(kp,ki,kd);
+  }
   Serial.println();
 }
 
