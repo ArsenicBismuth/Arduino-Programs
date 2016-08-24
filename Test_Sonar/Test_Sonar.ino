@@ -4,11 +4,11 @@
 //Structures
 
 //Hardware specs
-const int maxdis=100;   //cm
+const int maxdis=400;   //cm
 NewPing sonar[]={       //Digital pin
   NewPing(3,4,maxdis),  //Left
   NewPing(7,8,maxdis),  //Front
-  NewPing(11,12,maxdis) //Right
+  //NewPing(11,12,maxdis) //Right
 };
 const int snr=sizeof(sonar)/sizeof(NewPing)-1;    //Don't erase the -1
 const int motorpin[] {5,6,9,10};   //Motors (PWM)

@@ -20,7 +20,7 @@ const int prioritypin=2;           //Priority switch (digital)
 const int dis[]={500,300,500};  //Asked distance (in ms). Left, front, right.
 double maxturn=0.6;       //Max ratio of spd in PID limit
 int spd=100;                     //Maximum speed tweaked by spd
-const bool idle=false;          //For debugging lights, turning off motor
+bool idle=false;          //For debugging lights, turning off motor
 
 //Calculation
 double in,out,setpoint;
@@ -66,11 +66,12 @@ void tuning(){
     char c=Serial.read();                 //Store chars
     s.concat(c);                      //Combine chars received
     switch(c){
-      case 's':spd=s.toInt(); Serial.print(s); s=""; break;  //Input ranges from 0 to 10
-      case 't':maxturn=s.toInt()/10; Serial.print(s); s=""; break;  //Input ranges from 0 to 10
-      case 'p':kp=s.toInt(); Serial.print(s); s=""; break;
-      case 'i':ki=s.toInt(); Serial.print(s); s=""; break;
-      case 'd':kd=s.toInt(); Serial.print(s); s=""; break;
+      case 's':spd=s.toInt(); Serial.print(spd); s=""; break;  //Input ranges from 0 to 10
+      case 't':maxturn=s.toInt()/10; Serial.print(maxturn); s=""; break;  //Input ranges from 0 to 10
+      case 'p':kp=s.toInt()/10; Serial.print(kp); s=""; break;
+      case 'i':ki=s.toInt()/10; Serial.print(ki); s=""; break;
+      case 'd':kd=s.toInt()/10; Serial.print(kd); s=""; break;
+      case 'x':idle=!idle; Serial.print(idle); s=""; break;
     }
     pid.SetTunings(kp,ki,kd);
     pid.SetOutputLimits(0,spd*maxturn);
