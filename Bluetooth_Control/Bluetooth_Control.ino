@@ -4,7 +4,7 @@
 //Structures
 
 //Hardware specs
-SoftwareSerial bt(8,12);          //RX, TX; thus the opposite for the BT module
+SoftwareSerial bt(11,12);          //RX, TX; thus the opposite for the BT module
 const int motorpin[] {5,6,9,10}; //Motors (PWM)
 
 //App specs
