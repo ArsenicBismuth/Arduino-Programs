@@ -1,6 +1,8 @@
 #include <Wire.h>
 #include <Joystick.h>
 
+// Find [Config] tags for configurable codes
+
 /* Configs
 	MPU6050
 	 SCL -> SCL [ProMicro D3;			    NANO A5; 	 UNO A5, Above AREF & SDA]
@@ -51,7 +53,7 @@ void setup() {
 	Joystick.setXAxisRange(-127, 127);
 	Joystick.setYAxisRange(-127, 127);
 	
-	Serial.begin(9600);
+	Serial.begin(57600);
 	
 	calibrateSensors();
 }
@@ -60,6 +62,20 @@ void loop() {
 	// Acquiring data
 	mpuAcquire();
 	
+	// Process into joystick data
+	processJoystick();
+	
+	// Executing
+	Joystick.setXAxis(x);
+	Joystick.setYAxis(y);
+
+	// Debugging
+	sendSerial();
+	
+	delay(10);
+}
+
+void processJoystick() {
 	// Remove offsets and scale gyro data  
 	gx -= base_x_gyro;
 	gy -= base_y_gyro;
@@ -68,19 +84,14 @@ void loop() {
 	ay -= base_y_accel;
 	az -= base_z_accel;
 	
-	// Mapping to joystick analog axis
+	// [Config] Mapping to joystick analog axis
 	/*	Just making sure -127 to 127 reached.
 		Passing those is preferable, allow 
-		for easier editing using UCR.
+		for easier editing just by using
+		multiplier outside
 	*/
 	x = ay * 1 + gz * 0;
 	y = az * 1 + gy * 0;
-	
-	// Executing
-	Joystick.setXAxis(x);
-	Joystick.setYAxis(y);
-
-	delay(10);
 }
 
 void mpuAcquire() {
@@ -98,7 +109,7 @@ void mpuAcquire() {
 	gy = Wire.read() << 8 | Wire.read(); // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
 	gz = Wire.read() << 8 | Wire.read(); // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
 	
-	// Re-Align based on IMU placement
+	// [Config] Re-Align based on IMU placement
 	ax *= -1;
 	ay *= -1;
 	az *= -1;
@@ -121,7 +132,7 @@ void mpuAcquire() {
 // Simple calibration - just average first few readings to subtract
 // from the later data
 void calibrateSensors() {
-  int num_readings = 10;
+  int num_readings = 10; // [Config] n first numbers sampled
 
   // Discard the first reading (don't know if this is needed or
   // not, however, it won't hurt.)
@@ -144,4 +155,12 @@ void calibrateSensors() {
   base_x_accel /= num_readings;
   base_y_accel /= num_readings;
   base_z_accel /= num_readings;
+}
+
+void sendSerial() {
+	// Formatting x:int:y:int
+	Serial.print("x:");
+	Serial.print(x);
+	Serial.print("y:");
+	Serial.print(y);
 }
