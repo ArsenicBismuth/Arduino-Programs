@@ -1,5 +1,10 @@
 #include <Wire.h>
-#include <Joystick.h>
+
+// Check processor type. Other than At32u4, HID won't enabled
+#ifdef __AVR_ATmega32u4__
+  #include <Joystick.h>
+  #define HID
+#endif
 
 // Find [Config] tags for configurable codes
 
@@ -31,13 +36,15 @@ int base_z_accel = 0;
 	In actual Joystick, those would be Z-Axis and Z-Rotation respectively.
 	But decided to use X-axis and Y-axis for ease of visualization.
 */
-Joystick_ Joystick(JOYSTICK_DEFAULT_REPORT_ID,JOYSTICK_TYPE_GAMEPAD,
-  0, 0,                  // Button Count, Hat Switch Count
-  true, true, false,     // X and Y, but no Z Axis
-  false, false, false,   // No Rx, Ry, or Rz
-  false, false,          // No rudder or throttle
-  false, false, false	 // No accelerator, brake, or steering
-);
+#ifdef HID
+	Joystick_ Joystick(JOYSTICK_DEFAULT_REPORT_ID,JOYSTICK_TYPE_GAMEPAD,
+	  0, 0,                  // Button Count, Hat Switch Count
+	  true, true, false,     // X and Y, but no Z Axis
+	  false, false, false,   // No Rx, Ry, or Rz
+	  false, false,          // No rudder or throttle
+	  false, false, false	 // No accelerator, brake, or steering
+	);
+#endif
 
 void setup() {
 	// Initialize I2C for MPU6050
@@ -47,11 +54,13 @@ void setup() {
 	Wire.write(0); // set to zero (wakes up the MPU-6050)
 	Wire.endTransmission(true);
 	
-	// Initialize Joystick
-	Joystick.begin();
-	// Joystick analog ranges from -127 to 127
-	Joystick.setXAxisRange(-127, 127);
-	Joystick.setYAxisRange(-127, 127);
+	#ifdef HID
+		// Initialize Joystick
+		Joystick.begin();
+		// Joystick analog ranges from -127 to 127
+		Joystick.setXAxisRange(-127, 127);
+		Joystick.setYAxisRange(-127, 127);
+	#endif
 	
 	Serial.begin(57600);
 	
@@ -62,12 +71,14 @@ void loop() {
 	// Acquiring data
 	mpuAcquire();
 	
-	// Process into joystick data
+	// Process the joystick data from acquired data
 	processJoystick();
 	
-	// Executing
-	Joystick.setXAxis(x);
-	Joystick.setYAxis(y);
+	#ifdef HID
+		// Executing
+		Joystick.setXAxis(x);
+		Joystick.setYAxis(y);
+	#endif
 
 	// Debugging
 	sendSerial();
