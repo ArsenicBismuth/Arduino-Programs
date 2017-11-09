@@ -13,6 +13,7 @@
 //
 // by Matthew Heironimus
 // 2016-11-24
+// https://github.com/MHeironimus/ArduinoJoystickLibrary
 //--------------------------------------------------------------------
 
 #include <Joystick.h>

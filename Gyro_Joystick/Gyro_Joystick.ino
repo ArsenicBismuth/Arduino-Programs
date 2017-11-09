@@ -15,6 +15,9 @@
 	 INT -> INT [ProMicro TXO, RXI, D2, D3, D7; NANO D2, D3; UNO D2, D3]
 */
 
+// [Config] Parameter
+#define DEBUG_PROCESSING 1 // Check if debugging using processing
+
 const int MPU_addr = 0x68;  // I2C address of the MPU-6050
 
 // Variables to store the values from the sensor readings
@@ -25,12 +28,12 @@ int x, y;
 
 //  Use the following global variables 
 //  to calibrate the gyroscope sensor and accelerometer readings
-int base_x_gyro = 0;
-int base_y_gyro = 0;
-int base_z_gyro = 0;
-int base_x_accel = 0;
-int base_y_accel = 0;
-int base_z_accel = 0;
+float base_x_gyro = 0;
+float base_y_gyro = 0;
+float base_z_gyro = 0;
+float base_x_accel = 0;
+float base_y_accel = 0;
+float base_z_accel = 0;
 
 /*	Only 2 axis required for up-down and left-right view
 	In actual Joystick, those would be Z-Axis and Z-Rotation respectively.
@@ -58,16 +61,16 @@ void setup() {
 		// Initialize Joystick
 		Joystick.begin();
 		
-		// Joystick analog ranges from -127 to 127
-		Joystick.setXAxisRange(-127, 127);
-		Joystick.setYAxisRange(-127, 127);
+		// Mapping data representing 16-bit Joystick (-32k to 32k)
+		Joystick.setXAxisRange(-16384, 16384);
+		Joystick.setYAxisRange(-16384, 16384);
     
     Serial.println("At32u4 detected\n");
 	#endif
 	
 	Serial.begin(57600);
   
-  delay(500);
+  delay(1000);
 	calibrateSensors();
 }
 
@@ -85,14 +88,14 @@ void loop() {
 	#endif
 
   // Debugging
-  sendSerial(0);
+  sendSerial(DEBUG_PROCESSING);
 }
 
 void mpuAcquire() {
 	Wire.beginTransmission(MPU_addr);
 	Wire.write(0x3B); // starting with register 0x3B (ACCEL_XOUT_H)
 	Wire.endTransmission(false);
-	
+
 	Wire.requestFrom(MPU_addr,14,true); // request a total of 14 registers
 	// Getting 1 byte each reading, appending into 2 bytes of complete data
 	ax = Wire.read() << 8 | Wire.read(); // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L) 
@@ -102,23 +105,24 @@ void mpuAcquire() {
 	gx = Wire.read() << 8 | Wire.read(); // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
 	gy = Wire.read() << 8 | Wire.read(); // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
 	gz = Wire.read() << 8 | Wire.read(); // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
-
+  
+  // Each data is int16_t, -32k to 32k
+  
   // Process raw data
   processRaw();
   
-  //sendSerial(1);
-	delay(100);
+	delay(10);
 }
 
 void processRaw() {
   // [Config] Re-Align based on IMU placement
-  // Divided to avoid overflow
-  ax *= (float) -1/10;
-  ay *= (float) -1/10;
-  az *= (float) -1/10;
-  gx *= (float) -1;
-  gy *= (float) -1;
-  gz *= (float) -1;
+  // Divided to match needed representation & avoid overflow
+  ax *= (float) -1/2;
+  ay *= (float) -1/2;
+  az *= (float) -1/2;
+  gx *= (float) 1/2;
+  gy *= (float) 1/2;
+  gz *= (float) 1/2;
   
   /* Status after re-aligment:
     X = back - front
@@ -131,7 +135,7 @@ void processRaw() {
 }
 
 void processJoystick() {
-  // Remove offsets and scale gyro data  
+  // Remove offsets
   ax -= base_x_accel;
   ay -= base_y_accel;
   az -= base_z_accel;
@@ -143,9 +147,14 @@ void processJoystick() {
   /*  Just making sure -127 to 127 reached.
     Passing those is preferable, allow 
     for easier editing just by using
-    multiplier outside
-  */
-  x = ay * 1 + gz * 0;
+    multiplier outside. */
+
+  /* Gyro is used since it's a relative positional (angular velocity), not related to gravity or anything,
+    which is what we wanted. Accelerometer becoming very pain in the ass when gravity involved.
+    Basically with accel a different tilt will results in different reading even with the same gesture --
+    it's just a tilt sensor in its raw form */
+    
+  x = ay * 0 + gz * 1;
   y = az * 0 + gy * 1;
 }
 
@@ -161,36 +170,35 @@ void calibrateSensors() {
   // Read and average the raw values
   for (int i = 0; i < num_readings; i++) {
     mpuAcquire();
-    base_x_accel += ax;
-    base_y_accel += ay;
-    base_z_accel += az;
-    base_x_gyro += gx;
-    base_y_gyro += gy;
-    base_z_gyro += gz;
-  }
 
-  base_x_accel /= num_readings;
-  base_y_accel /= num_readings;
-  base_z_accel /= num_readings;
-  base_x_gyro /= num_readings;
-  base_y_gyro /= num_readings;
-  base_z_gyro /= num_readings;
+    // Division added inside to avoid overflow as long as the raw data isn't overflowed
+    base_x_accel += (float) ax / num_readings;
+    base_y_accel += (float) ay / num_readings;
+    base_z_accel += (float) az / num_readings;
+    base_x_gyro += (float) gx / num_readings;
+    base_y_gyro += (float) gy / num_readings;
+    base_z_gyro += (float) gz / num_readings;
+
+    sendSerial(DEBUG_PROCESSING);
+  }
 }
 
-void sendSerial(bool raw) {
+void sendSerial(bool processing) {
 	// Formatting x:int\ny:int\n
 	Serial.print("\nx:");
 	Serial.print(x);
-	Serial.print("\ny:");
+  if (processing) Serial.print("\n");
+  else Serial.print("\t");
+	Serial.print("y:");
 	Serial.print(y);
 
-  if(raw) {
-    Serial.print("\t");
+  if(!processing) {
+    /*Serial.print("\t");
     Serial.print(ax);
     Serial.print("\t");
     Serial.print(ay);
     Serial.print("\t");
-    Serial.print(az);
+    Serial.print(az);*/
     Serial.print("\t");
     Serial.print(gx);
     Serial.print("\t");
@@ -199,10 +207,10 @@ void sendSerial(bool raw) {
     Serial.print(gz);
 
     Serial.print("\t");
-    Serial.print(base_x_accel);
+    Serial.print(base_x_gyro);
     Serial.print("\t");
-    Serial.print(base_y_accel);
+    Serial.print(base_y_gyro);
     Serial.print("\t");
-    Serial.print(base_z_accel);
+    Serial.print(base_z_gyro);
   }
 }
