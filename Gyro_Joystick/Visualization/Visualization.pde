@@ -1,7 +1,7 @@
 import processing.serial.*;
 
 Serial  myPort;
-short   portIndex = 1; // Index of serial port in list (varies by computer)
+short   portIndex = 0; // Index of serial port in list (varies by computer)
 int     lf = 10;       // ASCII linefeed
 String  inString;      // String for testing serial communication
 
@@ -72,7 +72,7 @@ void serialEvent(Serial p) {
   // Left-half window for raw data, right-half accumulated data
   // Makes box touch the border with input data of -16k & 16k
   rect1[0] = rel[0] * 0.01 + width * 0.25 - dim/2;
-  rect1[1] = - rel[1] * 0.01 + height * 0.5 - dim/2;	// Because here Y+ is down. Opposed to joystick
+  rect1[1] = rel[1] * 0.01 + height * 0.5 - dim/2;
   rect2[0] = pos[0] * 0.001 + width * 0.75 - dim/2;
-  rect2[1] = - pos[1] * 0.001 + height * 0.5 - dim/2;
+  rect2[1] = pos[1] * 0.001 + height * 0.5 - dim/2;
 }

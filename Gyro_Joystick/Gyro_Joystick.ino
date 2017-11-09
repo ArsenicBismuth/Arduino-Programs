@@ -16,7 +16,8 @@
 */
 
 // [Config] Parameter
-#define DEBUG_PROCESSING 1 // Check if debugging using processing
+#define DEBUG_PROCESSING 1  // Check if debugging using processing
+#define RANGE 16383         // Analog Range, peak not peak-to-peak
 
 const int MPU_addr = 0x68;  // I2C address of the MPU-6050
 
@@ -62,8 +63,8 @@ void setup() {
 		Joystick.begin();
 		
 		// Mapping data representing 16-bit Joystick (-32k to 32k)
-		Joystick.setXAxisRange(-16384, 16384);
-		Joystick.setYAxisRange(-16384, 16384);
+		Joystick.setXAxisRange(-RANGE, RANGE);
+		Joystick.setYAxisRange(-RANGE, RANGE);
     
     Serial.println("At32u4 detected\n");
 	#endif
@@ -116,20 +117,21 @@ void mpuAcquire() {
 
 void processRaw() {
   // [Config] Re-Align based on IMU placement
-  // Divided to match needed representation & avoid overflow
+  // Divided to match needed representation & avoid overflow if necessary
   ax *= (float) -1/2;
   ay *= (float) -1/2;
   az *= (float) -1/2;
-  gx *= (float) 1/2;
+  gx *= (float) -1/2;
   gy *= (float) 1/2;
   gz *= (float) 1/2;
-  
+
+  // DirectInput positive is bottom right corner
   /* Status after re-aligment:
     X = back - front
     Y = left - right
     Z = up - down
     Xrot = clockwise
-    Yrot = back roll
+    Yrot = front roll
     Zrot = steering right
   */
 }
