@@ -1,7 +1,7 @@
 #include <Wire.h>
 
 // Check processor type. Other than At32u4, HID won't enabled
-#ifdef __AVR_ATmega32u4__
+#ifdef __AVR_ATmega32U4__
   #include <Joystick.h>
   #define HID
 #endif
@@ -10,9 +10,9 @@
 
 /* Configs
 	MPU6050
-	 SCL -> SCL [ProMicro D3;			    NANO A5; 	 UNO A5, Above AREF & SDA]
-	 SDA -> SDA [ProMicro D2;			    NANO A4; 	 UNO A4, Above AREF]
-	 INT -> INT [ProMicro TXO, RXI, D2, D3; NANO D2, D3; UNO D2, D3]
+	 SCL -> SCL [ProMicro D3;			    	NANO A5; 	 UNO A5, Above AREF & SDA]
+	 SDA -> SDA [ProMicro D2;			    	NANO A4; 	 UNO A4, Above AREF]
+	 INT -> INT [ProMicro TXO, RXI, D2, D3, D7; NANO D2, D3; UNO D2, D3]
 */
 
 const int MPU_addr = 0x68;  // I2C address of the MPU-6050
@@ -57,13 +57,17 @@ void setup() {
 	#ifdef HID
 		// Initialize Joystick
 		Joystick.begin();
+		
 		// Joystick analog ranges from -127 to 127
 		Joystick.setXAxisRange(-127, 127);
 		Joystick.setYAxisRange(-127, 127);
+    
+    Serial.println("At32u4 detected\n");
 	#endif
 	
 	Serial.begin(57600);
-	
+  
+  delay(500);
 	calibrateSensors();
 }
 
@@ -80,29 +84,8 @@ void loop() {
 		Joystick.setYAxis(y);
 	#endif
 
-	// Debugging
-	sendSerial();
-	
-	delay(10);
-}
-
-void processJoystick() {
-	// Remove offsets and scale gyro data  
-	gx -= base_x_gyro;
-	gy -= base_y_gyro;
-	gz -= base_z_gyro;
-	ax -= base_x_accel;
-	ay -= base_y_accel;
-	az -= base_z_accel;
-	
-	// [Config] Mapping to joystick analog axis
-	/*	Just making sure -127 to 127 reached.
-		Passing those is preferable, allow 
-		for easier editing just by using
-		multiplier outside
-	*/
-	x = ay * 1 + gz * 0;
-	y = az * 1 + gy * 0;
+  // Debugging
+  sendSerial(0);
 }
 
 void mpuAcquire() {
@@ -119,25 +102,51 @@ void mpuAcquire() {
 	gx = Wire.read() << 8 | Wire.read(); // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
 	gy = Wire.read() << 8 | Wire.read(); // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
 	gz = Wire.read() << 8 | Wire.read(); // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
-	
-	// [Config] Re-Align based on IMU placement
-	ax *= -1;
-	ay *= -1;
-	az *= -1;
-	gx *= -1;
-	gy *= -1;
-	gz *= -1;
-	
-	/* Status after re-aligment:
-		X = back - front
-		Y = left - right
-		Z = up - down
-		Xrot = clockwise
-		Yrot = back roll
-		Zrot = steering right
-	*/
-	
-	//delay(333);
+
+  // Process raw data
+  processRaw();
+  
+  //sendSerial(1);
+	delay(100);
+}
+
+void processRaw() {
+  // [Config] Re-Align based on IMU placement
+  // Divided to avoid overflow
+  ax *= (float) -1/10;
+  ay *= (float) -1/10;
+  az *= (float) -1/10;
+  gx *= (float) -1;
+  gy *= (float) -1;
+  gz *= (float) -1;
+  
+  /* Status after re-aligment:
+    X = back - front
+    Y = left - right
+    Z = up - down
+    Xrot = clockwise
+    Yrot = back roll
+    Zrot = steering right
+  */
+}
+
+void processJoystick() {
+  // Remove offsets and scale gyro data  
+  ax -= base_x_accel;
+  ay -= base_y_accel;
+  az -= base_z_accel;
+  gx -= base_x_gyro;
+  gy -= base_y_gyro;
+  gz -= base_z_gyro;
+  
+  // [Config] Mapping to joystick analog axis
+  /*  Just making sure -127 to 127 reached.
+    Passing those is preferable, allow 
+    for easier editing just by using
+    multiplier outside
+  */
+  x = ay * 1 + gz * 0;
+  y = az * 0 + gy * 1;
 }
 
 // Simple calibration - just average first few readings to subtract
@@ -152,26 +161,48 @@ void calibrateSensors() {
   // Read and average the raw values
   for (int i = 0; i < num_readings; i++) {
     mpuAcquire();
+    base_x_accel += ax;
+    base_y_accel += ay;
+    base_z_accel += az;
     base_x_gyro += gx;
     base_y_gyro += gy;
     base_z_gyro += gz;
-    base_x_accel += ax;
-    base_y_accel += ay;
-    base_y_accel += az;
   }
-  
-  base_x_gyro /= num_readings;
-  base_y_gyro /= num_readings;
-  base_z_gyro /= num_readings;
+
   base_x_accel /= num_readings;
   base_y_accel /= num_readings;
   base_z_accel /= num_readings;
+  base_x_gyro /= num_readings;
+  base_y_gyro /= num_readings;
+  base_z_gyro /= num_readings;
 }
 
-void sendSerial() {
-	// Formatting x:int:y:int
-	Serial.print("x:");
+void sendSerial(bool raw) {
+	// Formatting x:int\ny:int\n
+	Serial.print("\nx:");
 	Serial.print(x);
-	Serial.print("y:");
+	Serial.print("\ny:");
 	Serial.print(y);
+
+  if(raw) {
+    Serial.print("\t");
+    Serial.print(ax);
+    Serial.print("\t");
+    Serial.print(ay);
+    Serial.print("\t");
+    Serial.print(az);
+    Serial.print("\t");
+    Serial.print(gx);
+    Serial.print("\t");
+    Serial.print(gy);
+    Serial.print("\t");
+    Serial.print(gz);
+
+    Serial.print("\t");
+    Serial.print(base_x_accel);
+    Serial.print("\t");
+    Serial.print(base_y_accel);
+    Serial.print("\t");
+    Serial.print(base_z_accel);
+  }
 }
