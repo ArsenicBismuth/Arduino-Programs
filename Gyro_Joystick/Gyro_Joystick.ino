@@ -18,6 +18,7 @@
 // [Config] Parameter
 #define DEBUG_PROCESSING 1  // Check if debugging using processing
 #define RANGE 16383         // Analog Range, peak not peak-to-peak
+#define DEADP 10         // Deadzone in percent
 
 const int MPU_addr = 0x68;  // I2C address of the MPU-6050
 
@@ -81,10 +82,10 @@ void loop() {
 	
 	// Process the joystick data from acquired data
 	processJoystick();
-	
+
 	#ifdef HID
 		// Executing
-		Joystick.setXAxis(x);
+		Joystick.setXAxis(x+1);
 		Joystick.setYAxis(y);
 	#endif
 
@@ -158,6 +159,10 @@ void processJoystick() {
     
   x = ay * 0 + gz * 1;
   y = az * 0 + gy * 1;
+
+  Serial.print("A"); sendSerial(DEBUG_PROCESSING);
+  x = deadzone(x, DEADP);
+  y = deadzone(y, DEADP);
 }
 
 // Simple calibration - just average first few readings to subtract
@@ -182,6 +187,18 @@ void calibrateSensors() {
     base_z_gyro += (float) gz / num_readings;
 
     sendSerial(DEBUG_PROCESSING);
+  }
+}
+
+int deadzone(int val, int dead) {
+  // Deadzone in percent, 0.1*range => 10
+  dead = dead / 2;
+  
+  if ((float) abs(val) * 100 / (float) RANGE <= dead) {
+    return 0;
+  } else {
+    // value * equivalent value percent in new range
+    return (float) val / abs(val) * (abs(val) - dead / 100.0 * RANGE) * 50.0 / (50.0 - dead);
   }
 }
 
