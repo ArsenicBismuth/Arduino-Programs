@@ -102,37 +102,28 @@ uint8_t teapotPacket[14] = { '$', 0x02, 0,0, 0,0, 0,0, 0,0, 0x00, 0x00, '\r', '\
 // [Config] Parameter
 #define DEBUG_PROCESSING 1  // Check if debugging using processing
 #define RANGE 16383         // Analog Range, peak not peak-to-peak
-#define DEADP 10            // Deadzone in percent
-#define CLIP 40             // Clip to -CLIP to CLIP
-#define HOLDLOOP 10         // Check how long (loop) previous data is kept. Simulating "holding" analog down, rising magnitude
-                            // This will cause jittering, 0 -> val_1 -> 0 val_2 -> 0.
-                            // But that's okay. As long as it doesn't positive <-> negative, the analog will still move in the same direction
-#define HOLDMODE 0          // Enable hold mode, thus equivalent to direct YPR data not relative to previous. Eq to infinity HOLDLOOP
+#define DEADP 1             // Deadzone in percent
+#define CLIP 50             // Clip to -CLIP to CLIP
+#define HOLDPREV 5          // How long (loop) previous data is kept. Giving higher magnitude for longer gesture
+#define HOLDMODE 0          // Enable hold mode, thus equivalent to direct YPR data (not relative to previous). Equiv to inf HOLDPREV
+#define HOLDOUT 5           // How long joystick output is kept, outputting the max. Significantly reduce jittering by HOLDPREV
 
 const int MPU_addr = 0x68;  // I2C address of the MPU-6050
 
 // Variables to store the values from the sensor readings
-int16_t ax = 0;
-int16_t ay = 0;
-int16_t az = 0;
-int16_t tm = 0;
-int16_t gx = 0;
-int16_t gy = 0;
-int16_t gz = 0;
+VectorFloat a = {0, 0, 0};
+VectorFloat g = {0, 0, 0};  // Store relative ypr data, current - previous
 
-// Previous
-int16_t pax = 0;
-int16_t pay = 0;
-int16_t paz = 0;
-int16_t ptm = 0;
-int16_t pgx = 0;
-int16_t pgy = 0;
-int16_t pgz = 0;
-bool start_phase = 1;
-int loop_counter = HOLDLOOP;
+// Previous management variables
+VectorFloat pa = {0, 0, 0};
+VectorFloat pg = {0, 0, 0}; // Store previous ypr data, so != previous g since g is curr - prev. This is prev raw DMP
+bool start = 1;
+int loop_counter1 = HOLDPREV;
+int loop_counter2 = HOLDOUT;
 
 // Variables sent as joystick
 int x, y;
+int px = 0, py = 0;
 
 //  Use the following global variables 
 //  to calibrate the gyroscope sensor and accelerometer readings
@@ -163,6 +154,8 @@ volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin h
 void dmpDataReady() {
     mpuInterrupt = true;
 }
+
+
 
 void setup() {
   // join I2C bus (I2Cdev library doesn't do this automatically)
@@ -258,6 +251,8 @@ void setup() {
   delay(1000);
 }
 
+
+
 void loop() {
 	// Acquiring data
 	mpuAcquire();
@@ -266,29 +261,16 @@ void loop() {
   // IT MUST BE CHECKED FROM SEEING DATA,
   // because for ex can't differentiate gy with gx for which is which
   // since you don't know where front is pointing at
-  ax = 0;
-  ay = 0;
-  az = 0;
-  gx = (ypr[2]) * 180/M_PI - pgx;
-  gy = (ypr[1]) * 180/M_PI - pgy;
-  gz = (ypr[0]) * 180/M_PI - pgz;
+  a = {0, 0, 0};
+  g = {ypr[2] * 180/M_PI - pg.x,
+	    ypr[1] * 180/M_PI - pg.y,
+	    ypr[0] * 180/M_PI - pg.z};
 
-  if ((loop_counter <= 0) || (HOLDMODE && start_phase)) {
-    pax = 0;
-    pay = 0;
-    paz = 0;
-    pgx = (ypr[2]) * 180/M_PI;
-    pgy = (ypr[1]) * 180/M_PI;
-    pgz = (ypr[0]) * 180/M_PI;
-    start_phase = 0;
-    loop_counter = HOLDLOOP;
-  } else 
-    if (!HOLDMODE) loop_counter --;
-
-  Serial.print(gz);
-  Serial.print('\t');
-  Serial.print(gy);
-  Serial.print('\t');
+  Serial.print("rgz");
+  Serial.print(g.z);
+  Serial.print("\trgy");
+  Serial.print(g.y);
+  Serial.print("\t");
   
   processData();
   
@@ -301,29 +283,46 @@ void loop() {
 		Joystick.setYAxis(y);
 	#endif
 
+  // How long before a previous reference updated
+  if ((loop_counter1 <= 0) || (HOLDMODE && start)) {
+    pa = {0, 0, 0};
+    pg = {ypr[2] * 180/M_PI,
+          ypr[1] * 180/M_PI,
+          ypr[0] * 180/M_PI};
+    start = 0;
+    loop_counter1 = HOLDPREV;
+  } else 
+    if (!HOLDMODE) loop_counter1 --;
+
   // Debugging
   //sendSerial(DEBUG_PROCESSING);
 }
 
+
+
 void processData() {
-  gx = clip(gx, -CLIP, CLIP);
-  gy = clip(gy, -CLIP, CLIP);
-  gz = clip(gz, -CLIP, CLIP);
+  // Avoid changing 179 to -179 when it's actually 2 deg change
+  if (pg.x >= 90 && (ypr[2] * 180/M_PI) <= -90) g.x += 360;
+  else if (pg.x < -90 && (ypr[2] * 180/M_PI) > 90) g.x -= 360;
+  
+  if (pg.y >= 90 && (ypr[1] * 180/M_PI) <= -90) g.y += 360;
+  else if (pg.y < -90 && (ypr[1] * 180/M_PI) > 90) g.y -= 360;
+  
+  if (pg.z >= 90 && (ypr[0] * 180/M_PI) <= -90) g.z += 360;
+  else if (pg.z < -90 && (ypr[0] * 180/M_PI) > 90) g.z -= 360;
+  
+  g.x = clip(g.x, -CLIP, CLIP);
+  g.y = clip(g.y, -CLIP, CLIP);
+  g.z = clip(g.z, -CLIP, CLIP);
   
   // [Config] Re-Align based on IMU placement
   // Divided to match needed representation & avoid overflow if necessary
-  ax *= (float) -1;
-  ay *= (float) -1;
-  az *= (float) -1;
-  gx *= (float) 1 * RANGE / (float) CLIP;
-  gy *= (float) 1 * RANGE / (float) CLIP;
-  gz *= (float) 1 * RANGE / (float) CLIP;
-
-  
-  // Avoid changing 179 to -179 when it's actually 2 deg change
-  if (pgx >= 90 && gx <= -90) gx += 180;
-  if (pgy >= 90 && gy <= -90) gy += 180;
-  if (pgz >= 90 && gz <= -90) gz += 180;
+  a.x *= -1;
+  a.y *= -1;
+  a.z *= -1;
+  g.x *= 1 * RANGE / CLIP;
+  g.y *= 1 * RANGE / CLIP;
+  g.z *= 1 * RANGE / CLIP;
 
   // DirectInput positive is bottom right corner
   /* Status after re-aligment:
@@ -336,14 +335,16 @@ void processData() {
   */
 }
 
+
+
 void processJoystick() {
   // Remove offsets
-//  ax -= base_x_accel;
-//  ay -= base_y_accel;
-//  az -= base_z_accel;
-//  gx -= base_x_gyro;
-//  gy -= base_y_gyro;
-//  gz -= base_z_gyro;
+  //  ax -= base_x_accel;
+  //  ay -= base_y_accel;
+  //  az -= base_z_accel;
+  //  gx -= base_x_gyro;
+  //  gy -= base_y_gyro;
+  //  gz -= base_z_gyro;
   
   // [Config] Mapping to joystick analog axis
   /* Gyro is used since it's a relative positional (angular velocity), not related to gravity or anything,
@@ -351,44 +352,61 @@ void processJoystick() {
     Basically with accel a different tilt will results in different reading even with the same gesture --
     it's just a tilt sensor in its raw form */
   
-  x = ay * 0 + gz * 1;
-  y = az * 0 + gy * 1;
+  x = a.y * 0 + g.z * 1;
+  y = a.z * 0 + g.y * 1;
 
-  Serial.print(gz);
-  Serial.print('\t');
-  Serial.print(gy);
-  Serial.print('\t');
-  Serial.print(pgz);
-  Serial.print('\t');
-  Serial.print(pgy);
-  Serial.print('\t');
+  Serial.print("gz");
+  Serial.print(g.z);
+  Serial.print("\tgy");
+  Serial.print(g.y);
+  Serial.print("\tpgz");
+  Serial.print(pg.z);
+  Serial.print("\tpgy");
+  Serial.print(pg.y);
+  Serial.print("\t");
+
+  x = deadzone(x, DEADP);
+  y = deadzone(y, DEADP);
+
+  if (loop_counter2 <= 0) {
+    px = x;
+    py = y;
+    loop_counter2 = HOLDOUT;
+  } else {
+    // Check if bigger (magnitude)
+    if (abs(px) > abs(x)) x = px;
+    if (abs(py) > abs(y)) y = py;
+    loop_counter2 --;
+  }
 
   Serial.print(x);
   Serial.print('\t');
   Serial.print(y);
   Serial.print('\t');
-  
-  x = deadzone(x, DEADP);
-  y = deadzone(y, DEADP);
 }
 
-int clip(int val, int clipDown, int clipUp) {
+
+
+// Using double to allow for full integer coverage
+double clip(double val, double clipDown, double clipUp) {
   if (val > clipUp) return clipUp;
   else if (val < clipDown) return clipDown;
   else return val;
 }
 
-int deadzone(int val, int dead) {
+double deadzone(double val, double dead) {
   // Deadzone in percent, 0.1*range => 10
   dead = dead / 2;
   
-  if ((float) abs(val) * 100 / (float) RANGE <= dead) {
+  if (abs(val) * 100 / RANGE <= dead) {
     return 0;
   } else {
     // value * equivalent value percent in new range
-    return (float) val / abs(val) * (abs(val) - dead / 100.0 * RANGE) * 50.0 / (50.0 - dead);
+    return val / abs(val) * (abs(val) - dead / 100.0 * RANGE) * 50.0 / (50.0 - dead);
   }
 }
+
+
 
 void mpuAcquire() {
   // if programming failed, don't try to do anything
