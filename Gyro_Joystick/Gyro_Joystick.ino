@@ -102,11 +102,14 @@ uint8_t teapotPacket[14] = { '$', 0x02, 0,0, 0,0, 0,0, 0,0, 0x00, 0x00, '\r', '\
 // [Config] Parameter
 #define DEBUG_PROCESSING 1  // Check if debugging using processing
 #define RANGE 16383         // Analog Range, peak not peak-to-peak
-#define DEADP 1             // Deadzone in percent
-#define CLIP 50             // Clip to -CLIP to CLIP
+#define DISTANCE 80         // Distance for sine calculation. Basically just a multiplier.
+#define DEADP 10            // Deadzone in percent
+#define CLIP 20             // Clip to -CLIP to CLIP
+
 #define HOLDPREV 5          // How long (loop) previous data is kept. Giving higher magnitude for longer gesture
 #define HOLDMODE 0          // Enable hold mode, thus equivalent to direct YPR data (not relative to previous). Equiv to inf HOLDPREV
 #define HOLDOUT 5           // How long joystick output is kept, outputting the max. Significantly reduce jittering by HOLDPREV
+
 
 const int MPU_addr = 0x68;  // I2C address of the MPU-6050
 
@@ -310,6 +313,11 @@ void processData() {
   
   if (pg.z >= 90 && (ypr[0] * 180/M_PI) <= -90) g.z += 360;
   else if (pg.z < -90 && (ypr[0] * 180/M_PI) > 90) g.z -= 360;
+
+  // Getting a translation reaction through a rotating motion
+  g.x = sin(g.x) * DISTANCE;
+  g.y = sin(g.y) * DISTANCE;
+  g.z = sin(g.z) * DISTANCE;
   
   g.x = clip(g.x, -CLIP, CLIP);
   g.y = clip(g.y, -CLIP, CLIP);
@@ -365,8 +373,8 @@ void processJoystick() {
   Serial.print(pg.y);
   Serial.print("\t");
 
-  x = deadzone(x, DEADP);
-  y = deadzone(y, DEADP);
+  x = deadzone(x, DEADP, RANGE);
+  y = deadzone(y, DEADP, RANGE);
 
   if (loop_counter2 <= 0) {
     px = x;
@@ -394,15 +402,15 @@ double clip(double val, double clipDown, double clipUp) {
   else return val;
 }
 
-double deadzone(double val, double dead) {
+double deadzone(double val, double dead, double range) {
   // Deadzone in percent, 0.1*range => 10
   dead = dead / 2;
   
-  if (abs(val) * 100 / RANGE <= dead) {
+  if (abs(val) * 100 / range <= dead) {
     return 0;
   } else {
     // value * equivalent value percent in new range
-    return val / abs(val) * (abs(val) - dead / 100.0 * RANGE) * 50.0 / (50.0 - dead);
+    return val / abs(val) * (abs(val) - dead / 100.0 * range) * 50.0 / (50.0 - dead);
   }
 }
 
