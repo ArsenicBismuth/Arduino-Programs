@@ -5,12 +5,17 @@
 // [Config] Basic settings
 #define BUTTON 5        // Button count
 #define DUR_AFTER 3000  // Duration after buzzing before a new button press permitted
-#define TH_BUTTON 256   // analogRead threshold for
+#define ERR 40          // Error in analog input value
 #define DEBUG 0         // wether to enable playMelody or not
 
-// The components are all active LOW
-const uint8_t pin_button[BUTTON] = {A0, A1, A0, A0, A0};
+// The components active high
+const uint8_t pin_button = A0;  // Using just one pin method arranged in voltage divider
 const uint8_t pin_output[BUTTON] = {3, 5, 3, 3, 3};
+
+uint8_t button[BUTTON] = {0};
+uint8_t prev_button[BUTTON] = {0};
+const int button_th[BUTTON] = {1000, 830, 614, 393, 279};  // [Config] Threshold for A0 to be identified as certain button, tuning necessary
+                                 // 10k, 22k, 39k, 82k, 150k
 
 //Notes in the melody: (note durations: 4 = quarter note, 8 = eighth note, etc.)
 typedef struct note {
@@ -52,24 +57,33 @@ void playMelody(int repeat, int pin) {
 void setup() {
   Serial.begin(9600);
 
+  // Pin mode
   for (int i = 0; i < BUTTON; i++){
-    pinMode(pin_button[i], INPUT_PULLUP);
     pinMode(pin_output[i], OUTPUT);
   }
 }
 
 void loop() {
+  int input = analogRead(pin_button);
+  Serial.print(input); Serial.print(' ');
+
   for (int i = 0; i < BUTTON; i++){
-    Serial.print(analogRead(pin_button[i]));
-    Serial.print(' ');
-    Serial.print(digitalRead(pin_button[i])*1000);
-    Serial.print(' ');
-    if (!DEBUG && (analogRead(pin_button[i]) < TH_BUTTON)) {
+    // Map analog input to button
+    if ((input > button_th[i] - ERR) && (input <= button_th[i] + ERR)) button[i] = 1;
+    else button[i] = 0;
+
+    Serial.print(button[i]); Serial.print(' ');
+
+    // If triggered
+    if (!DEBUG && button[i] && prev_button[i]) {
       playMelody(0, pin_output[i]);
       digitalWrite(pin_output[i], HIGH);  // Stays on until a period of time
       delay(DUR_AFTER);
       digitalWrite(pin_output[i], LOW);  // Stays on until a period of time
     }
+
+    // To prevent noise. Just one look-back already removed almost all false-alarms
+    prev_button[i] = button[i];
   }
   Serial.println();
 }
