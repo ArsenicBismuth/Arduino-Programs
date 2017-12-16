@@ -6,16 +6,17 @@
 #define BUTTON 5        // Button count
 #define DUR_AFTER 3000  // Duration after buzzing before a new button press permitted
 #define ERR 40          // Error in analog input value
-#define DEBUG 0         // wether to enable playMelody or not
+#define DEBUG 0         // Wether to enable playMelody or not
+#define TESTOUT 0       // Loop playMelody across all output
 
 // The components active high
-const uint8_t pin_button = A0;  // Using just one pin method arranged in voltage divider
-const uint8_t pin_output[BUTTON] = {3, 5, 3, 3, 3};
+const uint8_t pin_button = A7;  // Using just one pin method arranged in voltage divider
+const uint8_t pin_output[BUTTON] = {5, 3, 6, 10, 11};
 
 uint8_t button[BUTTON] = {0};
 uint8_t prev_button[BUTTON] = {0};
-const int button_th[BUTTON] = {1000, 830, 614, 393, 279};  // [Config] Threshold for A0 to be identified as certain button, tuning necessary
-                                 // 10k, 22k, 39k, 82k, 150k
+const int button_th[BUTTON] = {1000, 780, 614, 393, 250};  // [Config] Threshold for A0 to be identified as certain button, tuning necessary
+                             // 10k, 22k, 39k, 82k, 150k
 
 //Notes in the melody: (note durations: 4 = quarter note, 8 = eighth note, etc.)
 typedef struct note {
@@ -75,7 +76,7 @@ void loop() {
     Serial.print(button[i]); Serial.print(' ');
 
     // If triggered
-    if (!DEBUG && button[i] && prev_button[i]) {
+    if ((!DEBUG && button[i] && prev_button[i]) || TESTOUT) {
       playMelody(0, pin_output[i]);
       digitalWrite(pin_output[i], HIGH);  // Stays on until a period of time
       delay(DUR_AFTER);
