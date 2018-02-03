@@ -101,12 +101,12 @@ uint8_t teapotPacket[14] = { '$', 0x02, 0,0, 0,0, 0,0, 0,0, 0x00, 0x00, '\r', '\
 
 // [Config] Parameter
 #define DEBUG_PROCESSING 1  // Check if debugging using processing
-#define RANGE 16383         // Analog Range, peak not peak-to-peak
-#define DISTANCE 80         // Distance for sine calculation. Basically just a multiplier.
+#define RANGE 32767         // Analog Range, peak not peak-to-peak
+#define DISTANCE 2         // Distance for sine calculation. Basically just a multiplier.
 #define DEADP 10            // Deadzone in percent
-#define CLIP 20             // Clip to -CLIP to CLIP
+#define CLIP 20             // Clip to -CLIP to CLIP in degrees
 
-#define HOLDPREV 5          // How long (loop) previous data is kept. Giving higher magnitude for longer gesture
+#define HOLDPREV 1          // How long (loop) previous data is kept. Giving higher magnitude for longer gesture
 #define HOLDMODE 0          // Enable hold mode, thus equivalent to direct YPR data (not relative to previous). Equiv to inf HOLDPREV
 #define HOLDOUT 5           // How long joystick output is kept, outputting the max. Significantly reduce jittering by HOLDPREV
 
@@ -201,12 +201,14 @@ void setup() {
   devStatus = mpu.dmpInitialize();
 
   // [Config] supply your own gyro offsets here, scaled for min sensitivity
-  // Latest update: 12/11/17 12:08 Based on IMU_Zero
-  // WARNING: It's the offset TO BE GIVEN, so negative of the zero condition data
-  mpu.setXGyroOffset(91);
-  mpu.setYGyroOffset(22);
-  mpu.setZGyroOffset(7);
-  mpu.setZAccelOffset(1867); // Acquired by placing Z perpendicular to grafity direction
+  // Latest update: 04/02/18 02:08 Fully based on IMU_Zero, everything
+  // Yes, really. Just by changing something out of ordinary will mess the others.
+  mpu.setXAccelOffset(365);
+  mpu.setYAccelOffset(4426);
+  mpu.setZAccelOffset(5802);
+  mpu.setXGyroOffset(94);
+  mpu.setYGyroOffset(16);
+  mpu.setZGyroOffset(4);
 
   // make sure it worked (returns 0 if so)
   if (devStatus == 0) {
@@ -268,6 +270,8 @@ void loop() {
   g = {ypr[2] * 180/M_PI - pg.x,
 	    ypr[1] * 180/M_PI - pg.y,
 	    ypr[0] * 180/M_PI - pg.z};
+  
+  // Basically g will contains the change of ypr in degrees
 
   Serial.print("rgz");
   Serial.print(g.z);
@@ -282,7 +286,7 @@ void loop() {
 
 	#ifdef HID
 		// Executing
-		Joystick.setXAxis(x+1);
+		Joystick.setXAxis(x);
 		Joystick.setYAxis(y);
 	#endif
 
@@ -314,15 +318,15 @@ void processData() {
   if (pg.z >= 90 && (ypr[0] * 180/M_PI) <= -90) g.z += 360;
   else if (pg.z < -90 && (ypr[0] * 180/M_PI) > 90) g.z -= 360;
 
-  // Getting a translation reaction through a rotating motion
-  g.x = sin(g.x) * DISTANCE;
-  g.y = sin(g.y) * DISTANCE;
-  g.z = sin(g.z) * DISTANCE;
-  
+  // Getting a translation reaction through a rotating motion, sin angle is in radian
+  /*g.x = sin(g.x * M_PI/180) * DISTANCE;
+  g.y = sin(g.y * M_PI/180) * DISTANCE;
+  g.z = sin(g.z * M_PI/180) * DISTANCE;*/
+
   g.x = clip(g.x, -CLIP, CLIP);
   g.y = clip(g.y, -CLIP, CLIP);
   g.z = clip(g.z, -CLIP, CLIP);
-  
+
   // [Config] Re-Align based on IMU placement
   // Divided to match needed representation & avoid overflow if necessary
   a.x *= -1;
