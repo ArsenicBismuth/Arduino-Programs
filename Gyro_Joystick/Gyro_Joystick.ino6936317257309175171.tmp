@@ -50,7 +50,7 @@ MPU6050 mpu;
 // not compensated for orientation, so +X is always +X according to the
 // sensor, just without the effects of gravity. If you want acceleration
 // compensated for orientation, us OUTPUT_READABLE_WORLDACCEL instead.
-#define OUTPUT_READABLE_REALACCEL
+//#define OUTPUT_READABLE_REALACCEL
 
 // uncomment "OUTPUT_READABLE_WORLDACCEL" if you want to see acceleration
 // components with gravity removed and adjusted for the world frame of
@@ -92,8 +92,6 @@ uint8_t teapotPacket[14] = { '$', 0x02, 0,0, 0,0, 0,0, 0,0, 0x00, 0x00, '\r', '\
   #define HID
 #endif
 
-#define INT16X 32767.0      // Maximum value of INT16
-
 /* Configs
 	MPU6050
 	 SCL -> SCL [ProMicro D3;			    	NANO A5; 	 UNO A5, Above AREF & SDA]
@@ -103,15 +101,13 @@ uint8_t teapotPacket[14] = { '$', 0x02, 0,0, 0,0, 0,0, 0,0, 0x00, 0x00, '\r', '\
 
 // [Config] Parameter
 #define DEBUG_PROCESSING 1  // Check if debugging using processing
+#define RANGE 8191         // Analog Range, peak not peak-to-peak
 #define DISTANCE 2          // Distance for sine calculation. Basically just a multiplier.
-#define DEADP 10            // Deadzone in percent
-// Using define gives a very grave bug, totally wrong calculation results
-const double RANGE = INT16X/4;      // Analog Range, peak not peak-to-peak
-const double CLIP_D = 90;           // Clip to -CLIP_D to CLIP_D in degrees
-const double CLIP_A = INT16X/4;     // Clip to -CLIP_A to CLIP_A in acceleration unit
-                                    // Acceleration is given in [-int16, int16] that maps [-2g, 2g]
-                            
-#define HOLDPREV 2          // How long (loop) previous data is kept. Giving higher magnitude for longer gesture
+#define DEADP 1             // Deadzone in percent
+#define CLIP_D 20           // Clip to -CLIP_D to CLIP_D in degrees
+#define CLIP_A 20           // Clip to -CLIP_A to CLIP_A in acceleration
+
+#define HOLDPREV 1          // How long (loop) previous data is kept. Giving higher magnitude for longer gesture
 #define HOLDMODE 0          // Enable hold mode, thus equivalent to direct YPR data (not relative to previous). Equiv to inf HOLDPREV
 #define HOLDOUT 5           // How long joystick output is kept, outputting the max. Significantly reduce jittering by HOLDPREV
 
@@ -328,17 +324,15 @@ void processData() {
   g.y = sin(g.y * M_PI/180) * DISTANCE;
   g.z = sin(g.z * M_PI/180) * DISTANCE;*/
 
-  a.x = clip(a.x, -CLIP_A, CLIP_A);
-  a.y = clip(a.y, -CLIP_A, CLIP_A);
-  a.z = clip(a.z, -CLIP_A, CLIP_A);
+  a.x = clip(g.x, -CLIP_A, CLIP_A);
+  a.y = clip(g.y, -CLIP_A, CLIP_A);
+  a.z = clip(g.z, -CLIP_A, CLIP_A);
   g.x = clip(g.x, -CLIP_D, CLIP_D);
   g.y = clip(g.y, -CLIP_D, CLIP_D);
   g.z = clip(g.z, -CLIP_D, CLIP_D);
 
   // [Config] Re-Align based on IMU placement
   // Divided to match needed representation & avoid overflow if necessary
-  // Basically [-CLIP, CLIP] * RANGE / CLIP = [-RANGE, RANGE]
-  
   a.x *= -1 * RANGE / CLIP_A;
   a.y *= -1 * RANGE / CLIP_A;
   a.z *= -1 * RANGE / CLIP_A;
@@ -360,7 +354,7 @@ void processData() {
 
 
 void processJoystick() {
-  // Remove offsets post internal offsets
+  // Remove offsets
   //  ax -= base_x_accel;
   //  ay -= base_y_accel;
   //  az -= base_z_accel;
@@ -375,8 +369,8 @@ void processJoystick() {
     it's just a tilt sensor in its raw form */
   /* Turns out accelerometer data is very beautiful now after setting using the correct calibration (offsets) */
   
-  x = a.y * 1 + g.z * 0;
-  y = a.z * 1 + g.y * 0;
+  x = a.y * 100 + g.z * 1;
+  y = a.z * 100 + g.y * 1;
 
   Serial.print("gz");
   Serial.print(g.z);
@@ -478,8 +472,7 @@ void mpuAcquire() {
       Serial.print("\t");
       Serial.print(q.y);
       Serial.print("\t");
-      Serial.print(q.z);
-      Serial.print("\t");
+      Serial.println(q.z);
     #endif
 
     #ifdef OUTPUT_READABLE_EULER
@@ -491,8 +484,7 @@ void mpuAcquire() {
       Serial.print("\t");
       Serial.print(euler[1] * 180/M_PI);
       Serial.print("\t");
-      Serial.print(euler[2] * 180/M_PI);
-      Serial.print("\t");
+      Serial.println(euler[2] * 180/M_PI);
     #endif
 
     #ifdef OUTPUT_READABLE_YAWPITCHROLL
@@ -505,8 +497,7 @@ void mpuAcquire() {
       Serial.print("\t");
       Serial.print(ypr[1] * 180/M_PI);
       Serial.print("\t");
-      Serial.print(ypr[2] * 180/M_PI);
-      Serial.print("\t");
+      Serial.println(ypr[2] * 180/M_PI);
     #endif
 
     #ifdef OUTPUT_READABLE_REALACCEL
@@ -520,8 +511,7 @@ void mpuAcquire() {
       Serial.print("\t");
       Serial.print(aaReal.y);
       Serial.print("\t");
-      Serial.print(aaReal.z);
-      Serial.print("\t");
+      Serial.println(aaReal.z);
     #endif
 
     #ifdef OUTPUT_READABLE_WORLDACCEL
@@ -537,8 +527,7 @@ void mpuAcquire() {
       Serial.print("\t");
       Serial.print(aaWorld.y);
       Serial.print("\t");
-      Serial.print(aaWorld.z);
-      Serial.print("\t");
+      Serial.println(aaWorld.z);
     #endif
 
     #ifdef OUTPUT_TEAPOT
@@ -554,8 +543,6 @@ void mpuAcquire() {
       Serial.write(teapotPacket, 14);
       teapotPacket[11]++; // packetCount, loops at 0xFF on purpose
     #endif
-
-    Serial.println();
 
     // blink LED to indicate activity
     blinkState = !blinkState;
