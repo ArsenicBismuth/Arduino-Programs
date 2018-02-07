@@ -8,7 +8,7 @@
 // I2Cdev and MPU6050 must be installed as libraries, or else the .cpp/.h files
 // for both classes must be in the include path of your project
 #include "I2Cdev.h"
-#include <PID_v1.h>
+
 #include "MPU6050_6Axis_MotionApps20.h"
 //#include "MPU6050.h" // not necessary if using MotionApps include file
 
@@ -50,13 +50,13 @@ MPU6050 mpu;
 // not compensated for orientation, so +X is always +X according to the
 // sensor, just without the effects of gravity. If you want acceleration
 // compensated for orientation, us OUTPUT_READABLE_WORLDACCEL instead.
-//#define OUTPUT_READABLE_REALACCEL
+#define OUTPUT_READABLE_REALACCEL
 
 // uncomment "OUTPUT_READABLE_WORLDACCEL" if you want to see acceleration
 // components with gravity removed and adjusted for the world frame of
 // reference (yaw is relative to initial orientation, since no magnetometer
 // is present in this case). Could be quite handy in some cases.
-#define OUTPUT_READABLE_WORLDACCEL
+//#define OUTPUT_READABLE_WORLDACCEL
 
 // uncomment "OUTPUT_TEAPOT" if you want output that matches the
 // format used for the InvenSense teapot demo
@@ -110,17 +110,12 @@ const double RANGE = INT16X/2;      // Analog Range, peak not peak-to-peak
 const double CLIP_D = 90;           // Clip to -CLIP_D to CLIP_D in degrees
 const double CLIP_A = INT16X/4;     // Clip to -CLIP_A to CLIP_A in acceleration unit
                                     // Acceleration is given in [-int16, int16] that maps [-2g, 2g]
+
+#define UPDATE 1000         // Amount of loops before data update
 #define HOLDPREV 0          // How long (loop) previous data is kept. Giving higher magnitude for longer gesture
 #define HOLDMODE 0          // Enable hold mode, thus equivalent to direct YPR data (not relative to previous). Equiv to inf HOLDPREV
 #define HOLDOUT 0           // How long joystick output is kept, outputting the max. Significantly reduce jittering by HOLDPREV
 
-// [Config] PID
-#define SAMPLETIME 5        // Set ki to 1 (else 0) and see how good the pids match the input
-double kp = 0, ki = 3, kd = 0;  // Init tunings
-double setpoint = 0;        // Since only the deviation used here
-double in_pid_x, in_pid_y, out_pid_x, out_pid_y;
-PID pidx(&in_pid_x, &out_pid_x, &setpoint, kp, ki, kd, REVERSE);
-PID pidy(&in_pid_y, &out_pid_y, &setpoint, kp, ki, kd, REVERSE);
 
 const int MPU_addr = 0x68;  // I2C address of the MPU-6050
 
@@ -134,6 +129,7 @@ VectorFloat pg = {0, 0, 0}; // Store previous ypr data, so != previous g since g
 bool start = 1;
 int loop_counter1 = HOLDPREV;
 int loop_counter2 = HOLDOUT;
+int loop_counter3 = UPDATE; // In float so it can be > max of INT16
 
 // Variables sent as joystick
 int x, y;
@@ -251,17 +247,8 @@ void setup() {
   // configure LED for output
   pinMode(LED_PIN, OUTPUT);
 
-  // PID
-  pidx.SetOutputLimits(-RANGE, RANGE);
-  pidy.SetOutputLimits(-RANGE, RANGE);
-  pidx.SetSampleTime(SAMPLETIME);   // Set ki to 1 (else 0) and see how good the pids match the input
-  pidy.SetSampleTime(SAMPLETIME);
-  
-  // Turn the PID on
-  pidx.SetMode(AUTOMATIC);
-  pidy.SetMode(AUTOMATIC);
-
   // Setup Joystick HID
+  
 	#ifdef HID
 		// Initialize Joystick
 		Joystick.begin();
@@ -286,34 +273,29 @@ void loop() {
   // IT MUST BE CHECKED FROM SEEING DATA,
   // because for ex can't differentiate gy with gx for which is which
   // since you don't know where front is pointing at
-  in_pid_x = deadzone(aaWorld.y, 10, RANGE);  // Determine which data used in PID input for x-axis movement
-  in_pid_y = deadzone(aaWorld.z, 10, RANGE);
-  pidx.Compute();
-  pidy.Compute();
-  
-  a = {0, out_pid_x, out_pid_y};
-  g = {ypr[2] * 180/M_PI - pg.x,
-      ypr[1] * 180/M_PI - pg.y,
-      ypr[0] * 180/M_PI - pg.z};
+
+  if (loop_counter3 <= 0) {
+    a = {0.00001*aaReal.x + pa.x, 0.00001*aaReal.y + pa.y, 0.00001*aaReal.z + pa.z};
+    g = {ypr[2] * 180/M_PI - pg.x,
+        ypr[1] * 180/M_PI - pg.y,
+        ypr[0] * 180/M_PI - pg.z};
+    loop_counter3 = UPDATE;
+  } else {
+    loop_counter3--;
+  }
   
   // Basically g will contains the change of ypr in degrees
 
-//  Serial.print("\trgz");
-//  Serial.print(g.z);
-//  Serial.print("\trgy");
-//  Serial.print(g.y);
-//  Serial.print("\t");
+  Serial.print("\trgz");
+  Serial.print(g.z);
+  Serial.print("\trgy");
+  Serial.print(g.y);
+  Serial.print("\t");
   
   processData();
   
 	// Process the joystick data from acquired data
 	processJoystick();
-
-  Serial.print("pidx\t");
-  Serial.print(out_pid_x);
-  Serial.print("\tpidy\t");
-  Serial.print(out_pid_y);
-  Serial.print("\t");
 
 	#ifdef HID
 		// Executing
@@ -404,15 +386,15 @@ void processJoystick() {
   x = a.y * 1 + g.z * 0;
   y = a.z * 1 + g.y * 0;
 
-//  Serial.print("gz");
-//  Serial.print(g.z);
-//  Serial.print("\tgy");
-//  Serial.print(g.y);
-//  Serial.print("\tpgz");
-//  Serial.print(pg.z);
-//  Serial.print("\tpgy");
-//  Serial.print(pg.y);
-//  Serial.print("\t");
+  Serial.print("gz");
+  Serial.print(g.z);
+  Serial.print("\tgy");
+  Serial.print(g.y);
+  Serial.print("\tpgz");
+  Serial.print(pg.z);
+  Serial.print("\tpgy");
+  Serial.print(pg.y);
+  Serial.print("\t");
 
   x = deadzone(x, DEADP, RANGE);
   y = deadzone(y, DEADP, RANGE);
@@ -526,13 +508,13 @@ void mpuAcquire() {
       mpu.dmpGetQuaternion(&q, fifoBuffer);
       mpu.dmpGetGravity(&gravity, &q);
       mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-//      Serial.print("ypr\t");
-//      Serial.print(ypr[0] * 180/M_PI);
-//      Serial.print("\t");
-//      Serial.print(ypr[1] * 180/M_PI);
-//      Serial.print("\t");
-//      Serial.print(ypr[2] * 180/M_PI);
-//      Serial.print("\t");
+      Serial.print("ypr\t");
+      Serial.print(ypr[0] * 180/M_PI);
+      Serial.print("\t");
+      Serial.print(ypr[1] * 180/M_PI);
+      Serial.print("\t");
+      Serial.print(ypr[2] * 180/M_PI);
+      Serial.print("\t");
     #endif
 
     #ifdef OUTPUT_READABLE_REALACCEL
