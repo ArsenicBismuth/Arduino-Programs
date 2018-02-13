@@ -1,15 +1,9 @@
 /*
  * Original: http://www.avr-tutorials.com/projects/atmega16-based-digital-clock
- * DigitalClock.c
- * Written in AVR Studio 5
- * Compiler: AVR GNU C Compiler (GCC)
  *
- * Created: 12/10/2011 1:17:19 PM
- * Author:	AVR Tutorials
- * Website:	www.AVR-Tutorials.com
  */ 
  
-#define F_CPU 4000000UL		// 4 MHz
+#define F_CPU 16000000UL		// 16MHz, default in most Arduino
 
 #include <avr/delay.h>
 #include <avr/io.h>
@@ -79,7 +73,7 @@ int main(void)
 	ButPort = 0x00;	// Enable pullup
  
 	// TCNT1						// Background variable which counts system clock ticks after modified by Prescaler 1
-	TCCR1B = (1<<CS12|1<<WGM12);	// Clock Select 1, prescaler set as 1/256. // Clear Time on Compare 1, set Timer/Counter mode to CTC
+	TCCR1B = (1<<CS12|1<<CS10|1<<WGM12);	// Clock Select 1, prescaler set as 1/1024. // Clear Time on Compare 1, set Timer/Counter mode to CTC
 	OCR1A = 15625-1;				// Ouput Compare Match, value to be referenced when comparing
 	TIMSK1 = 1<<OCIE1A;				// Timer/Counter1, Output Compare A Match Interrupt enable
 	sei();							// Set global interrupt flag
