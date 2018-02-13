@@ -1,7 +1,7 @@
 import processing.serial.*;
 
 Serial  myPort;
-short   portIndex = 1; // Index of serial port in list (varies by computer)
+short   portIndex = 0; // Index of serial port in list (varies by computer)
 int     lf = 10;       // ASCII linefeed
 String  inString;      // String for testing serial communication
 
@@ -14,7 +14,7 @@ float pos[] = {0, 0};  // Positional data
 float x1, x2, y1, y2;
 float rect1[] = {0, 0};  // Starting location
 float rect2[] = {0, 0};
-float dim = 80.0;
+float dim = 40.0;
 
 void setup() {
   
@@ -47,7 +47,7 @@ void draw() {
  */
 void serialEvent(Serial p) {
   inString = myPort.readString();
-  print(inString);
+  //print(inString);
   
   try {
     // Parse the data
@@ -63,15 +63,16 @@ void serialEvent(Serial p) {
         pos[1] += rel[1];
       }
       // Clean buffer one-by-one until valid
-      print(rel[0],rel[1],'\t');
+      println(rel[0],rel[1],'\t');
     }
   } catch (Exception e) {
     println("Caught Exception");
   }
   
   // Left-half window for raw data, right-half accumulated data
-  rect1[0] = rel[0] * 0.1 + width * 0.25 - dim/2;
-  rect1[1] = rel[1] * 0.1 + height * 0.5 - dim/2;
-  rect2[0] = pos[0] * 0.01 + width * 0.75 - dim/2;
-  rect2[1] = pos[1] * 0.01 + height * 0.5 - dim/2;
+  // Makes box touch the border with input data of -16k & 16k
+  rect1[0] = rel[0] * 0.01 + width * 0.25 - dim/2;
+  rect1[1] = rel[1] * 0.01 + height * 0.5 - dim/2;
+  rect2[0] = pos[0] * 0.001 + width * 0.75 - dim/2;
+  rect2[1] = pos[1] * 0.001 + height * 0.5 - dim/2;
 }
