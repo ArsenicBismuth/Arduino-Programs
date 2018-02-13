@@ -15,19 +15,31 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
  
-#define SegDataPort		PORTB
-#define SegDataPin		PINB
+#define SegDataPort		PORTB	// Output buffer
+#define SegDataPin		PINB	// Input buffer
 #define SegDataDDR		DDRB
  
 #define SegCntrlPort	PORTC
 #define SegCntrlPin		PINC
 #define SegCntrlDDR		DDRC
- 
+
+#define ButPort			PORTD
+#define ButPin			PIND
+#define ButDDR			DDRD
+
  
 /*Global Variables Declarations*/
 unsigned char hours = 0;
 unsigned char minutes = 0;
 unsigned char seconds = 0;
+
+unsigned char int1 = 0;		// Leftmost number, to be operated against
+unsigned char int2 = 0;
+unsigned char result = 0;
+unsigned char cursor = 0;	// Specify cursor location, displayed using the period
+
+unsigned char pbut = 0;		// Previous button state
+unsigned char calc = 0;		// Calculator modes, total of 5: inactive, sum, reduce, multi, div
  
 /*
 * Basic timer concepts
@@ -45,6 +57,9 @@ unsigned char seconds = 0;
 /*****************************************************************************/
 /*Decimal Digit (0-9) to Seven Segment Values Encoder*/
 unsigned char DigitTo7SegEncoder(unsigned char digit, unsigned char common);
+
+/*Increment any of six digits based on location*/
+unsigned char Increment(unsigned char digit);
  
 /*Timer Counter 1 Compare Match A Interrupt Service Routine/Interrupt Handler*/
 ISR(TIMER1_COMPA_vect);
@@ -55,56 +70,102 @@ ISR(TIMER1_COMPA_vect);
 int main(void)
 {
 	// MCU parameter configs
-    SegDataDDR = 0xFF;
-	SegCntrlDDR = 0x3F;
-	SegCntrlPort = 0xFF;
+    SegDataDDR = 0xFF;	 // Output
+	
+	SegCntrlDDR = 0xFF;	 // Output
+	SegCntrlPort = 0xFF; // HIGH
+	
+	ButDDR = 0x00;	// Input
+	ButPort = 0x00;	// Enable pullup
  
+	// TCNT1						// Background variable which counts system clock ticks after modified by Prescaler 1
 	TCCR1B = (1<<CS12|1<<WGM12);	// Clock Select 1, prescaler set as 1/256. // Clear Time on Compare 1, set Timer/Counter mode to CTC
 	OCR1A = 15625-1;				// Ouput Compare Match, value to be referenced when comparing
-	TIMSK1 = 1<<OCIEA;				// Timer/Counter1, Output Compare A Match Interrupt enable
+	TIMSK1 = 1<<OCIE1A;				// Timer/Counter1, Output Compare A Match Interrupt enable
 	sei();							// Set global interrupt flag
  
  
-	while(1)
-    {
-        /* Set Minutes when SegCntrl Pin 6 Switch is Pressed*/
-		if((SegCntrlPin & 0x40) == 0 )
-		{	
-			_delay_ms(200);
-			if(minutes < 59)
-				minutes++;
-			else
-				minutes = 0;
-		}
-		
-        /* Set Hours when SegCntrl Pin 7 Switch is Pressed */
-		if((SegCntrlPin & 0x80) == 0 )
-		{	
-			_delay_ms(200);
-			if(hours < 23)
-				hours++;
-			else
-				hours = 0;
-		}
-		
-		
-		/* 
-		* Set one 7-segments at a time for every loop,
-		* fast enough to appear as if they're all always on.
-		* Isolation done by the Control Ports
+	while(1) {
+		/*
+		* Basic Operations
+		* Buttons: [Move cursor] [Increment digit] [Cycle modes]
+		* - Buttons handled only on "Rising", preventing multiple strokes.
+		* - Clock functions normally even while being used as a calculator.
+		* - Every calculation works on-the-fly, any change of state will
+		* directly reflected on result
+		* - Cursor functionality allows for faster number manipulation,
+		* digit selected by cursor (marked by a dot) is the increment target
+		* instead of the number as a whole.
 		*/
-		SegDataPort = DigitTo7SegEncoder(seconds%10,1);
-		SegCntrlPort = ~0x01;
-		SegDataPort = DigitTo7SegEncoder(seconds/10,1); 
-		SegCntrlPort = ~0x02;
-		SegDataPort = DigitTo7SegEncoder(minutes%10,1);
-		SegCntrlPort = ~0x04;
-		SegDataPort = DigitTo7SegEncoder(minutes/10,1); 
-		SegCntrlPort = ~0x08;
-		SegDataPort = DigitTo7SegEncoder(hours%10,1); 
-		SegCntrlPort = ~0x10;
-		SegDataPort = DigitTo7SegEncoder(hours/10,1);
-		SegCntrlPort = ~0x20;
+		
+		// Basic multi buttons management
+		for(unsigned char i = 0; i < 3; i++) {
+			
+			// Check rising, button isn't active while previously it's
+			if(!(~ButPort && (1<<i)) && (~pbut && (1<<i))) {
+				
+				switch(i) {
+					case 0:	// Cycle between multiple modes
+						if(calc < 3) calc++;
+						else calc = 0;
+						break;
+					case 1:	// Increment based on cursor position
+						Increment(cursor);
+						break;
+					case 2:	// Move cursor
+						if (cursor < 5) cursor++;
+						else cursor = 0;
+						break;
+					default:
+						break;
+				}
+			}
+
+		}
+		
+        pbut = ButPort;	// Store button state
+		
+		// Calculate result on-the-fly
+		switch(calc) {
+			case 1: result = int1 + int2; break;	// Summation
+			case 2: result = int1 - int2; break;	// Reduction
+			case 3: result = int1 * int2; break;	// Multiplication
+			case 4: result = int1 / int2; break;	// Division
+			default: result = 0; break;
+		}
+		
+		if(!calc) {
+			/* 
+			* Set one 7-segments at a time for every loop,
+			* fast enough to appear as if they're all always on.
+			* Isolation done by the Control Ports
+			*/
+			SegDataPort = DigitTo7SegEncoder(seconds%10,1) | ((1<<8) && (cursor == 0));
+			SegCntrlPort = ~0x01;
+			SegDataPort = DigitTo7SegEncoder(seconds/10,1) | ((1<<8) && (cursor == 1)); 
+			SegCntrlPort = ~0x02;
+			SegDataPort = DigitTo7SegEncoder(minutes%10,1) | ((1<<8) && (cursor == 2));
+			SegCntrlPort = ~0x04;
+			SegDataPort = DigitTo7SegEncoder(minutes/10,1) | ((1<<8) && (cursor == 3)); 
+			SegCntrlPort = ~0x08;
+			SegDataPort = DigitTo7SegEncoder(hours%10,1) | ((1<<8) && (cursor == 4)); 
+			SegCntrlPort = ~0x10;
+			SegDataPort = DigitTo7SegEncoder(hours/10,1) | ((1<<8) && (cursor == 5));
+			SegCntrlPort = ~0x20;
+		} else {
+			SegDataPort = DigitTo7SegEncoder(result%10,1) | ((1<<8) && (cursor == 0));
+			SegCntrlPort = ~0x01;
+			SegDataPort = DigitTo7SegEncoder(result/10,1) | ((1<<8) && (cursor == 1)); 
+			SegCntrlPort = ~0x02;
+			SegDataPort = DigitTo7SegEncoder(int2%10,1) | ((1<<8) && (cursor == 2));
+			SegCntrlPort = ~0x04;
+			SegDataPort = DigitTo7SegEncoder(int2/10,1) | ((1<<8) && (cursor == 3)); 
+			SegCntrlPort = ~0x08;
+			SegDataPort = DigitTo7SegEncoder(int1%10,1) | ((1<<8) && (cursor == 4)); 
+			SegCntrlPort = ~0x10;
+			SegDataPort = DigitTo7SegEncoder(int1/10,1) | ((1<<8) && (cursor == 5));
+			SegCntrlPort = ~0x20;
+		}
  
     }
 	return 0;
@@ -157,6 +218,59 @@ unsigned char DigitTo7SegEncoder(unsigned char digit, unsigned char common)
 				else			SegVal = ~0b01101111;		
 	}		
 	return SegVal;
+}
+
+unsigned char Increment(unsigned char digit)
+{
+	if(!calc) {
+		switch(digit) {
+			case 0:
+				if (seconds % 10 < 9) seconds++;
+				else seconds = (seconds / 10) * 10;
+				break;
+			case 1:
+				if (seconds + 10 < 60) seconds += 10;
+				else seconds %= 10;
+				break;
+			case 2:
+				if (minutes % 10 < 9) minutes++;
+				else minutes = (minutes / 10) * 10;
+				break;
+			case 3:
+				if (minutes + 10 < 60) minutes += 10;
+				else minutes %= 10;
+				break;
+			case 4:
+				if (hours % 10 < 9) hours++;
+				else hours = (hours / 10) * 10;
+				break;
+			case 5:
+				if (hours + 10 < 24) hours += 10;
+				else hours %= 10;
+				break;
+		}
+	} else {
+		switch(digit) {
+			case 0: break;	// Can't change result
+			case 1: break;
+			case 2:
+				if (int2 % 10 < 9) int2++;
+				else int2 = (int2 / 10) * 10;
+				break;
+			case 3:
+				if (int2 + 10 < 100) int2 += 10;
+				else int2 %= 10;
+				break;
+			case 4:
+				if (int1 % 10 < 9) int1++;
+				else int1 = (int1 / 10) * 10;
+				break;
+			case 5:
+				if (int1 + 10 < 100) int1 += 10;
+				else int1 %= 10;
+				break;
+		}
+	}
 }
  
 /*Timer Counter 1 Compare Match A Interrupt Service Routine/Interrupt Handler*/
