@@ -9,17 +9,17 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
  
-#define SegDataPort		PORTB	// Output buffer
-#define SegDataPin		PINB	// Input buffer
-#define SegDataDDR		DDRB
+#define SegDataPort		PORTD	// Output buffer
+#define SegDataPin		PIND	// Input buffer
+#define SegDataDDR		DDRD
  
-#define SegCntrlPort	PORTC
-#define SegCntrlPin		PINC
-#define SegCntrlDDR		DDRC
+#define SegCntrlPort	PORTB
+#define SegCntrlPin		PINB
+#define SegCntrlDDR		DDRB
 
-#define ButPort			PORTD
-#define ButPin			PIND
-#define ButDDR			DDRD
+#define ButPort			PORTC
+#define ButPin			PINC
+#define ButDDR			DDRC
 
  
 /*Global Variables Declarations*/
@@ -96,7 +96,7 @@ int main(void)
 		for(unsigned char i = 0; i < 3; i++) {
 			
 			// Check rising, button isn't active while previously it's
-			if(!(~ButPort && (1<<i)) && (~pbut && (1<<i))) {
+			if(!(~ButPin && (1<<i)) && (~pbut && (1<<i))) {
 				
 				switch(i) {
 					case 0:	// Cycle between multiple modes
@@ -117,7 +117,7 @@ int main(void)
 
 		}
 		
-        pbut = ButPort;	// Store button state
+        pbut = ButPin;	// Store button state
 		
 		// Calculate result on-the-fly
 		switch(calc) {
