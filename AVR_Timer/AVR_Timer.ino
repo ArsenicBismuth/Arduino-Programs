@@ -9,20 +9,42 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
  
-#define SegDataPort		PORTD	// Output buffer
-#define SegDataPin		PIND	// Input buffer
+// PORT	= Output buffer
+// PIN	= Input buffer
+
+// Should be ((PORTB << (16-2)) | (PORTD >> 2)),
+// but it's illegal for data assigment since they're
+// two separate variables
+/*
+#define SegDataPort		PORTD
+#define SegDataPin		PIND
 #define SegDataDDR		DDRD
  
-#define SegCntrlPort	PORTB
-#define SegCntrlPin		PINB
-#define SegCntrlDDR		DDRB
+#define SegCntrlPort	PORTC
+#define SegCntrlPin		PINC
+#define SegCntrlDDR		DDRC
+ 
+// Should be (PORTB >> 2)
+#define ButPort			PORTB
+#define ButPin			PINB
+#define ButDDR			DDRB
+*/
 
-#define ButPort			PORTC
-#define ButPin			PINC
-#define ButDDR			DDRC
-
+// For data reading, below is legal
+#define ButPin			(PINB >> 2)
  
 /*Global Variables Declarations*/
+unsigned char SegDataPort = 0;
+/* 
+* Port combiner
+* Combine PORTB[1:0] & PORTD[7:2]
+*	SegDataPort = [B1...B0, D7...D2]
+*				= (((PORTB & 0b00000011) << (7-2)) | ((PORTD & 0b11111100) >> 2));	
+* Thus, use below for applying
+*	PORTB |= (SegDataPort >> (7-2)) & 0b00000011;
+*	PORTD |= (SegDataPort << 2) & 0b11111100;
+*/
+
 unsigned char hours = 0;
 unsigned char minutes = 0;
 unsigned char seconds = 0;
@@ -54,6 +76,9 @@ unsigned char DigitTo7SegEncoder(unsigned char digit, unsigned char common);
 
 /*Increment any of six digits based on location*/
 unsigned char Increment(unsigned char digit);
+
+/*Update combined ports used by the 7-segments*/
+unsigned char UpdateMultiPorts();
  
 /*Timer Counter 1 Compare Match A Interrupt Service Routine/Interrupt Handler*/
 ISR(TIMER1_COMPA_vect);
@@ -64,20 +89,19 @@ ISR(TIMER1_COMPA_vect);
 int main(void)
 {
 	// MCU parameter configs
-    SegDataDDR = 0xFF;	 // Output
+	DDRD = 0xFF << 2;		// Output 7-segment data [7:2]
+	DDRB = 0xFF >> (7-2);	// Output 7-segment data [1:0], Input [7:2]
 	
-	SegCntrlDDR = 0xFF;	 // Output
-	SegCntrlPort = 0xFF; // HIGH
+	DDRB = 0x00;		// Enable pullup
 	
-	ButDDR = 0x00;	// Input
-	ButPort = 0x00;	// Enable pullup
+	DDRC = 0xFF;		// Output 7-segment common pin (control)
+	PORTC = 0xFF;		// HIGH 7-segment common pin
  
 	// TCNT1						// Background variable which counts system clock ticks after modified by Prescaler 1
 	TCCR1B = (1<<CS12|1<<CS10|1<<WGM12);	// Clock Select 1, prescaler set as 1/1024. // Clear Time on Compare 1, set Timer/Counter mode to CTC
 	OCR1A = 15625-1;				// Ouput Compare Match, value to be referenced when comparing
 	TIMSK1 = 1<<OCIE1A;				// Timer/Counter1, Output Compare A Match Interrupt enable
 	sei();							// Set global interrupt flag
- 
  
 	while(1) {
 		/*
@@ -135,34 +159,58 @@ int main(void)
 			* Isolation done by the Control Ports
 			*/
 			SegDataPort = DigitTo7SegEncoder(seconds%10,1) | ((1<<8) && (cursor == 0));
-			SegCntrlPort = ~0x01;
+			UpdateMultiPorts();
+			PORTC = ~0x01;
 			SegDataPort = DigitTo7SegEncoder(seconds/10,1) | ((1<<8) && (cursor == 1)); 
-			SegCntrlPort = ~0x02;
+			UpdateMultiPorts();
+			PORTC = ~0x02;
 			SegDataPort = DigitTo7SegEncoder(minutes%10,1) | ((1<<8) && (cursor == 2));
-			SegCntrlPort = ~0x04;
+			UpdateMultiPorts();
+			PORTC = ~0x04;
 			SegDataPort = DigitTo7SegEncoder(minutes/10,1) | ((1<<8) && (cursor == 3)); 
-			SegCntrlPort = ~0x08;
+			UpdateMultiPorts();
+			PORTC = ~0x08;
 			SegDataPort = DigitTo7SegEncoder(hours%10,1) | ((1<<8) && (cursor == 4)); 
-			SegCntrlPort = ~0x10;
+			UpdateMultiPorts();
+			PORTC = ~0x10;
 			SegDataPort = DigitTo7SegEncoder(hours/10,1) | ((1<<8) && (cursor == 5));
-			SegCntrlPort = ~0x20;
+			UpdateMultiPorts();
+			PORTC = ~0x20;
 		} else {
 			SegDataPort = DigitTo7SegEncoder(result%10,1) | ((1<<8) && (cursor == 0));
-			SegCntrlPort = ~0x01;
+			UpdateMultiPorts();
+			PORTC = ~0x01;
 			SegDataPort = DigitTo7SegEncoder(result/10,1) | ((1<<8) && (cursor == 1)); 
-			SegCntrlPort = ~0x02;
+			UpdateMultiPorts();
+			PORTC = ~0x02;
 			SegDataPort = DigitTo7SegEncoder(int2%10,1) | ((1<<8) && (cursor == 2));
-			SegCntrlPort = ~0x04;
+			UpdateMultiPorts();
+			PORTC = ~0x04;
 			SegDataPort = DigitTo7SegEncoder(int2/10,1) | ((1<<8) && (cursor == 3)); 
-			SegCntrlPort = ~0x08;
+			UpdateMultiPorts();
+			PORTC = ~0x08;
 			SegDataPort = DigitTo7SegEncoder(int1%10,1) | ((1<<8) && (cursor == 4)); 
-			SegCntrlPort = ~0x10;
+			UpdateMultiPorts();
+			PORTC = ~0x10;
 			SegDataPort = DigitTo7SegEncoder(int1/10,1) | ((1<<8) && (cursor == 5));
-			SegCntrlPort = ~0x20;
+			UpdateMultiPorts();
+			PORTC = ~0x20;
 		}
  
     }
 	return 0;
+}
+
+unsigned char UpdateMultiPorts()
+{
+	/* 
+	* Port combiner
+	* Combine PORTB[1:0] & PORTD[7:2]
+	*	SegDataPort = [B1...B0, D7...D2]
+	*				= (((PORTB & 0b00000011) << (7-2)) | ((PORTD & 0b11111100) >> 2));	
+	*/
+	PORTB |= (SegDataPort >> (7-2)) & 0b00000011;
+	PORTD |= (SegDataPort << 2) & 0b11111100;
 }
  
 /*
