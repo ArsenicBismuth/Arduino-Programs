@@ -37,12 +37,12 @@
 unsigned char SegDataPort = 0;
 /* 
 * Port combiner
-* Combine PORTB[1:0] & PORTD[7:2]
-*	SegDataPort = [B1...B0, D7...D2]
-*				= (((PORTB & 0b00000011) << (7-2)) | ((PORTD & 0b11111100) >> 2));	
+* Combine PORTD[7:2] & PORTB[1:0]
+*	SegDataPort = [D7...D2, B1...B0]
+*				= ((PORTD & 0b11111100) | (PORTB & 0b00000011));
 * Thus, use below for applying
-*	PORTB |= (SegDataPort >> (7-2)) & 0b00000011;
-*	PORTD |= (SegDataPort << 2) & 0b11111100;
+*	PORTD = (SegDataPort & 0b11111100);
+*	PORTB = (SegDataPort & 0b00000011);
 */
 
 unsigned char hours = 0;
@@ -89,10 +89,11 @@ ISR(TIMER1_COMPA_vect);
 int main(void)
 {
 	// MCU parameter configs
-	DDRD = 0xFF << 2;		// Output 7-segment data [7:2]
-	DDRB = 0xFF >> (7-2);	// Output 7-segment data [1:0], Input [7:2]
+	DDRD = 0b11111100;	// Output 7-segment data [7:2]
+	DDRB = 0b00000011;	// Output 7-segment data [1:0], Input [7:2]
 	
-	DDRB = 0x00;		// Enable pullup
+	PORTD = 0x00;		// Enable pullup on input, set LOW for output
+	PORTB = 0x00;		// Enable pullup on input, set LOW for output
 	
 	DDRC = 0xFF;		// Output 7-segment common pin (control)
 	PORTC = 0xFF;		// HIGH 7-segment common pin
@@ -201,16 +202,16 @@ int main(void)
 	return 0;
 }
 
+/* 
+* Port combiner
+* Combine PORTD[7:2] & PORTB[1:0]
+*	SegDataPort = [D7...D2, B1...B0]
+*				= ((PORTD & 0b11111100) | (PORTB & 0b00000011));
+*/
 unsigned char UpdateMultiPorts()
 {
-	/* 
-	* Port combiner
-	* Combine PORTB[1:0] & PORTD[7:2]
-	*	SegDataPort = [B1...B0, D7...D2]
-	*				= (((PORTB & 0b00000011) << (7-2)) | ((PORTD & 0b11111100) >> 2));	
-	*/
-	PORTB |= (SegDataPort >> (7-2)) & 0b00000011;
-	PORTD |= (SegDataPort << 2) & 0b11111100;
+	PORTD = (SegDataPort & 0b11111100);
+	PORTB = (SegDataPort & 0b00000011);
 }
  
 /*
