@@ -1,6 +1,8 @@
 /*
  * Original: http://www.avr-tutorials.com/projects/atmega16-based-digital-clock
+ * Further Developed by Dafa Faris Muhammad & Daniel Steven
  *
+ * TinkerCAD: https://www.tinkercad.com/things/819XeKP5d56-neat-snicket/editel?sharecode=WGq3tsCr5HTkRXMRe8cOgkFx0VyLV-NySdcAKFX-mCI=
  */ 
  
 #define F_CPU 16000000UL		// 16MHz, default in most Arduino
@@ -52,9 +54,9 @@ unsigned char seconds = 0;
 unsigned char int1 = 0;		// Leftmost number, to be operated against
 unsigned char int2 = 0;
 unsigned char result = 0;
-unsigned char cursor = 0;	// Specify cursor location, displayed using the period
+unsigned char curs = 0;		// Specify cursor location, displayed using the period
 
-unsigned char pbut = 0;		// Previous button state
+unsigned char pbut = 0xFF;	// Previous button state
 unsigned char calc = 0;		// Calculator modes, total of 5: inactive, sum, reduce, multi, div
  
 /*
@@ -87,13 +89,15 @@ ISR(TIMER1_COMPA_vect);
 /*Main Program*/
 /*****************************************************************************/
 int main(void)
-{
+{	
+	// Serial.begin(9600);
+	
 	// MCU parameter configs
 	DDRD = 0b11111100;	// Output 7-segment data [7:2]
 	DDRB = 0b00000011;	// Output 7-segment data [1:0], Input [7:2]
 	
-	PORTD = 0x00;		// Enable pullup on input, set LOW for output
-	PORTB = 0x00;		// Enable pullup on input, set LOW for output
+	PORTD = 0xFF;		// Enable pullup on input, set HIGH for output
+	PORTB = 0xFF;		// Enable pullup on input, set HIGH for output
 	
 	DDRC = 0xFF;		// Output 7-segment common pin (control)
 	PORTC = 0xFF;		// HIGH 7-segment common pin
@@ -121,19 +125,19 @@ int main(void)
 		for(unsigned char i = 0; i < 3; i++) {
 			
 			// Check rising, button isn't active while previously it's
-			if(!(~ButPin && (1<<i)) && (~pbut && (1<<i))) {
+			if(!(~ButPin & (1<<i)) && (~pbut & (1<<i))) {
 				
 				switch(i) {
 					case 0:	// Cycle between multiple modes
-						if(calc < 3) calc++;
+						if(calc < 4) calc++;
 						else calc = 0;
 						break;
 					case 1:	// Increment based on cursor position
-						Increment(cursor);
+						Increment(curs);
 						break;
 					case 2:	// Move cursor
-						if (cursor < 5) cursor++;
-						else cursor = 0;
+						if (curs < 5) curs++;
+						else curs = 0;
 						break;
 					default:
 						break;
@@ -141,8 +145,10 @@ int main(void)
 			}
 
 		}
-		
         pbut = ButPin;	// Store button state
+		
+		/* Serial.print(ButPin,BIN);
+		Serial.print("\n"); */
 		
 		// Calculate result on-the-fly
 		switch(calc) {
@@ -159,43 +165,61 @@ int main(void)
 			* fast enough to appear as if they're all always on.
 			* Isolation done by the Control Ports
 			*/
-			SegDataPort = DigitTo7SegEncoder(seconds%10,1) | ((1<<8) && (cursor == 0));
+			SegDataPort = DigitTo7SegEncoder(seconds%10,1) | ((1<<7) * (curs == 0));
 			UpdateMultiPorts();
 			PORTC = ~0x01;
-			SegDataPort = DigitTo7SegEncoder(seconds/10,1) | ((1<<8) && (cursor == 1)); 
+			/* Serial.print(SegDataPort,BIN);
+			Serial.print("\t");
+			Serial.print(PORTD,BIN);
+			Serial.print("\t");
+			Serial.print(PORTB,BIN);
+			Serial.print("\n"); */
+			_delay_ms(5);
+			SegDataPort = DigitTo7SegEncoder(seconds/10,1) | ((1<<7) * (curs == 1)); 
 			UpdateMultiPorts();
 			PORTC = ~0x02;
-			SegDataPort = DigitTo7SegEncoder(minutes%10,1) | ((1<<8) && (cursor == 2));
+			_delay_ms(5);
+			SegDataPort = DigitTo7SegEncoder(minutes%10,1) | ((1<<7) * (curs == 2));
 			UpdateMultiPorts();
 			PORTC = ~0x04;
-			SegDataPort = DigitTo7SegEncoder(minutes/10,1) | ((1<<8) && (cursor == 3)); 
+			_delay_ms(5);
+			SegDataPort = DigitTo7SegEncoder(minutes/10,1) | ((1<<7) * (curs == 3)); 
 			UpdateMultiPorts();
 			PORTC = ~0x08;
-			SegDataPort = DigitTo7SegEncoder(hours%10,1) | ((1<<8) && (cursor == 4)); 
+			_delay_ms(5);
+			SegDataPort = DigitTo7SegEncoder(hours%10,1) | ((1<<7) * (curs == 4)); 
 			UpdateMultiPorts();
 			PORTC = ~0x10;
-			SegDataPort = DigitTo7SegEncoder(hours/10,1) | ((1<<8) && (cursor == 5));
+			_delay_ms(5);
+			SegDataPort = DigitTo7SegEncoder(hours/10,1) | ((1<<7) * (curs == 5));
 			UpdateMultiPorts();
 			PORTC = ~0x20;
+			_delay_ms(5);
 		} else {
-			SegDataPort = DigitTo7SegEncoder(result%10,1) | ((1<<8) && (cursor == 0));
+			SegDataPort = DigitTo7SegEncoder(result%10,1) | ((1<<7) * (curs == 0));
 			UpdateMultiPorts();
 			PORTC = ~0x01;
-			SegDataPort = DigitTo7SegEncoder(result/10,1) | ((1<<8) && (cursor == 1)); 
+			_delay_ms(5);
+			SegDataPort = DigitTo7SegEncoder(result/10,1) | ((1<<7) * (curs == 1)); 
 			UpdateMultiPorts();
 			PORTC = ~0x02;
-			SegDataPort = DigitTo7SegEncoder(int2%10,1) | ((1<<8) && (cursor == 2));
+			_delay_ms(5);
+			SegDataPort = DigitTo7SegEncoder(int2%10,1) | ((1<<7) * (curs == 2));
 			UpdateMultiPorts();
 			PORTC = ~0x04;
-			SegDataPort = DigitTo7SegEncoder(int2/10,1) | ((1<<8) && (cursor == 3)); 
+			_delay_ms(5);
+			SegDataPort = DigitTo7SegEncoder(int2/10,1) | ((1<<7) * (curs == 3)); 
 			UpdateMultiPorts();
 			PORTC = ~0x08;
-			SegDataPort = DigitTo7SegEncoder(int1%10,1) | ((1<<8) && (cursor == 4)); 
+			_delay_ms(5);
+			SegDataPort = DigitTo7SegEncoder(int1%10,1) | ((1<<7) * (curs == 4)); 
 			UpdateMultiPorts();
 			PORTC = ~0x10;
-			SegDataPort = DigitTo7SegEncoder(int1/10,1) | ((1<<8) && (cursor == 5));
+			_delay_ms(5);
+			SegDataPort = DigitTo7SegEncoder(int1/10,1) | ((1<<7) * (curs == 5));
 			UpdateMultiPorts();
 			PORTC = ~0x20;
+			_delay_ms(5);
 		}
  
     }
@@ -204,14 +228,16 @@ int main(void)
 
 /* 
 * Port combiner
-* Combine PORTD[7:2] & PORTB[1:0]
+* PORTD[7:2] : PORTB[1:0] = SegDataPort & 0x0F
+* Thus, a SegDataPort data equivalents to
 *	SegDataPort = [D7...D2, B1...B0]
 *				= ((PORTD & 0b11111100) | (PORTB & 0b00000011));
 */
 unsigned char UpdateMultiPorts()
 {
-	PORTD = (SegDataPort & 0b11111100);
-	PORTB = (SegDataPort & 0b00000011);
+	// Get the output data from SegDataPort then combine with Pullup settings for inputs
+	PORTD = (SegDataPort & 0b11111100) | 0b00000011;
+	PORTB = (SegDataPort & 0b00000011) | 0b11111100;
 }
  
 /*
@@ -263,6 +289,7 @@ unsigned char DigitTo7SegEncoder(unsigned char digit, unsigned char common)
 	return SegVal;
 }
 
+/*Increment any of six digits based on location*/
 unsigned char Increment(unsigned char digit)
 {
 	if(!calc) {
