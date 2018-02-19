@@ -128,14 +128,14 @@ int main(void)
 			if(!(~ButPin & (1<<i)) && (~pbut & (1<<i))) {
 				
 				switch(i) {
-					case 0:	// Cycle between multiple modes
+					case 2:	// Cycle between multiple modes
 						if(calc < 4) calc++;
 						else calc = 0;
 						break;
 					case 1:	// Increment based on cursor position
 						Increment(curs);
 						break;
-					case 2:	// Move cursor
+					case 0:	// Move cursor
 						if (curs < 5) curs++;
 						else curs = 0;
 						break;
@@ -174,52 +174,52 @@ int main(void)
 			Serial.print("\t");
 			Serial.print(PORTB,BIN);
 			Serial.print("\n"); */
-			_delay_ms(5);
+			_delay_ms(1);
 			SegDataPort = DigitTo7SegEncoder(seconds/10,1) | ((1<<7) * (curs == 1)); 
 			UpdateMultiPorts();
 			PORTC = ~0x02;
-			_delay_ms(5);
+			_delay_ms(1);
 			SegDataPort = DigitTo7SegEncoder(minutes%10,1) | ((1<<7) * (curs == 2));
 			UpdateMultiPorts();
 			PORTC = ~0x04;
-			_delay_ms(5);
+			_delay_ms(1);
 			SegDataPort = DigitTo7SegEncoder(minutes/10,1) | ((1<<7) * (curs == 3)); 
 			UpdateMultiPorts();
 			PORTC = ~0x08;
-			_delay_ms(5);
+			_delay_ms(1);
 			SegDataPort = DigitTo7SegEncoder(hours%10,1) | ((1<<7) * (curs == 4)); 
 			UpdateMultiPorts();
 			PORTC = ~0x10;
-			_delay_ms(5);
+			_delay_ms(1);
 			SegDataPort = DigitTo7SegEncoder(hours/10,1) | ((1<<7) * (curs == 5));
 			UpdateMultiPorts();
 			PORTC = ~0x20;
-			_delay_ms(5);
+			_delay_ms(1);
 		} else {
 			SegDataPort = DigitTo7SegEncoder(result%10,1) | ((1<<7) * (curs == 0));
 			UpdateMultiPorts();
 			PORTC = ~0x01;
-			_delay_ms(5);
+			_delay_ms(1);
 			SegDataPort = DigitTo7SegEncoder(result/10,1) | ((1<<7) * (curs == 1)); 
 			UpdateMultiPorts();
 			PORTC = ~0x02;
-			_delay_ms(5);
+			_delay_ms(1);
 			SegDataPort = DigitTo7SegEncoder(int2%10,1) | ((1<<7) * (curs == 2));
 			UpdateMultiPorts();
 			PORTC = ~0x04;
-			_delay_ms(5);
+			_delay_ms(1);
 			SegDataPort = DigitTo7SegEncoder(int2/10,1) | ((1<<7) * (curs == 3)); 
 			UpdateMultiPorts();
 			PORTC = ~0x08;
-			_delay_ms(5);
+			_delay_ms(1);
 			SegDataPort = DigitTo7SegEncoder(int1%10,1) | ((1<<7) * (curs == 4)); 
 			UpdateMultiPorts();
 			PORTC = ~0x10;
-			_delay_ms(5);
+			_delay_ms(1);
 			SegDataPort = DigitTo7SegEncoder(int1/10,1) | ((1<<7) * (curs == 5));
 			UpdateMultiPorts();
 			PORTC = ~0x20;
-			_delay_ms(5);
+			_delay_ms(1);
 		}
  
     }
