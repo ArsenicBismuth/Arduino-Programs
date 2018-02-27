@@ -25,29 +25,40 @@
 #define SegDataPin		PIND
 #define SegDataDDR		DDRD
  
-#define SegCntrlPort	PORTC
-#define SegCntrlPin		PINC
-#define SegCntrlDDR		DDRC
+#define SegCtrlPort	PORTC
+#define SegCtrlPin		PINC
+#define SegCtrlDDR		DDRC
  
 // Should be (PORTB >> 2)
 #define ButPort			PORTB
 #define ButPin			PINB
 #define ButDDR			DDRB
 */
- 
+
 /*Global Variables Declarations*/
-uint8_t SegDataPort = 0;
+
 /* 
-* Port combiner
-* Combine PORTD[7:2] & PORTB[1:0]
-*	SegDataPort = [D7...D2, B1...B0]
+* Port combiner, ex:
+* PORTD[7:2] (porta) : PORTB[1:0] (portb) = SegData (multi) & 0x0F
+* A SegData data equivalents to
+*	SegData = [D7...D2, B1...B0]
 *				= ((PORTD & 0b11111100) | (PORTB & 0b00000011));
 * Thus, use below for applying
-*	PORTD = (SegDataPort & 0b11111100);
-*	PORTB = (SegDataPort & 0b00000011);
+*	PORTD = (SegData & 0b11111100) | ~0b11111100;
+*	PORTB = (SegData & 0b00000011) | ~0b11111100;
+* Forcing the rest to high, keep pullup settings
 */
 
-#define PINADC 6		// Use A6, only available in SMD ATmega
+uint16_t SegData = 0;	// PORTD[7:2] & PORTB[1:0]
+#define SegDataa PORTD
+#define SegDatab PORTB
+#define SegDataConf 0b11111100
+uint16_t SegCtrl = 0;	// PORTB[7:5] & PORTC[4:0]
+#define SegCtrla PORTB
+#define SegCtrlb PORTC
+#define SegCtrlConf 0b11100000
+
+#define PINADC 5		// Use A6, only available in SMD ATmega
 #define BUTTER 3		// Allowable ADC error from specified button mapping value
 
 uint8_t hours = 0;
@@ -86,7 +97,7 @@ uint8_t DigitTo7SegEncoder(uint8_t digit, uint8_t common);
 void UpdateDisplay(uint8_t d5, uint8_t d4, uint8_t d3, uint8_t d2, uint8_t d1, uint8_t d0, uint8_t dot);
 
 /*Update combined ports used by the 7-segments*/
-void UpdateMultiPorts();
+void UpdateMultiPorts(uint16_t *multi, uint16_t *porta, uint16_t *portb, uint16_t confa,  uint16_t confb, uint8_t force);
 
 /*Read analog data using ADC*/
 uint16_t AnalogRead(uint8_t ch);
@@ -108,18 +119,17 @@ ISR(TIMER1_COMPA_vect);
 /*****************************************************************************/
 int main(void)
 {	
-	Serial.begin(9600);
+	//Serial.begin(9600);
 	
 	/* MCU parameter configs */
 	// Pins initialization
-	DDRD = 0b11111100;	// Output 7-segment data [7:2]
-	DDRB = 0b00000011;	// Output 7-segment data [1:0], Input [7:2]
+	DDRD = SegDataConf;					// Output 7-segment data [7:2]
+	DDRB = ~SegDataConf | SegCtrlConf;	// Output seg data [1:0], Input [5:2], Output seg control [7:6]
+	DDRC = ~SegCtrlConf;				// Output seg common pin (control)
 	
-	PORTD = 0xFF;			// Enable pullup on input, set HIGH for output
-	PORTB = 0xFF;			// Enable pullup on input, set HIGH for output
-	
-	DDRC = 0xFF;		// Output 7-segment common pin (control)
-	PORTC = 0xFF;	// HIGH 7-segment common pin
+	PORTD = 0xFF;		// Enable pullup on input, set HIGH for output
+	PORTB = 0xFF;
+	PORTC = ~SegCtrlConf;
  
 	// Timer initialization
 	// TCNT1						// Background variable which counts system clock ticks after modified by Prescaler 1
@@ -202,15 +212,12 @@ int main(void)
 				case '*': if (intm > 0) intm --; break;		// Decrement
 				case '#': intm = 0; break;					// Clear
 				// Normal input, 0-9. Limit input to 4 digits
-				default: if (intm <= 9999) intm = intm * 10 + pbut; break;
+				default: if (intm <= 999) intm = intm * 10 + pbut; break;
 			}
 		}
         pbut = but;	// Store button state
 		
-		Serial.print(mode);
-		Serial.print(' ');
-		Serial.print(intm);
-		Serial.println();
+		//Serial.print(mode);Serial.print(' ');Serial.print(intm);Serial.println();
 		
 		/*Calculation handling*/
 		switch(mode) {
@@ -253,25 +260,34 @@ int main(void)
 void UpdateDisplay(uint8_t d5, uint8_t d4, uint8_t d3, uint8_t d2, uint8_t d1, uint8_t d0, uint8_t dot){
 	uint8_t digits[6] = {d0, d1, d2, d3, d4, d5};
 	for (int i = 0; i < 6; i++) {
-		SegDataPort = DigitTo7SegEncoder(digits[i], 1) | ((1<<7) * (dot == i));
-		UpdateMultiPorts();
-		PORTC = ~(0x01<<i) & ~0x1;
-		_delay_ms(1);
+		SegData = DigitTo7SegEncoder(digits[i], 1) | ((1<<7) * (dot == i));
+		SegCtrl = ~(0x01<<i);
+		UpdateMultiPorts(&SegData, (uint16_t*)&SegDataa, (uint16_t*)&SegDatab, SegDataConf,  ~SegDataConf, 1);
+		UpdateMultiPorts(&SegCtrl, (uint16_t*)&SegCtrla, (uint16_t*)&SegCtrlb, SegCtrlConf,  ~SegCtrlConf, 1);
+		_delay_ms(2);
 	}
 }
 
 /* 
-* Port combiner
-* PORTD[7:2] : PORTB[1:0] = SegDataPort & 0x0F
-* Thus, a SegDataPort data equivalents to
-*	SegDataPort = [D7...D2, B1...B0]
+* Port combiner, ex:
+* PORTD[7:2] (porta) : PORTB[1:0] (portb) = SegData (multi) & 0x0F
+* Thus, a SegData data equivalents to
+*	SegData = [D7...D2, B1...B0]
 *				= ((PORTD & 0b11111100) | (PORTB & 0b00000011));
+uint16_t SegData = 0;	// PORTD[7:2] & PORTB[1:0]
+#define SegDataa PORTD
+#define SegDatab PORTB
+#define SegDataConf 0b11111100
+uint16_t SegCtrl = 0;	// PORTB[7:5] & PORTC[4:0]
+#define SegCtrla PORTB
+#define SegCtrlb PORTC
+#define SegCtrlConf 0b11100000
 */
-void UpdateMultiPorts()
+void UpdateMultiPorts(uint16_t *multi, uint16_t *porta, uint16_t *portb, uint16_t confa,  uint16_t confb, uint8_t force)
 {
-	// Get the output data from SegDataPort then combine with Pullup settings for inputs
-	PORTD = (SegDataPort & 0b11111100) | 0b00000011;
-	PORTB = (SegDataPort & 0b00000011) | 0b11111100;
+	// Get the output data from MultiPorts then keep the data not used by the multi
+	*porta = (*multi & confa) | (*porta & ~confa);
+	*portb = (*multi & confb) | (*portb & ~confb);
 }
  
 /*
@@ -363,7 +379,7 @@ uint8_t Button(uint16_t adc, uint16_t error)
 		i++;
 	}
 	
-	Serial.print(adc); Serial.print(' '); Serial.print(button); Serial.print(' ');
+	//Serial.print(adc); Serial.print(' '); Serial.print(button); Serial.print(' ');
 	
 	return button;
 }
