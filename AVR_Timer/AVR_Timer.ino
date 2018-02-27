@@ -97,7 +97,7 @@ uint8_t DigitTo7SegEncoder(uint8_t digit, uint8_t common);
 void UpdateDisplay(uint8_t d5, uint8_t d4, uint8_t d3, uint8_t d2, uint8_t d1, uint8_t d0, uint8_t dot);
 
 /*Update combined ports used by the 7-segments*/
-void UpdateMultiPorts(uint16_t *multi, uint16_t *porta, uint16_t *portb, uint16_t confa,  uint16_t confb, uint8_t force);
+void UpdateMultiPorts(uint16_t *multi, uint16_t *porta, uint16_t *portb, uint16_t confa,  uint16_t confb);
 
 /*Read analog data using ADC*/
 uint16_t AnalogRead(uint8_t ch);
@@ -262,8 +262,8 @@ void UpdateDisplay(uint8_t d5, uint8_t d4, uint8_t d3, uint8_t d2, uint8_t d1, u
 	for (int i = 0; i < 6; i++) {
 		SegData = DigitTo7SegEncoder(digits[i], 1) | ((1<<7) * (dot == i));
 		SegCtrl = ~(0x01<<i);
-		UpdateMultiPorts(&SegData, (uint16_t*)&SegDataa, (uint16_t*)&SegDatab, SegDataConf,  ~SegDataConf, 1);
-		UpdateMultiPorts(&SegCtrl, (uint16_t*)&SegCtrla, (uint16_t*)&SegCtrlb, SegCtrlConf,  ~SegCtrlConf, 1);
+		UpdateMultiPorts(&SegData, (uint16_t*)&SegDataa, (uint16_t*)&SegDatab, SegDataConf,  ~SegDataConf);
+		UpdateMultiPorts(&SegCtrl, (uint16_t*)&SegCtrla, (uint16_t*)&SegCtrlb, SegCtrlConf,  ~SegCtrlConf);
 		_delay_ms(2);
 	}
 }
@@ -283,9 +283,9 @@ uint16_t SegCtrl = 0;	// PORTB[7:5] & PORTC[4:0]
 #define SegCtrlb PORTC
 #define SegCtrlConf 0b11100000
 */
-void UpdateMultiPorts(uint16_t *multi, uint16_t *porta, uint16_t *portb, uint16_t confa,  uint16_t confb, uint8_t force)
+void UpdateMultiPorts(uint16_t *multi, uint16_t *porta, uint16_t *portb, uint16_t confa,  uint16_t confb)
 {
-	// Get the output data from MultiPorts then keep the data not used by the multi
+	// Get the corresponding port data from multi and keep the data unused the multi
 	*porta = (*multi & confa) | (*porta & ~confa);
 	*portb = (*multi & confb) | (*portb & ~confb);
 }
