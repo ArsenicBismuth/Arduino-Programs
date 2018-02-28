@@ -209,8 +209,8 @@ int main(void)
 					}
 					break;
 				// Non-mode buttons
-				case '*': if (intm > 0) intm --; break;		// Decrement
-				case '#': intm = 0; break;					// Clear
+				case '*': intm /= 10; break;	// Undo latest number input
+				case '#': intm = 0; break;		// Clear
 				// Normal input, 0-9. Limit input to 4 digits
 				default: if (intm <= 999) intm = intm * 10 + pbut; break;
 			}
@@ -332,15 +332,15 @@ ISR(TIMER1_COMPA_vect)
 {
 	seconds++;
  
-	if(seconds == 60) {
+	if(seconds >= 60) {
 		seconds = 0;
 		minutes++;
 	}
-	if(minutes == 60) {
+	if(minutes >= 60) {
 		minutes = 0;
 		hours++;		
 	}
-	if(hours > 23)
+	if(hours >= 24)
 		hours = 0;
 }
 
