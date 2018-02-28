@@ -1,10 +1,10 @@
 /*
- * Original: http://www.avr-tutorials.com/projects/atmega16-based-digital-clock
- * Further Developed by Dafa Faris Muhammad & Daniel Steven
+ * Developed by Dafa Faris Muhammad & Daniel Steven
  *
  * TinkerCAD: https://www.tinkercad.com/things/2AZw3X21r0k-copy-of-neat-snicket/editel?sharecode=ebuvlFIe8aLPWZyW79dfbpua2jYm88cSwJwrc6oba88=
  * Keypad Resistors: http://www.microchip.com/forums/m/tm.aspx?m=694613&p=1
  * ADC Reference: http://maxembedded.com/2011/06/the-adc-of-the-avr/
+ * Timer Reference: http://www.avr-tutorials.com/projects/atmega16-based-digital-clock
  */ 
  
 #define F_CPU 16000000UL		// 16MHz, default in most Arduino
@@ -19,21 +19,8 @@
 
 // Should be ((PORTB << (16-2)) | (PORTD >> 2)),
 // but it's illegal for data assigment since they're
-// two separate variables
-/*
-#define SegDataPort		PORTD
-#define SegDataPin		PIND
-#define SegDataDDR		DDRD
- 
-#define SegCtrlPort	PORTC
-#define SegCtrlPin		PINC
-#define SegCtrlDDR		DDRC
- 
-// Should be (PORTB >> 2)
-#define ButPort			PORTB
-#define ButPin			PINB
-#define ButDDR			DDRB
-*/
+// two separate variables.
+// Legal case would be reading multiple ports.
 
 /*Global Variables Declarations*/
 
@@ -100,7 +87,7 @@ void UpdateDisplay(uint8_t d5, uint8_t d4, uint8_t d3, uint8_t d2, uint8_t d1, u
 void UpdateMultiPorts(uint16_t *multi, uint16_t *porta, uint16_t *portb, uint16_t confa,  uint16_t confb);
 
 /*Read analog data using ADC*/
-uint16_t AnalogRead(uint8_t ch);
+uint16_t AdcRead(uint8_t ch);
 
 /*Map Buttons from ADC Reading*/
 uint8_t Button(uint8_t adc, uint8_t error);
@@ -154,13 +141,13 @@ int main(void)
 		* Modes:
 		* - [A] Clock		(mode 0)
 		* - [B] Set Clock	(mode 1) Can't adjust the last two seconds due to int16 limitation
-		* - [C] Calculator	(mode 2 input A, mode 3 input B, mode 4-7 various results)
-		* - [D] Enter		(apply & increment calculator modes)
+		* - [C] Calculator	(mode 2 input A, mode 3 input B, mode 4-7 various calc results)
+		* - [D] Enter		(apply or increment calculator modes)
 		*/
 		
 		/*Button & mode handling*/
 		// Basic multi buttons management from single ADC pin
-		but = Button(AnalogRead(PINADC), BUTTER);
+		but = Button(AdcRead(PINADC), BUTTER);	// Get mapped button data from ADC reading with error BUTTER
 		
 		// Check rising, button isn't active while previously it's
 		if((but == 255) && (pbut != 255)) {
@@ -274,14 +261,6 @@ void UpdateDisplay(uint8_t d5, uint8_t d4, uint8_t d3, uint8_t d2, uint8_t d1, u
 * Thus, a SegData data equivalents to
 *	SegData = [D7...D2, B1...B0]
 *				= ((PORTD & 0b11111100) | (PORTB & 0b00000011));
-uint16_t SegData = 0;	// PORTD[7:2] & PORTB[1:0]
-#define SegDataa PORTD
-#define SegDatab PORTB
-#define SegDataConf 0b11111100
-uint16_t SegCtrl = 0;	// PORTB[7:5] & PORTC[4:0]
-#define SegCtrla PORTB
-#define SegCtrlb PORTC
-#define SegCtrlConf 0b11100000
 */
 void UpdateMultiPorts(uint16_t *multi, uint16_t *porta, uint16_t *portb, uint16_t confa,  uint16_t confb)
 {
@@ -345,7 +324,7 @@ ISR(TIMER1_COMPA_vect)
 }
 
 /*Read analog data using ADC*/
-uint16_t AnalogRead(uint8_t ch)
+uint16_t AdcRead(uint8_t ch)
 {
   // select the corresponding channel 0~7
   // ANDing with ’7′ will always keep the value
