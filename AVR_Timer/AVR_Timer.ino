@@ -29,24 +29,25 @@
 * PORTD[7:2] (porta) : PORTB[1:0] (portb) = SegData (multi) & 0x0F
 * A SegData data equivalents to
 *	SegData = [D7...D2, B1...B0]
-*				= ((PORTD & 0b11111100) | (PORTB & 0b00000011));
+*			= ((PORTD & 0b11111100) | (PORTB & 0b00000011));
 * Thus, use below for applying
-*	PORTD = (SegData & 0b11111100) | ~0b11111100;
-*	PORTB = (SegData & 0b00000011) | ~0b11111100;
+*	PORTD = (SegData & 0b11111100) | (PORTD & ~0b11111100);
+*	PORTB = (SegData & 0b00000011) | (PORTB & ~0b11111100);
 * Forcing the rest to high, keep pullup settings
 */
 
-uint16_t SegData = 0;	// PORTD[7:2] & PORTB[1:0]
+uint8_t SegData = 0;	// PORTD[7:2] & PORTB[1:0]
 #define SegDataa PORTD
 #define SegDatab PORTB
 #define SegDataConf 0b11111100
-uint16_t SegCtrl = 0;	// PORTB[7:5] & PORTC[4:0]
+uint8_t SegCtrl = 0;	// PORTB[7:5] & PORTC[4:0]
 #define SegCtrla PORTB
 #define SegCtrlb PORTC
 #define SegCtrlConf 0b11100000
 
+#define DOSERIAL 0		// Wether to use serial or not. Improve speed if disabled.
 #define PINADC 5		// Use A6, only available in SMD ATmega
-#define BUTTER 3		// Allowable ADC error from specified button mapping value
+#define BUTTER 6		// Allowable ADC error from specified button mapping value
 
 uint8_t hours = 0;
 uint8_t minutes = 0;
@@ -84,7 +85,7 @@ uint8_t DigitTo7SegEncoder(uint8_t digit, uint8_t common);
 void UpdateDisplay(uint8_t d5, uint8_t d4, uint8_t d3, uint8_t d2, uint8_t d1, uint8_t d0, uint8_t dot);
 
 /*Update combined ports used by the 7-segments*/
-void UpdateMultiPorts(uint16_t *multi, uint16_t *porta, uint16_t *portb, uint16_t confa,  uint16_t confb);
+void UpdateMultiPorts(uint8_t *multi, volatile uint8_t *porta, volatile uint8_t *portb, uint8_t confa,  uint8_t confb);
 
 /*Read analog data using ADC*/
 uint16_t AdcRead(uint8_t ch);
@@ -106,7 +107,7 @@ ISR(TIMER1_COMPA_vect);
 /*****************************************************************************/
 int main(void)
 {	
-	//Serial.begin(9600);
+	if (DOSERIAL) Serial.begin(9600);
 	
 	/* MCU parameter configs */
 	// Pins initialization
@@ -188,10 +189,12 @@ int main(void)
 							intm = 0;
 							mode++;
 							break;
-						case 4:
+						case 4: // Fallthrough
 						case 5:
 						case 6: mode++; break;	 // Go to the next calculation mode
-						case 7: mode = 2; break; // Loop again, to review
+						case 7: 
+							mode = 4;	 // Loop again, to review
+							break;
 						default: break;
 					}
 					break;
@@ -204,7 +207,7 @@ int main(void)
 		}
         pbut = but;	// Store button state
 		
-		//Serial.print(mode);Serial.print(' ');Serial.print(intm);Serial.println();
+		if (DOSERIAL) {Serial.print(mode);Serial.print(' ');Serial.print(intm);Serial.println();}
 		
 		/*Calculation handling*/
 		switch(mode) {
@@ -223,7 +226,7 @@ int main(void)
 			case 1: UpdateDisplay(intm/1000, intm%1000/100, intm%100/10, intm%10, seconds/10, seconds%10, 2); break;
 			case 2: UpdateDisplay('a', '=', intm/1000%10, intm/100%10, intm/10%10, intm%10, curs); break;
 			case 3: UpdateDisplay('b', '=', intm/1000%10, intm/100%10, intm/10%10, intm%10, curs); break;
-			case 4: 
+			case 4: // Fallthrough
 			case 5:
 			case 6:
 			case 7: 
@@ -242,16 +245,17 @@ int main(void)
 * Ordered from leftmost to rightmost.
 * Set one 7-segments at a time for every loop,
 * fast enough to appear as if they're all always on.
-* Isolation done by the Control Ports
+* Isolation done by the Control Ports.
 */
 void UpdateDisplay(uint8_t d5, uint8_t d4, uint8_t d3, uint8_t d2, uint8_t d1, uint8_t d0, uint8_t dot){
 	uint8_t digits[6] = {d0, d1, d2, d3, d4, d5};
 	for (int i = 0; i < 6; i++) {
 		SegData = DigitTo7SegEncoder(digits[i], 1) | ((1<<7) * (dot == i));
 		SegCtrl = ~(0x01<<i);
-		UpdateMultiPorts(&SegData, (uint16_t*)&SegDataa, (uint16_t*)&SegDatab, SegDataConf,  ~SegDataConf);
-		UpdateMultiPorts(&SegCtrl, (uint16_t*)&SegCtrla, (uint16_t*)&SegCtrlb, SegCtrlConf,  ~SegCtrlConf);
-		_delay_ms(2);
+		
+		UpdateMultiPorts(&SegData, &SegDataa, &SegDatab, SegDataConf,  ~SegDataConf);
+		UpdateMultiPorts(&SegCtrl, &SegCtrla, &SegCtrlb, SegCtrlConf,  ~SegCtrlConf);
+		_delay_ms(1);
 	}
 }
 
@@ -260,9 +264,10 @@ void UpdateDisplay(uint8_t d5, uint8_t d4, uint8_t d3, uint8_t d2, uint8_t d1, u
 * PORTD[7:2] (porta) : PORTB[1:0] (portb) = SegData (multi) & 0x0F
 * Thus, a SegData data equivalents to
 *	SegData = [D7...D2, B1...B0]
-*				= ((PORTD & 0b11111100) | (PORTB & 0b00000011));
+*			= ((PORTD & 0b11111100) | (PORTB & 0b00000011));
+* [Important] Globally accessed data like MCU special registers must use volatile keyword
 */
-void UpdateMultiPorts(uint16_t *multi, uint16_t *porta, uint16_t *portb, uint16_t confa,  uint16_t confb)
+void UpdateMultiPorts(uint8_t *multi, volatile uint8_t *porta, volatile uint8_t *portb, uint8_t confa,  uint8_t confb)
 {
 	// Get the corresponding port data from multi and keep the data unused the multi
 	*porta = (*multi & confa) | (*porta & ~confa);
@@ -347,8 +352,8 @@ uint16_t AdcRead(uint8_t ch)
 /*Map Buttons from ADC Reading*/
 uint8_t Button(uint16_t adc, uint16_t error)
 {
-	uint8_t buts[16] = {  1,  2,  3,'a',  4,  5,  6,'b',  7,  8,  9,'c','*' ,0,'#','d'};
-	uint16_t adcs[16] = {559,541,521,500,480,456,428,398,370,334,293,247,203,145, 78,  0};
+	uint8_t buts[16]  = {  1,  2,  3,'a',  4,  5,  6,'b',  7,  8,  9,'c','*' , 0,'#', 'd'};
+	uint16_t adcs[16] = {564,546,527,506,489,463,437,409,380,345,306,262,219,160, 96,  22};
 	
 	uint8_t i = 0;
 	uint8_t button = 255;	// Default state, unpressed
@@ -358,8 +363,9 @@ uint8_t Button(uint16_t adc, uint16_t error)
 		i++;
 	}
 	
-	//Serial.print(adc); Serial.print(' '); Serial.print(button); Serial.print(' ');
+	if (DOSERIAL) {Serial.print(adc); Serial.print(' '); Serial.print(button); Serial.print(' ');}
 	
+	_delay_ms(10);
 	return button;
 }
 
