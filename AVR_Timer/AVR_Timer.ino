@@ -201,8 +201,9 @@ int main(void)
 				// Non-mode buttons
 				case '*': intm /= 10; break;	// Undo latest number input
 				case '#': intm = 0; break;		// Clear
-				// Normal input, 0-9. Limit input to 4 digits
-				default: if (intm <= 999) intm = intm * 10 + pbut; break;
+				// Normal input, 0-9. Limit input to 4 digits.
+				// Convert char to int
+				default: if (intm <= 999) intm = intm * 10 + (pbut - '0'); break;
 			}
 		}
         pbut = but;	// Store button state
@@ -352,8 +353,9 @@ uint16_t AdcRead(uint8_t ch)
 /*Map Buttons from ADC Reading*/
 uint8_t Button(uint16_t adc, uint16_t error)
 {
-	uint8_t buts[16]  = {  1,  2,  3,'a',  4,  5,  6,'b',  7,  8,  9,'c','*' , 0,'#', 'd'};
-	uint16_t adcs[16] = {564,546,527,506,489,463,437,409,380,345,306,262,219,160, 96,  22};
+	// Mapping in both char & int is possible, but using all in char will prevent aliasing
+	uint8_t buts[16]  = {'1','2','3','a','4','5','6','b','7','8','9','c','*','0','#','d'};
+	uint16_t adcs[16] = {564,546,527,506,489,463,437,409,380,345,306,262,219,160, 96, 22};
 	
 	uint8_t i = 0;
 	uint8_t button = 255;	// Default state, unpressed
