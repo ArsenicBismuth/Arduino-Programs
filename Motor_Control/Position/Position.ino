@@ -5,6 +5,8 @@
    Rotary Enc Ref : https://playground.arduino.cc/Main/RotaryEncoders
 */
 
+#include <TimerOne.h>
+
 // usually the rotary encoders three pins have the ground pin in the middle
 enum PinAssignments {
   encPinA = 2,   // right
@@ -19,15 +21,15 @@ static boolean rotating = false;    // debounce management
 float ang = 0.0;
 int spd = 0;
 
-char dc = 0;        // Duty-cycle
-int sp = 0;         // Set-point (degree)
-float kp = 1;       // proportional
-float ki = 0;       // sum
-float kd = 0;       // difference
+volatile char dc = 0;       // Duty-cycle
+volatile int sp = 0;        // Set-point (degree)
+volatile float kp = 1;      // proportional
+volatile float ki = 0;      // sum
+volatile float kd = 0;      // difference
 
-float e = 0;        // Error        
-float e_prev = 0;   // Previous error
-float e_sum = 0;    // Error sum
+volatile float e = 0;       // Error        
+volatile float e_prev = 0;  // Previous error
+volatile float e_sum = 0;   // Error sum
 
 unsigned long cmillis = 0;          // Current time
 unsigned long pmillis = 0;          // Previous time
@@ -49,6 +51,10 @@ void setup() {
     attachInterrupt(0, doencA, CHANGE);
     // encoder pin on interrupt 1 (pin 3)
     attachInterrupt(1, doencB, CHANGE);
+
+    Timer1.initialize(1000);            // Time in us
+    Timer1.attachInterrupt(pidCalc);    // Calculate error at 1kHz
+    // Setting the error calculation rate is equivalent to setting the sampling rate
     
     Serial.begin(9600);  // output
     Serial.println("Angle(n) \tAngle(deg) \tSpeed(RPM)");
@@ -79,15 +85,20 @@ void loop() {
         sp = Serial.readStringUntil('\n').toInt();
     }
 
+    pidCalc();
+    
+    // Output
+    if (dc > 100) dc = 100;
+    analogWrite(outPWM, dc*255/100);
+}
+
+// Interrupt at 1kHz
+void pidCalc() {
     // PID
     e = sp - ang;
     dc = e*kp + e_sum*ki + (e - e_prev)*kd;
     e_prev = e;
     e_sum += e;
-
-    // Output
-    if (dc > 100) dc = 100;
-    analogWrite(outPWM, dc*255/100);
 }
 
 // Interrupt on A changing state
