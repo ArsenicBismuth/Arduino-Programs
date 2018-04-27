@@ -15,13 +15,13 @@
 #include <util/setbaud.h>
 #include <stdio.h>
 
-volatile unsigned long encPos = 0;   // a counter for the dial
-unsigned long lastReportedPos = 1;   // change management
+volatile unsigned long encPos = 0;  // a counter for the dial
+unsigned long lastReportedPos = 1;  // change management
 static boolean rotating = false;    // debounce management
 float ang = 0.0;
-int spd = 0;
+float spd = 0.0;
 
-unsigned long m = 0;          // Current time
+unsigned long m = 0;                // Current time
 unsigned long cmillis = 0;          // Current time
 unsigned long pmillis = 0;          // Previous time
 
@@ -103,7 +103,6 @@ int main(void) {
     
     // Encoder
     DDRD &= ~(1 << encPinA) & ~(1 << encPinB);  // Clear the pins, turning into input
-
     PORTD |= (1 << encPinA) | (1 << encPinB);   // turn on the Pull-up
 
     EICRA |= (1 << ISC00) | (1 << ISC01);       // Set the interrupts to trigger on ANY logic change
@@ -126,17 +125,18 @@ int main(void) {
     while (1) {
         cmillis = m;
         rotating = 1;  // reset the debouncer
-        
-        if (lastReportedPos != encPos) {
-            printf("%d\t", encPos);
-            ang = encPos * 3.0 / 20.0;    // Max 9830.25 Min 0.15 (degrees)
-            printf("%.2f\t", ang);
-            spd = (encPos - lastReportedPos) * 1000 * 0.15 / (cmillis - pmillis) * 360 / 60;
-            printf("%d\n", spd);
+
+        printf("%d\t", encPos);
+        printf("%.2f\t", ang);
+        printf("%d\n", spd);
             
+        if (lastReportedPos != encPos) {
+            ang = encPos * 0.15 * 4;    // Max 9830.25 Min 0.15 (degrees)
+            spd = (encPos - lastReportedPos) * 1000 * 0.15 * 4/ (cmillis - pmillis) * 360 / 60;
             lastReportedPos = encPos;
             pmillis = cmillis;
-        }
+        } else
+            spd = 0;
     }
     return 1;
 }

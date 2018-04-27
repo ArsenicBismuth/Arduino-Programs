@@ -11,17 +11,19 @@
 enum PinAssignments {
   encPinA = 2,   // right
   encPinB = 3,   // left
-  outPWM = 5
+  outPWM = 5,
+  dirA = 9,
+  dirB = 8
 };
 
-volatile unsigned long encPos = 0;   // a counter for the dial
-unsigned long lastReportedPos = 1;   // change management
+volatile unsigned long encPos = 0;  // a counter for the dial
+unsigned long lastReportedPos = 1;  // change management
 static boolean rotating = false;    // debounce management
 
 float ang = 0.0;
-int spd = 0;
+float spd = 0;
 
-volatile char dc = 0;       // Duty-cycle
+volatile int dc = 0;       // Duty-cycle
 volatile int sp = 0;        // Set-point (degree)
 volatile float kp = 1;      // proportional
 volatile float ki = 0;      // sum
@@ -42,10 +44,16 @@ void setup() {
     pinMode(encPinA, INPUT);
     pinMode(encPinB, INPUT);
     pinMode(outPWM, OUTPUT);
+    pinMode(dirA, OUTPUT);
+    pinMode(dirB, OUTPUT);
     
     // turn on pullup resistors
     digitalWrite(encPinA, HIGH);
     digitalWrite(encPinB, HIGH);
+
+    // H-Bridge direction
+    digitalWrite(dirA, HIGH);
+    digitalWrite(dirB, LOW);
     
     // encoder pin on interrupt 0 (pin 2)
     attachInterrupt(0, doencA, CHANGE);
@@ -64,21 +72,19 @@ void setup() {
 void loop() {
     cmillis = millis();
     rotating = true;  // reset the debouncer
-
+    
+    Serial.print(sp); Serial.print("\t");
+    Serial.print(encPos, DEC); Serial.print("\t");
+    Serial.print(ang, 2); Serial.print("\t");
+    Serial.println(spd, 2);
+    
     if (lastReportedPos != encPos) {
-        Serial.print(encPos, DEC);
-        Serial.print("\t");
-        
-        ang = encPos * 0.15;    // Max 9830.25 deg or 27.30625 rev
-        Serial.print(ang, 2);
-        Serial.print("\t");
-
-        spd = (encPos - lastReportedPos) * 1000 * 0.15 / (cmillis - pmillis) * 360 / 60;
-        Serial.println(spd);
-        
+        ang = encPos * 0.15 * 4;    // Max 9830.25 deg or 27.30625 rev
+        spd = (encPos - lastReportedPos) * 1000 * 0.15 * 4 / (cmillis - pmillis) * 360 / 60;
         lastReportedPos = encPos;
         pmillis = cmillis;
-    }
+    } else
+        spd = 0;
 
     // Serial, only process if there's data in the buffer
     if (Serial.available() > 0) {
@@ -88,6 +94,17 @@ void loop() {
     pidCalc();
     
     // Output
+    if (dc < 0) {
+      // CCW
+      digitalWrite(dirA, LOW);
+      digitalWrite(dirB, HIGH);
+      dc *= -1;
+    } else {
+      // CW
+      digitalWrite(dirA, HIGH);
+      digitalWrite(dirB, LOW);
+    }
+    
     if (dc > 100) dc = 100;
     analogWrite(outPWM, dc*255/100);
 }

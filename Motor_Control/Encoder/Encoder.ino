@@ -14,8 +14,9 @@ enum PinAssignments {
 volatile unsigned long encPos = 0;   // a counter for the dial
 unsigned long lastReportedPos = 1;   // change management
 static boolean rotating = false;    // debounce management
+
 float ang = 0.0;
-int spd = 0;
+float spd = 0;
 
 unsigned long cmillis = 0;          // Current time
 unsigned long pmillis = 0;          // Previous time
@@ -38,7 +39,7 @@ void setup() {
     attachInterrupt(1, doencB, CHANGE);
     
     Serial.begin(9600);  // output
-    Serial.println("Angle(n) \tAngle(deg) \tSpeed(RPM)");
+    //Serial.println("Angle(n) \tAngle(deg) \tSpeed(RPM)");
 }
 
 // main loop, work is done by interrupt service routines, this one only prints stuff
@@ -46,20 +47,17 @@ void loop() {
     cmillis = millis();
     rotating = true;  // reset the debouncer
 
-    if (lastReportedPos != encPos) {
-        Serial.print(encPos, DEC);
-        Serial.print("\t");
-        
-        ang = encPos * 0.15;    // Max 9830.25 deg or 27.30625 rev
-        Serial.print(ang, 2);
-        Serial.print("\t");
+    Serial.print(encPos, DEC); Serial.print("\t");
+    Serial.print(ang, 2); Serial.print("\t");
+    Serial.println(spd, 2);
 
-        spd = (encPos - lastReportedPos) * 1000 * 0.15 / (cmillis - pmillis) * 360 / 60;
-        Serial.println(spd);
-        
+    if (lastReportedPos != encPos) {
+        ang = encPos * 0.15 * 4;    // Max 9830.25 deg or 27.30625 rev
+        spd = (encPos - lastReportedPos) * 1000 * 0.15 * 4 / (cmillis - pmillis) * 360 / 60;
         lastReportedPos = encPos;
         pmillis = cmillis;
-    }
+    } else
+        spd = 0;
 }
 
 // Interrupt on A changing state
