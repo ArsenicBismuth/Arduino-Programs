@@ -113,7 +113,7 @@ void loop() {
 void pidCalc() {
     // PID
     e = sp - spd;
-    dc = e*kp;
+    dc = e*kp; // + e_sum*ki + (e - e_prev)*kd;
     e_prev = e;
     e_sum += e;
 }
