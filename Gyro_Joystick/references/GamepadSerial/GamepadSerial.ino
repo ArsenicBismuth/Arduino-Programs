@@ -2,6 +2,7 @@
 
 // Create Joystick
 Joystick_ Joystick;
+#define INT16X 32767
 
 // Set to true for Auto Send mode.
 // Call Joystick.sendState() to send in manual mode.
@@ -18,14 +19,14 @@ void setup() {
     memset(buts,0,sizeof(buts));
     
     // Set Range Values
-    Joystick.setXAxisRange(-127, 127);
-    Joystick.setYAxisRange(-127, 127);
-    Joystick.setZAxisRange(0, 360);
-    Joystick.setRxAxisRange(-127, 127);
-    Joystick.setRyAxisRange(-127, 127);
-    Joystick.setRzAxisRange(0, 360);
-    Joystick.setThrottleRange(0, 255);
-    Joystick.setRudderRange(255, 0);
+    Joystick.setXAxisRange(-INT16X, INT16X);
+    Joystick.setYAxisRange(-INT16X, INT16X);
+    Joystick.setZAxisRange(-INT16X, INT16X);
+    Joystick.setRxAxisRange(-INT16X, INT16X);
+    Joystick.setRyAxisRange(-INT16X, INT16X);
+    Joystick.setRzAxisRange(-INT16X, INT16X);
+    Joystick.setThrottleRange(0, INT16X);
+    Joystick.setRudderRange(INT16X, 0);
     
     if (testAutoSendMode) Joystick.begin();
     else Joystick.begin(false);

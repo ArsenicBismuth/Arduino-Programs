@@ -1,3 +1,9 @@
+// Mapping
+// PadTest
+// X = Right
+// Y = Up
+// Z = Front
+
 // I2Cdev and MPU6050 must be installed as libraries, or else the .cpp/.h files
 // for both classes must be in the include path of your project
 #include "I2Cdev.h"
@@ -20,20 +26,16 @@ MPU6050 accelgyro;
 int16_t ax, ay, az;
 int16_t gx, gy, gz;
 
-#define OUTPUT_READABLE_ACCELGYRO
-//#define OUTPUT_BINARY_ACCELGYRO
-
 #define LED_PIN 13
 bool blinkState = false;
 
 
 // Joystick stuff
 Joystick_ Joystick;
-#define INT16P 32767
-#define INT16N -32768
+#define INT16X 32767
 
 // Call Joystick.sendState() to send in manual mode.
-const bool testAutoSendMode = false;
+const bool testAutoSendMode = true;
 bool buts[32];  // Storing buttons states
 
 void setup() {
@@ -59,7 +61,7 @@ void setup() {
     // use the code below to change accel/gyro offset values
     
     Serial.println("Updating internal sensor offsets...");
-    // -76	-2359	1688	0	0	0
+    // [-1587,-1587] --> [-15,42]  [1823,1823] --> [-16,119]   [983,983] --> [16381,16399] [96,97] --> [0,2]   [27,28] --> [-3,1]  [-8,-7] --> [-1,3]
     Serial.print(accelgyro.getXAccelOffset()); Serial.print("\t");
     Serial.print(accelgyro.getYAccelOffset()); Serial.print("\t");
     Serial.print(accelgyro.getZAccelOffset()); Serial.print("\t");
@@ -67,12 +69,12 @@ void setup() {
     Serial.print(accelgyro.getYGyroOffset()); Serial.print("\t");
     Serial.print(accelgyro.getZGyroOffset()); Serial.print("\t");
     Serial.print("\n");
-    accelgyro.setXAccelOffset(365);
-    accelgyro.setYAccelOffset(4426);
-    accelgyro.setZAccelOffset(5802);
-    accelgyro.setXGyroOffset(0);
-    accelgyro.setYGyroOffset(0);
-    accelgyro.setZGyroOffset(0);
+    accelgyro.setXAccelOffset(-1587);
+    accelgyro.setYAccelOffset(1823);
+    accelgyro.setZAccelOffset(983);
+    accelgyro.setXGyroOffset(96);
+    accelgyro.setYGyroOffset(28);
+    accelgyro.setZGyroOffset(-8);
     Serial.print(accelgyro.getXAccelOffset()); Serial.print("\t");
     Serial.print(accelgyro.getYAccelOffset()); Serial.print("\t");
     Serial.print(accelgyro.getZAccelOffset()); Serial.print("\t");
@@ -85,12 +87,12 @@ void setup() {
     memset(buts,0,sizeof(buts));
     
     // Set axis ranges
-    Joystick.setXAxisRange(INT16N, INT16P);
-    Joystick.setYAxisRange(INT16N, INT16P);
-    Joystick.setZAxisRange(INT16N, INT16P);
-    Joystick.setRxAxisRange(INT16N, INT16P);
-    Joystick.setRyAxisRange(INT16N, INT16P);
-    Joystick.setRzAxisRange(INT16N, INT16P);
+    Joystick.setXAxisRange(-INT16X, INT16X);
+    Joystick.setYAxisRange(-INT16X, INT16X);
+    Joystick.setZAxisRange(-INT16X, INT16X);
+    Joystick.setRxAxisRange(-INT16X, INT16X);
+    Joystick.setRyAxisRange(-INT16X, INT16X);
+    Joystick.setRzAxisRange(-INT16X, INT16X);
     
     if (testAutoSendMode) Joystick.begin();
     else Joystick.begin(false);
@@ -103,15 +105,23 @@ void loop() {
     // read raw accel/gyro measurements from device
     accelgyro.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
 
-    Joystick.setXAxis(&ax);
-    Joystick.setYAxis(&ay);
-    Joystick.setZAxis(&az);
+    Joystick.setXAxis(ax);
+    Joystick.setYAxis(ay);
+    Joystick.setZAxis(az);
 
-    Joystick.setRxAxis(&gx);
-    Joystick.setRyAxis(&gy);
-    Joystick.setRzAxis(&gz);
+    Joystick.setRxAxis(gx);
+    Joystick.setRyAxis(gy);
+    Joystick.setRzAxis(gz);
 
     Joystick.sendState();   // Send them together
+
+    Serial.print("a/g:\t");
+    Serial.print(ax); Serial.print("\t");
+    Serial.print(ay); Serial.print("\t");
+    Serial.print(az); Serial.print("\t");
+    Serial.print(gx); Serial.print("\t");
+    Serial.print(gy); Serial.print("\t");
+    Serial.println(gz);
 
     // blink LED to indicate activity
     blinkState = !blinkState;
