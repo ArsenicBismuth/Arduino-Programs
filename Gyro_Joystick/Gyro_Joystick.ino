@@ -1,8 +1,8 @@
 // Mapping
-// PadTest
-// X = Right
-// Y = Up
-// Z = Front
+// IMU-A        PadTest IMU-G   Joy Ardu    Program
+// X = Right    Right   Pitch    |  x Ry    ax0 ax4
+// Y = Front    Up      Rolll    |  y Rx    ax1 ax3
+// Z = Up       Front   Yaw      |  z Rz    ax2 ax5
 
 // I2Cdev and MPU6050 must be installed as libraries, or else the .cpp/.h files
 // for both classes must be in the include path of your project
@@ -105,13 +105,13 @@ void loop() {
     // read raw accel/gyro measurements from device
     accelgyro.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
 
-    Joystick.setXAxis(ax);
-    Joystick.setYAxis(ay);
-    Joystick.setZAxis(az);
+    Joystick.setXAxis(ax);  // Right
+    Joystick.setYAxis(ay);  // Front
+    Joystick.setZAxis(az);  // Up
 
-    Joystick.setRxAxis(gx);
-    Joystick.setRyAxis(gy);
-    Joystick.setRzAxis(gz);
+    Joystick.setRxAxis(gy); // Roll
+    Joystick.setRyAxis(gx); // Pitch
+    Joystick.setRzAxis(gz); // Yaw
 
     Joystick.sendState();   // Send them together
 
