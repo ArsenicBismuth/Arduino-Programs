@@ -29,7 +29,6 @@ int Serrot = 0;     // Servo rotation, 180 = inverse, 90 = stop.
 
 // Form data
 bool ledStat = LOW;
-String timeForm = "00:00";
 int servForm = 90;
 int feed[] = {2, 100};  // Daily, each (percentage).
 long offTime = 5;       // Offset feed time (sec).
@@ -56,11 +55,12 @@ void setup() {
     delay(100);
     
     server.on("/", handle_onConnect);
-    server.on("/readTime", handle_ajaxTime);
-    server.on("/timeForm", handle_timeForm);
+    server.on("/readTime", handle_getTime);
+    server.on("/setTime",  handle_timeForm);
+    server.on("/setLed",   handle_setLed);
+    server.on("/readFeed", handle_getFeed);
     server.on("/feedForm", handle_feedForm);
     server.on("/servForm", handle_servForm);
-    server.on("/setLed",   handle_ajaxLed);
     server.onNotFound(handle_notFound);
 
     server.begin();
@@ -107,8 +107,8 @@ void loop() {
 //// Process
 void findFeed() {
     // Find closest feedn, floored
-    long val = (feed[0]+1) * (timeNow+1) / (24*3600);
-    Serial.printf("%d %d\n", val, ((24*3600) / (timeNow+1)));
+    long val = (feed[0]+1) * (timeNow-offTime) / (24*3600);
+    Serial.printf("%d\n", val);
     feedn = val;
     nextFeed(); // So get the next one
 }
@@ -116,33 +116,55 @@ void findFeed() {
 void nextFeed() {
     // Divide 24 hours into feed[0]+2 intervals,
     // And feed in all interval except at 0 & 24.
-    if (feedn < feed[0]) feedn += 1;
+    if ((feedn < feed[0]) && (feedn > 0)) feedn += 1;
     else feedn = 1;
     setFeed(feedn);
 }
 
 void setFeed(int n) {
-    feedTime = offTime + 3600*24 / (feed[0]+1) * n;
+    feedTime = offTime + 24*3600 / (feed[0]+1) * n;
+    // Just realized findFeed is this:
+    // n = (time-offset) / (24*3600) * daily
 }
 
 
 //// Server
+void handle_getFeed() {
+    // Get variables on web load, async.
+    char msg[20];
+    sprintf(msg, "%d,%d,%d", feed[0], feed[1], offTime);
+
+    Serial.println(msg);
+    server.send(200, "text/plain", msg);
+}
+
 void handle_feedForm() {
-    feed[0] = server.arg("textValue1").toInt(); // Daily
-    feed[1] = server.arg("textValue2").toInt(); // Each
-    offTime = server.arg("textValue3").toInt(); // Delay
+    // Traditional, non-ajax method.
+    feed[0] = server.arg("val1").toInt(); // Daily
+    feed[1] = server.arg("val2").toInt(); // Each
+    offTime = server.arg("val3").toInt(); // Delay
 
     findFeed();
     
-    Serial.println("Text received: ");
+    Serial.println("Received: ");
     for (int i = 0; i < server.args(); i++)
         Serial.printf("Arg #%d: %s\n", i, &server.arg(i));
         
     server.send(200, "text/html", SendHTML());
 }
 
+void handle_servForm() {
+    // Traditional, non-ajax method.
+    servForm = server.arg("textValue").toInt();
+    servo.write(servForm);
+    
+    Serial.printf("Received: %d\n", servForm);
+    server.send(200, "text/html", SendHTML());
+}
+
 void handle_timeForm() {
-    timeForm = server.arg("dateValue");
+    // Set internal time, async.
+    String timeForm = server.arg("val");
 
     // Sync time (ending exclusive)
     int hr = timeForm.substring(0,2).toInt();
@@ -152,26 +174,17 @@ void handle_timeForm() {
 
     findFeed();
 
-    Serial.printf("Text received: %s\n", &timeForm);
-    server.send(200, "text/html", SendHTML());
+    Serial.printf("Received: %s\n", &timeForm);
+    server.send(200, "text/plain", "");
 }
 
-void handle_servForm() {
-    // Traditional, non-ajax method.
-    servForm = server.arg("textValue").toInt();
-    servo.write(servForm);
-    
-    Serial.printf("Text received: %d\n", servForm);
-    server.send(200, "text/html", SendHTML());
-}
-
-void handle_ajaxTime() {
+void handle_getTime() {
     // Send time values only to client ajax request.
     String msg = strDate(timeNow) +","+ strDate(feedTime);
-    server.send(200, "text/plane", msg);
+    server.send(200, "text/plain", msg);
 }
 
-void handle_ajaxLed() {
+void handle_setLed() {
     // From xhttp.open("GET", "setLed?state="+led, true);
     String t_state = server.arg("state");
     if (t_state == "1") ledStat = true; // On
@@ -180,8 +193,8 @@ void handle_ajaxLed() {
     // Control LED
     digitalWrite(LEDpin, !ledStat);
 
-    Serial.printf("Text received: %s\n", &t_state);
-    server.send(200, "text/plane", "");
+    Serial.printf("Received: %s\n", &t_state);
+    server.send(200, "text/plain", "");
 }
 
 void handle_notFound(){

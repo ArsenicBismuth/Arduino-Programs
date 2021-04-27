@@ -10,22 +10,24 @@ static const char HtmlPage[] PROGMEM = R"=====(
 <body>
 
 <h1>FEED</h1>
-<form method="post" action="/timeForm">
+<!--<form method="post" action="/timeForm">-->
     <label>Time:</label>
-    <input type="time" name="dateValue">
-    <input type="submit">
-</form>
+    <input type="time" id="timeValue" name="name">
+    <button onclick="sendTime()">Submit</button>
+<!--</form-->
 <br>
+
 <form method="post" action="/feedForm">
     <label>Daily:</label>
-    <input type="text" name="textValue1" size="1" value="2">
+    <input type="text" id="feedVal1" name="val1" size="1" value="2">
     <label>Each:</label>
-    <input type="text" name="textValue2" size="1" value="100">
+    <input type="text" id="feedVal2" name="val2" size="1" value="100">
     <br>
     <label>Delay:</label>
-    <input type="text" name="textValue3" size="1" value="5">
+    <input type="text" id="feedVal3" name="val3" size="1" value="5">
     <input type="submit" value="Submit">
 </form>
+
 <p>Current time: <span id="timeNow">00:00</span></p>
 <p>Feeding time: <span id="timeFeed">00:00</span></p>
 
@@ -37,11 +39,21 @@ static const char HtmlPage[] PROGMEM = R"=====(
 
 <h1>LED</h1>
 <p>Click to switch LED on and off.</p>
-<button id="ledToggle" type="button" onclick="sendData(0)">OFF</button>
+<button id="ledToggle" onclick="sendLed(0)">OFF</button>
 
 
 <script>
-function sendData(led) {
+function sendTime() {
+    var val = document.getElementById("timeValue").value;
+    var xhttp = new XMLHttpRequest();
+    xhttp.onreadystatechange = function() {
+        // Something after update in the webpage
+    };
+    xhttp.open("GET", "setTime?val="+val, true);
+    xhttp.send();
+}
+
+function sendLed(led) {
     var xhttp = new XMLHttpRequest();
     xhttp.onreadystatechange = function() {
         if (this.readyState == 4 && this.status == 200) {
@@ -52,14 +64,14 @@ function sendData(led) {
                 document.getElementById("ledToggle").
                     onclick = function() {
                         // String in HTML, function in JS
-                        sendData(0)
+                        sendLed(0)
                     };
             } else if (led==0) { // Currently OFF
                 document.getElementById("ledToggle").
                     innerHTML = "ON";
                 document.getElementById("ledToggle").
                     onclick = function() {
-                        sendData(1)
+                        sendLed(1)
                     };
             }
         }
@@ -70,10 +82,15 @@ function sendData(led) {
 
 setInterval(function() {
     // Call a function repetatively with 2 Second interval
-    getData();
+    getTime();
 }, 2000);
 
-function getData() {
+window.onload = function() {
+    getTime();
+    getFeed();
+}
+
+function getTime() {
     var xhttp = new XMLHttpRequest();
     xhttp.onreadystatechange = function() {
         if (this.readyState == 4 && this.status == 200) {
@@ -86,6 +103,23 @@ function getData() {
     xhttp.open("GET", "readTime", true);
     xhttp.send();
 }
+
+function getFeed() {
+    var xhttp = new XMLHttpRequest();
+    xhttp.onreadystatechange = function() {
+        if (this.readyState == 4 && this.status == 200) {
+            document.getElementById("feedVal1").value =
+            this.responseText.split(",")[0];
+            document.getElementById("feedVal2").value =
+            this.responseText.split(",")[1];
+            document.getElementById("feedVal3").value =
+            this.responseText.split(",")[2];
+        }
+    };
+    xhttp.open("GET", "readFeed", true);
+    xhttp.send();
+}
+
 </script>
 </body>
 </html>
