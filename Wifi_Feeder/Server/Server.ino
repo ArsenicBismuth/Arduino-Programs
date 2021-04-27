@@ -19,7 +19,6 @@ const char* password = "12345678";    //Enter Password here
 IPAddress local_ip(192,168,1,1);
 IPAddress gateway(192,168,1,1);
 IPAddress subnet(255,255,255,0);
-
 ESP8266WebServer server(80);
 
 // Definitions
@@ -45,64 +44,24 @@ time_t servStart;
 time_t timeNow;
 Servo servo;
 
-// The R"=== allows for literal string,
-// no need for newline, qote, or apostrophe.
-const char htmlPage[]=R"=====(
-<!DOCTYPE html>
-<html>
-<head>
-<meta name=viewport content=width=device-width,initial-scale=1.5,minimum-scale=1.0>
-<title>Feeder Control</title>
-</head>
-<body>
-
-<h1>FEED</h1>
-<form method="post" action="/timeForm">
-    <label>Time:</label>
-    <input type="time" name="dateValue">
-    <input type="submit">
-</form>
-<br>
-<form method="post" action="/feedForm">
-    <label>Daily:</label>
-    <input type="text" name="textValue1" size="1" value="2">
-    <label>Each:</label>
-    <input type="text" name="textValue2" size="1" value="100">
-    <br>
-    <label>Delay:</label>
-    <input type="text" name="textValue3" size="1" value="5">
-    <input type="submit" value="Submit">
-</form>
-
-<h1>SERVO</h1>
-<form method="post" action="/servForm">
-    <input type="text" name="textValue" value="">
-    <input type="submit" value="Submit">
-</form>
-
-<h1>LED</h1>
-<p>Click to switch LED on and off.</p>
-<form method="get">
-)=====";
-
 
 void setup() {
-    Serial.begin(9600);
+    Serial.begin(115200);
     pinMode(LEDpin, OUTPUT);
     servo.attach(Serpin);
-    setFeed(1);
+    findFeed();
 
     WiFi.softAP(ssid, password);
     WiFi.softAPConfig(local_ip, gateway, subnet);
     delay(100);
     
-    server.on("/", handle_OnConnect);
+    server.on("/", handle_onConnect);
+    server.on("/readTime", handle_ajaxTime);
     server.on("/timeForm", handle_timeForm);
     server.on("/feedForm", handle_feedForm);
     server.on("/servForm", handle_servForm);
-    server.on("/ledOn", handle_ledon);
-    server.on("/ledOff", handle_ledoff);
-    server.onNotFound(handle_NotFound);
+    server.on("/setLed",   handle_ajaxLed);
+    server.onNotFound(handle_notFound);
 
     server.begin();
     Serial.println("HTTP server started");
@@ -111,10 +70,6 @@ void setup() {
 void loop() {
     //// Server
     server.handleClient();
-
-    // Control LED
-    if(ledStat) digitalWrite(LEDpin, HIGH);
-    else digitalWrite(LEDpin, LOW);
 
     // Update time (software)
     timeNow = now();
@@ -144,12 +99,20 @@ void loop() {
         servNow = false;
     }
 
-    // Debug
+    //// Debug
 //    Serial.println(strDate(timeNow) +" "+ strDate(feedTime));
 }
 
 
-// Process
+//// Process
+void findFeed() {
+    // Find closest feedn, floored
+    long val = (feed[0]+1) * (timeNow+1) / (24*3600);
+    Serial.printf("%d %d\n", val, ((24*3600) / (timeNow+1)));
+    feedn = val;
+    nextFeed(); // So get the next one
+}
+
 void nextFeed() {
     // Divide 24 hours into feed[0]+2 intervals,
     // And feed in all interval except at 0 & 24.
@@ -160,28 +123,22 @@ void nextFeed() {
 
 void setFeed(int n) {
     feedTime = offTime + 3600*24 / (feed[0]+1) * n;
-    
-    // If feed time is lower than now, look for the next one.
-    // Until it's the end of the day (next = tomorrow).
-    if ((feedTime < timeNow) && (feed[0] > 1) && (n < feed[0]+1)) {
-        nextFeed();
-    }
 }
 
 
-// Server
+//// Server
 void handle_feedForm() {
     feed[0] = server.arg("textValue1").toInt(); // Daily
     feed[1] = server.arg("textValue2").toInt(); // Each
     offTime = server.arg("textValue3").toInt(); // Delay
 
-    setFeed(feedn);
+    findFeed();
     
     Serial.println("Text received: ");
     for (int i = 0; i < server.args(); i++)
         Serial.printf("Arg #%d: %s\n", i, &server.arg(i));
         
-    server.send(200, "text/html", SendHTML(ledStat==LOW));
+    server.send(200, "text/html", SendHTML());
 }
 
 void handle_timeForm() {
@@ -193,55 +150,56 @@ void handle_timeForm() {
     setTime(0 + hr*3600 + mn*60); // setTime(hr, mn, 0,1,1,1970);
     timeNow = now();
 
-    setFeed(1);
+    findFeed();
 
     Serial.printf("Text received: %s\n", &timeForm);
-    server.send(200, "text/html", SendHTML(ledStat==LOW));
+    server.send(200, "text/html", SendHTML());
 }
 
 void handle_servForm() {
+    // Traditional, non-ajax method.
     servForm = server.arg("textValue").toInt();
     servo.write(servForm);
     
-    Serial.printf("Text received: %s\n", &servForm);
-    server.send(200, "text/html", SendHTML(ledStat==LOW));
+    Serial.printf("Text received: %d\n", servForm);
+    server.send(200, "text/html", SendHTML());
 }
 
-void handle_OnConnect() {
-    server.send(200, "text/html", SendHTML(ledStat==LOW)); 
+void handle_ajaxTime() {
+    // Send time values only to client ajax request.
+    String msg = strDate(timeNow) +","+ strDate(feedTime);
+    server.send(200, "text/plane", msg);
 }
 
-void handle_ledon() {
-    ledStat = LOW;
-    server.send(200, "text/html", SendHTML(true)); 
+void handle_ajaxLed() {
+    // From xhttp.open("GET", "setLed?state="+led, true);
+    String t_state = server.arg("state");
+    if (t_state == "1") ledStat = true; // On
+    else ledStat = false;
+    
+    // Control LED
+    digitalWrite(LEDpin, !ledStat);
+
+    Serial.printf("Text received: %s\n", &t_state);
+    server.send(200, "text/plane", "");
 }
 
-void handle_ledoff() {
-    ledStat = HIGH;
-    server.send(200, "text/html", SendHTML(false)); 
-}
-
-void handle_NotFound(){
+void handle_notFound(){
     server.send(404, "text/plain", "Not found");
 }
 
-String SendHTML(uint8_t led){
+void handle_onConnect() {
+    server.send(200, "text/html", SendHTML()); 
+}
+
+String SendHTML(){
     // Read static components from PROGMEM
-    String ptr = htmlPage;
-    
-    // Changable button
-    if(led) ptr +="<input type=\"button\" value=\"LED OFF\" onclick=\"window.location.href='/ledOff'\">\n";
-    else ptr +="<input type=\"button\" value=\"LED ON\" onclick=\"window.location.href='/ledOn'\">\n";
-    ptr +="</form>\n";
-    ptr +="<p>Current time: "+ strDate(timeNow) +"</p>";
-    ptr +="<p>Feeding time: "+ strDate(feedTime) +"</p>";
-    
-    ptr +="</body>\n";
-    ptr +="</html>\n";
+    String ptr = FPSTR(HtmlPage);
     return ptr;
 }
 
-// Utils
+
+//// Utils
 String strDate(time_t t) {
     return strTime(hour(t))+
            ":"+strTime(minute(t))+
