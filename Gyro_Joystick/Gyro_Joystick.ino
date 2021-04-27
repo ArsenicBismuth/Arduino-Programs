@@ -61,7 +61,6 @@ void setup() {
     // use the code below to change accel/gyro offset values
     
     Serial.println("Updating internal sensor offsets...");
-    // [-1587,-1587] --> [-15,42]  [1823,1823] --> [-16,119]   [983,983] --> [16381,16399] [96,97] --> [0,2]   [27,28] --> [-3,1]  [-8,-7] --> [-1,3]
     Serial.print(accelgyro.getXAccelOffset()); Serial.print("\t");
     Serial.print(accelgyro.getYAccelOffset()); Serial.print("\t");
     Serial.print(accelgyro.getZAccelOffset()); Serial.print("\t");
@@ -69,12 +68,17 @@ void setup() {
     Serial.print(accelgyro.getYGyroOffset()); Serial.print("\t");
     Serial.print(accelgyro.getZGyroOffset()); Serial.print("\t");
     Serial.print("\n");
-    accelgyro.setXAccelOffset(-1587);
-    accelgyro.setYAccelOffset(1823);
+    
+    // Calibration - set everything so that they're clos to 0 at rest.
+    // Except for the vertical accel, it should be ~ -16383 (positive if inverted).
+    // You may use "IMU_Zero" inside /References folder to determine offsets.
+    accelgyro.setXAccelOffset(-1597);
+    accelgyro.setYAccelOffset(1613);
     accelgyro.setZAccelOffset(983);
     accelgyro.setXGyroOffset(96);
-    accelgyro.setYGyroOffset(28);
-    accelgyro.setZGyroOffset(-8);
+    accelgyro.setYGyroOffset(26);
+    accelgyro.setZGyroOffset(2);
+    
     Serial.print(accelgyro.getXAccelOffset()); Serial.print("\t");
     Serial.print(accelgyro.getYAccelOffset()); Serial.print("\t");
     Serial.print(accelgyro.getZAccelOffset()); Serial.print("\t");
