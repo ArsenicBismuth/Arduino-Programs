@@ -7,9 +7,13 @@ static const char HtmlPage[] PROGMEM = R"=====(
 <meta name=viewport content=width=device-width,initial-scale=1.5,minimum-scale=1.0>
 <title>Feeder Control</title>
 </head>
-<body>
+<style>
+</style>
 
-<h1>FEED</h1>
+<body>
+<h1><a href="/" style="text-decoration: none; color: #000000">
+    FEED 
+</a></h1>
 <!--<form method="post" action="/timeForm">-->
     <label>Time:</label>
     <input type="time" id="timeValue" name="name">

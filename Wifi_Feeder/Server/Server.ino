@@ -79,9 +79,10 @@ void loop() {
 
     //// Logic
     // Based on range, 2 minutes
-    if (timeNow >= feedTime && timeNow < feedTime+60*2) {
+    if (timeNow >= feedTime && timeNow < feedTime+2*60) {
         feedNow = true;
         nextFeed(); // Update feedTime to the new one
+        // BUG: If feed once a day, servo will run 2minutes.
     }
 
     // Trigger servo rotation
@@ -149,8 +150,9 @@ void handle_feedForm() {
     Serial.println("Received: ");
     for (int i = 0; i < server.args(); i++)
         Serial.printf("Arg #%d: %s\n", i, &server.arg(i));
-        
-    server.send(200, "text/html", SendHTML());
+
+    server.sendHeader("Location","/");  // Redirect to home
+    server.send(303);   // 3xx necessary to give the location header
 }
 
 void handle_servForm() {
@@ -159,7 +161,8 @@ void handle_servForm() {
     servo.write(servForm);
     
     Serial.printf("Received: %d\n", servForm);
-    server.send(200, "text/html", SendHTML());
+    server.sendHeader("Location","/");  // Redirect to home
+    server.send(303);
 }
 
 void handle_timeForm() {
