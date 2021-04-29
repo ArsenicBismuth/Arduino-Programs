@@ -3,6 +3,7 @@
  *   - https://www.w3schools.com/tags/tryit.asp?filename=tryhtml5_input_type_time
  *   - https://github.com/PaulStoffregen/Time
  *   - https://circuits4you.com/2018/02/04/esp8266-ajax-update-part-of-web-page-without-refreshing/
+ *   - https://tttapa.github.io/ESP8266/Chap10%20-%20Simple%20Web%20Server.html
  */
 
 #include <ESP8266WiFi.h>
@@ -10,6 +11,7 @@
 #include <Servo.h>
 #include <TimeLib.h>
 #include "Index.h"
+#include "Style.h"
 
 /* Put your SSID & Password */
 const char* ssid = "Feeder";    // Enter SSID here
@@ -55,6 +57,7 @@ void setup() {
     delay(100);
     
     server.on("/", handle_onConnect);
+    server.on("/style.css", handle_css);
     server.on("/readTime", handle_getTime);
     server.on("/setTime",  handle_timeForm);
     server.on("/setLed",   handle_setLed);
@@ -99,9 +102,6 @@ void loop() {
         // Servo detach
         servNow = false;
     }
-
-    //// Debug
-//    Serial.println(strDate(timeNow) +" "+ strDate(feedTime));
 }
 
 
@@ -208,9 +208,19 @@ void handle_onConnect() {
     server.send(200, "text/html", SendHTML()); 
 }
 
+void handle_css() {
+    server.send(200, "text/css", SendCSS()); 
+}
+
+String SendCSS() {
+    // Read static components from PROGMEM
+    String ptr = FPSTR(STYLE_CSS);
+    return ptr;
+}
+
 String SendHTML(){
     // Read static components from PROGMEM
-    String ptr = FPSTR(HtmlPage);
+    String ptr = FPSTR(INDEX_HTML);
     return ptr;
 }
 
