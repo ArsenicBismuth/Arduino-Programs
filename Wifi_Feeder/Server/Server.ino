@@ -4,14 +4,14 @@
  *   - https://github.com/PaulStoffregen/Time
  *   - https://circuits4you.com/2018/02/04/esp8266-ajax-update-part-of-web-page-without-refreshing/
  *   - https://tttapa.github.io/ESP8266/Chap10%20-%20Simple%20Web%20Server.html
+ *   - https://tttapa.github.io/ESP8266/Chap11%20-%20SPIFFS.html
  */
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <Servo.h>
 #include <TimeLib.h>
-#include "Index.h"
-#include "Style.h"
+#include <LittleFS.h>
 
 /* Put your SSID & Password */
 const char* ssid = "Feeder";    // Enter SSID here
@@ -51,13 +51,14 @@ void setup() {
     pinMode(LEDpin, OUTPUT);
     servo.attach(Serpin);
     findFeed();
+    LittleFS.begin();
 
     WiFi.softAP(ssid, password);
     WiFi.softAPConfig(local_ip, gateway, subnet);
     delay(100);
     
-    server.on("/", handle_onConnect);
-    server.on("/style.css", handle_css);
+//    server.on("/", handle_onConnect);
+//    server.on("/style.css", handle_css);
     server.on("/readTime", handle_getTime);
     server.on("/setTime",  handle_timeForm);
     server.on("/setLed",   handle_setLed);
@@ -65,6 +66,9 @@ void setup() {
     server.on("/feedForm", handle_feedForm);
     server.on("/servForm", handle_servForm);
     server.onNotFound(handle_notFound);
+    // Not Found will handle all file-related request
+    // It'll find and load for the first time,
+    // and that file will be usable until restart.
 
     server.begin();
     Serial.println("HTTP server started");
@@ -201,27 +205,58 @@ void handle_setLed() {
 }
 
 void handle_notFound(){
-    server.send(404, "text/plain", "Not found");
+//    server.send(404, "text/plain", "Not found");
+    if (!handle_fileRead(server.uri()))  // send it if it exists
+        server.send(404, "text/plain", "404: Not Found");
 }
 
-void handle_onConnect() {
-    server.send(200, "text/html", SendHTML()); 
+//void handle_onConnect() {
+//    server.send(200, "text/html", SendHTML()); 
+//}
+//
+//void handle_css() {
+//    server.send(200, "text/css", SendCSS()); 
+//}
+
+//String SendCSS() {
+//    // Read static components from PROGMEM
+//    String ptr = FPSTR(STYLE_CSS);
+//    return ptr;
+//}
+//
+//String SendHTML(){
+//    // Read static components from PROGMEM
+//    String ptr = FPSTR(INDEX_HTML);
+//    return ptr;
+//}
+
+String getContentType(String filename){
+    if(filename.endsWith(".html")) return "text/html";
+    else if(filename.endsWith(".css")) return "text/css";
+    else if(filename.endsWith(".js")) return "application/javascript";
+    else if(filename.endsWith(".ico")) return "image/x-icon";
+    else if(filename.endsWith(".gz")) return "application/x-gzip";
+    return "text/plain";
 }
 
-void handle_css() {
-    server.send(200, "text/css", SendCSS()); 
-}
-
-String SendCSS() {
-    // Read static components from PROGMEM
-    String ptr = FPSTR(STYLE_CSS);
-    return ptr;
-}
-
-String SendHTML(){
-    // Read static components from PROGMEM
-    String ptr = FPSTR(INDEX_HTML);
-    return ptr;
+bool handle_fileRead(String path){  // send the right file to the client (if it exists)
+  Serial.println("handleFileRead: " + path);
+  if(path.endsWith("/")) path += "index.html";           // If a folder is requested, send the index file
+  String contentType = getContentType(path);             // Get the MIME type
+  String pathWithGz = path + ".gz";
+  
+  if(LittleFS.exists(pathWithGz) || LittleFS.exists(path)){  // If the file exists, either as a compressed archive, or normal
+    if(LittleFS.exists(pathWithGz))                          // If there's a compressed version available
+      path += ".gz";                                         // Use the compressed version
+    File file = LittleFS.open(path, "r");                    // Open the file
+    size_t sent = server.streamFile(file, contentType);    // Send it to the client
+    file.close();                                          // Close the file again
+    
+    Serial.println(String("\tSent file: ") + path);
+    return true;
+  }
+  Serial.println(String("\tFile Not Found: ") + path);
+  return false;                                          // If the file doesn't exist, return false
 }
 
 
