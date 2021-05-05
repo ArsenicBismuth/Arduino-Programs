@@ -5,6 +5,7 @@
  *   - https://circuits4you.com/2018/02/04/esp8266-ajax-update-part-of-web-page-without-refreshing/
  *   - https://tttapa.github.io/ESP8266/Chap10%20-%20Simple%20Web%20Server.html
  *   - https://tttapa.github.io/ESP8266/Chap11%20-%20SPIFFS.html
+ *   - https://blog.webjeda.com/lazy-load-css/
  */
 
 #include <ESP8266WiFi.h>
@@ -67,8 +68,6 @@ void setup() {
     server.on("/servForm", handle_servForm);
     server.onNotFound(handle_notFound);
     // Not Found will handle all file-related request
-    // It'll find and load for the first time,
-    // and that file will be usable until restart.
 
     server.begin();
     Serial.println("HTTP server started");
@@ -244,7 +243,8 @@ bool handle_fileRead(String path){  // send the right file to the client (if it 
   if(path.endsWith("/")) path += "index.html";           // If a folder is requested, send the index file
   String contentType = getContentType(path);             // Get the MIME type
   String pathWithGz = path + ".gz";
-  
+
+  long dur = millis();
   if(LittleFS.exists(pathWithGz) || LittleFS.exists(path)){  // If the file exists, either as a compressed archive, or normal
     if(LittleFS.exists(pathWithGz))                          // If there's a compressed version available
       path += ".gz";                                         // Use the compressed version
@@ -252,7 +252,8 @@ bool handle_fileRead(String path){  // send the right file to the client (if it 
     size_t sent = server.streamFile(file, contentType);    // Send it to the client
     file.close();                                          // Close the file again
     
-    Serial.println(String("\tSent file: ") + path);
+    Serial.print(String("\tSent file: ") + path);
+    Serial.printf(" (%d) \tin %dms\n", sent, millis()-dur);
     return true;
   }
   Serial.println(String("\tFile Not Found: ") + path);

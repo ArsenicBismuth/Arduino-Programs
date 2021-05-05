@@ -1,9 +1,9 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <link rel="stylesheet" href="style.css">
-  <!--link rel="stylesheet" href="https://bootswatch.com/4/darkly/bootstrap.min.css"-->
-  <meta name=viewport content=width=device-width,initial-scale=1.5,minimum-scale=1.0>
+  <!-- <link rel="stylesheet" href="style.css"> -->
+  <!-- <link rel="stylesheet" href="https://bootswatch.com/4/darkly/bootstrap.min.css"> -->
+  <meta name=viewport content="width=device-width, initial-scale=1.0, minimum-scale=0.8">
 <title>Feeder Control</title>
 </head>
 
@@ -11,8 +11,8 @@
 body {
     padding-top: 20px;
 }
-.mb-3 {
-    width: 300px;
+.container {
+	max-width: 400px !important;
 }
 .rl {
     border-top-left-radius: 0.25rem !important;
@@ -22,20 +22,22 @@ body {
     border-top-right-radius: 0.25rem !important;
     border-bottom-right-radius: 0.25rem !important;
 }
+.part {
+    max-width: 220px;
+}
 
 /* Overriding @media min-width */
 @media (min-width: 200px) {
-  .form-inline .form-control {
-      display: inline-block;
-      width: auto;
+  .ig-50 {
+      width: 100%;
       vertical-align: middle;
   }
 }
 .form-control {
     text-align: right;
 }
-
 </style>
+
 
 <body class="container">
 <h1><a href="/">
@@ -45,61 +47,61 @@ body {
 <!--<form method="post" action="/timeForm">-->
 <div class="input-group mb-3">
     <div class="input-group-prepend">
-        <span class="input-group-text">Time</span>
-    </div>
+    	<span class="input-group-text">Time</span>
+	</div>
     <input size="1" type="time" class="form-control mr-2 rr" id="timeValue" name="name">
-    <button class="btn btn-success" onclick="sendTime()">Submit</button>
+	<button class="btn btn-success" onclick="sendTime()">Submit</button>
 </div>
 <!--</form-->
 <br>
 
 <form method="post" action="/feedForm">
-    <div class="input-group mb-3">
-        <div class="input-group-prepend">
-            <label class="input-group-text">Daily</label></div>
+	<div class="input-group mb-3">
+		<div class="input-group-prepend">
+      		<label class="input-group-text">Daily</label></div>
         <input class="form-control" type="text"
-            id="feedVal1" name="val1" size="2" value="2">
+        	id="feedVal1" name="val1" size="2" value="2">
         <div class="input-group-append">
-            <label class="input-group-text rr mr-2">X</label> </div>
+      		<label class="input-group-text rr mr-2">X</label></div>
       
         <div class="input-group-prepend">
-            <label class="input-group-text rl">Each</label> </div>
+      		<label class="input-group-text rl">Each</label></div>
         <input class="form-control" type="text"
-            id="feedVal2" name="val2" size="2" value="100">
+        	id="feedVal2" name="val2" size="2" value="100">
         <div class="input-group-append">
-            <label class="input-group-text">%</label> </div>
+      		<label class="input-group-text">%</label></div>
     </div>
     
     <div class="input-group mb-3">
         <div class="input-group-prepend">
-            <label class="input-group-text">Delay</label></div>
+      		<label class="input-group-text">Delay</label></div>
         <input class="form-control" type="text"
-            id="feedVal3" name="val3" size="2" value="5">
+        	id="feedVal3" name="val3" size="2" value="5">
         <div class="input-group-append">
-            <label class="input-group-text rr mr-2">s</label> </div>
+      		<label class="input-group-text rr mr-2">s</label></div>
       
         <input class="btn btn-success" type="submit" value="Submit">
     </div>
 </form>
 
 <h3>Time</h3>
-<div class="input-group mb-3">
-    <div class="input-group-prepend">
-        <label class="input-group-text">Current</label> </div>
-    <span class="form-control rr" type="text" 
-        id="timeNow">00:00</span>
+<div class="input-group mb-3 part">
+	<div class="input-group-prepend">
+    	<label class="input-group-text">Current</label></div>
+	<span class="form-control rr" type="text" 
+    	id="timeNow">00:00</span>
 </div>
 
-<div class="input-group mb-3">
-    <div class="input-group-prepend">
-        <label class="input-group-text">Feeding</label> </div>
-    <span class="form-control rr" type="text" 
-        id="timeFeed">00:00</span>
+<div class="input-group mb-3 part">
+	<div class="input-group-prepend">
+    	<label class="input-group-text">Feeding</label></div>
+	<span class="form-control rr" type="text" 
+    	id="timeFeed">00:00</span>
 </div>
 
 <h3>Servo</h3>
-<form class="form-inline mb-3" method="post" action="/servForm">
-    <input type="text" class="form-control mr-2" name="textValue" value="">
+<form class="input-group mb-3 part" method="post" action="/servForm">
+    <input type="text" class="form-control rr mr-2" name="textValue" value="">
     <input type="submit" class="btn btn-success" value="Submit">
 </form>
 
@@ -108,6 +110,15 @@ body {
 
 
 <script>
+// Lazy load style.css
+(function() {
+    var cssMain = document.createElement("link");
+    cssMain.href = "/style.css";
+    cssMain.rel = "stylesheet";
+    cssMain.type = "text/css";
+    document.getElementsByTagName("head")[0].appendChild(cssMain);
+})();
+
 function sendTime() {
     var val = document.getElementById("timeValue").value;
     var xhttp = new XMLHttpRequest();
