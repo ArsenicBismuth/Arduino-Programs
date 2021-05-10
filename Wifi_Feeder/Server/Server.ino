@@ -7,6 +7,16 @@
  *   - https://tttapa.github.io/ESP8266/Chap11%20-%20SPIFFS.html
  *   - https://blog.webjeda.com/lazy-load-css/
  */
+ 
+/* Logs:
+ *  - It seems performance is totally black & white
+ *  - I can refresh and instantly loads everything,
+ *      that a 55 KB image loads instantly too.
+ *  - But often, even a 4 KB .css.gz gets cut midway.
+ *  - One thing for sure: You will get one of them,
+ *      and it stays that way.
+ */
+
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
@@ -27,7 +37,7 @@ ESP8266WebServer server(80);
 // Definitions
 uint8_t LEDpin = LED_BUILTIN;
 uint8_t Serpin = D6; 
-int Serdur = 5;    // In sec, 100% duration.
+int Serdur = 10;    // In sec, 100% duration.
 int Serrot = 0;     // Servo rotation, 180 = inverse, 90 = stop.
 
 // Form data
@@ -63,6 +73,7 @@ void setup() {
     server.on("/readTime", handle_getTime);
     server.on("/setTime",  handle_timeForm);
     server.on("/setLed",   handle_setLed);
+    server.on("/setServ",  handle_setServ);
     server.on("/readFeed", handle_getFeed);
     server.on("/feedForm", handle_feedForm);
     server.on("/servForm", handle_servForm);
@@ -134,7 +145,7 @@ void setFeed(int n) {
 
 //// Server
 void handle_getFeed() {
-    // Get variables on web load, async.
+    // Get feed configs on web load, async.
     char msg[20];
     sprintf(msg, "%d,%d,%d", feed[0], feed[1], offTime);
 
@@ -170,17 +181,17 @@ void handle_servForm() {
 
 void handle_timeForm() {
     // Set internal time, async.
-    String timeForm = server.arg("val");
+    String val = server.arg("val");
 
     // Sync time (ending exclusive)
-    int hr = timeForm.substring(0,2).toInt();
-    int mn = timeForm.substring(3,5).toInt();
+    int hr = val.substring(0,2).toInt();
+    int mn = val.substring(3,5).toInt();
     setTime(0 + hr*3600 + mn*60); // setTime(hr, mn, 0,1,1,1970);
     timeNow = now();
 
     findFeed();
 
-    Serial.printf("Received: %s\n", &timeForm);
+    Serial.printf("Received: %s\n", &val);
     server.send(200, "text/plain", "");
 }
 
@@ -192,14 +203,25 @@ void handle_getTime() {
 
 void handle_setLed() {
     // From xhttp.open("GET", "setLed?state="+led, true);
-    String t_state = server.arg("state");
-    if (t_state == "1") ledStat = true; // On
+    String val = server.arg("state");
+    if (val == "1") ledStat = true; // On
     else ledStat = false;
     
     // Control LED
     digitalWrite(LEDpin, !ledStat);
 
-    Serial.printf("Received: %s\n", &t_state);
+    Serial.printf("Received: %s\n", &val);
+    server.send(200, "text/plain", "");
+}
+
+void handle_setServ() {
+    // From xhttp.open("GET", "setServ?val="+serv, true);
+    int val = server.arg("val").toInt();
+    
+    // Control servo
+    servo.write(val);
+
+    Serial.printf("Received: %d\n", val);
     server.send(200, "text/plain", "");
 }
 
@@ -208,26 +230,6 @@ void handle_notFound(){
     if (!handle_fileRead(server.uri()))  // send it if it exists
         server.send(404, "text/plain", "404: Not Found");
 }
-
-//void handle_onConnect() {
-//    server.send(200, "text/html", SendHTML()); 
-//}
-//
-//void handle_css() {
-//    server.send(200, "text/css", SendCSS()); 
-//}
-
-//String SendCSS() {
-//    // Read static components from PROGMEM
-//    String ptr = FPSTR(STYLE_CSS);
-//    return ptr;
-//}
-//
-//String SendHTML(){
-//    // Read static components from PROGMEM
-//    String ptr = FPSTR(INDEX_HTML);
-//    return ptr;
-//}
 
 String getContentType(String filename){
     if(filename.endsWith(".html")) return "text/html";

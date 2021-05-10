@@ -14,6 +14,7 @@ body {
 .container {
 	max-width: 400px !important;
 }
+/* Force rounded */
 .rl {
     border-top-left-radius: 0.25rem !important;
     border-bottom-left-radius: 0.25rem !important;
@@ -21,6 +22,15 @@ body {
 .rr {
     border-top-right-radius: 0.25rem !important;
     border-bottom-right-radius: 0.25rem !important;
+}
+/* Force squared */
+.sl {
+    border-top-left-radius: 0 !important;
+    border-bottom-left-radius: 0 !important;
+}
+.sr {
+    border-top-right-radius: 0 !important;
+    border-bottom-right-radius: 0 !important;
 }
 .part {
     max-width: 220px;
@@ -100,6 +110,10 @@ body {
 </div>
 
 <h3>Servo</h3>
+<button class="btn btn-secondary mb-3 sr" onclick="sendServ(180)">Pull</button
+><button class="btn btn-danger mb-3 sr sl" onclick="sendServ(90)">Stop</button
+><button class="btn btn-secondary mb-3 sl" onclick="sendServ(0)">Push</button>
+
 <form class="input-group mb-3 part" method="post" action="/servForm">
     <input type="text" class="form-control rr mr-2" name="textValue" value="">
     <input type="submit" class="btn btn-success" value="Submit">
@@ -118,6 +132,15 @@ body {
     cssMain.type = "text/css";
     document.getElementsByTagName("head")[0].appendChild(cssMain);
 })();
+
+function sendServ(serv) {
+    var xhttp = new XMLHttpRequest();
+    xhttp.onreadystatechange = function() {
+        // Something after update in the webpage
+    };
+    xhttp.open("GET", "setServ?val="+serv, true);
+    xhttp.send();
+}
 
 function sendTime() {
     var val = document.getElementById("timeValue").value;
