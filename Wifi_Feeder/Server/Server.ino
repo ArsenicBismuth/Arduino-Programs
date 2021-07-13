@@ -6,6 +6,8 @@
  *   - https://tttapa.github.io/ESP8266/Chap10%20-%20Simple%20Web%20Server.html
  *   - https://tttapa.github.io/ESP8266/Chap11%20-%20SPIFFS.html
  *   - https://blog.webjeda.com/lazy-load-css/
+ *   - https://github.com/esp8266/Arduino/blob/master/libraries/DNSServer/examples/CaptivePortal/CaptivePortal.ino
+ *   - https://stackoverflow.com/questions/46289283/esp8266-captive-portal-with-pop-up
  */
  
 /* Logs:
@@ -20,6 +22,7 @@
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <DNSServer.h>
 #include <Servo.h>
 #include <TimeLib.h>
 #include <LittleFS.h>
@@ -29,10 +32,11 @@ const char* ssid = "Feeder";    // Enter SSID here
 const char* password = "12345678";    //Enter Password here
 
 /* Put IP Address details */
-IPAddress local_ip(192,168,1,1);
-IPAddress gateway(192,168,1,1);
+IPAddress local_ip(172,217,28,1);  // DNS server doesn't work with other IP
+IPAddress gateway(172,217,28,1);
 IPAddress subnet(255,255,255,0);
 ESP8266WebServer server(80);
+DNSServer dns;
 
 // Definitions
 uint8_t LEDpin = LED_BUILTIN;
@@ -67,9 +71,12 @@ void setup() {
     WiFi.softAP(ssid, password);
     WiFi.softAPConfig(local_ip, gateway, subnet);
     delay(100);
-    
+
 //    server.on("/", handle_onConnect);
 //    server.on("/style.css", handle_css);
+
+    // Start servers
+    dns.start(53, "*", local_ip);     // All DNS request (*) redirected to local_ip
     server.on("/readTime", handle_getTime);
     server.on("/setTime",  handle_timeForm);
     server.on("/setLed",   handle_setLed);
@@ -78,7 +85,16 @@ void setup() {
     server.on("/feedForm", handle_feedForm);
     server.on("/servForm", handle_servForm);
     server.onNotFound(handle_notFound);
-    // Not Found will handle all file-related request
+    // Not Found will handle all file-related request.
+
+    // Captive portals, map it to home: /index.html
+    server.on("/generate_204", handle_random);        // Android
+    server.on("/fwlink", handle_random);              // Microsoft
+    server.on("/connecttest.txt", handle_random);     // Win10
+    server.on("/hotspot-detect.html", handle_random); // Apple
+    // Handling captive portals is necessary, because
+    // by default it should go through NotFound > Home.
+    // Meanwhile I use NotFound for lazyloader.
 
     server.begin();
     Serial.println("HTTP server started");
@@ -86,6 +102,7 @@ void setup() {
 
 void loop() {
     //// Server
+    dns.processNextRequest();
     server.handleClient();
 
     // Update time (software)
@@ -223,6 +240,13 @@ void handle_setServ() {
 
     Serial.printf("Received: %d\n", val);
     server.send(200, "text/plain", "");
+}
+
+void handle_random(){
+    // Redirect to index.html
+//    Serial.println("handleRandom: " + server.uri());
+    server.sendHeader("Location","/");  // Redirect to home
+    server.send(303);   // 3xx necessary to give the location header
 }
 
 void handle_notFound(){
