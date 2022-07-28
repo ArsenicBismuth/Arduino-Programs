@@ -1,0 +1,15 @@
+Printing
+- Body    : 80g-100g
+- Else    : 110g-150g
+- Total   : 190g-250g
+- Price   : Rp46k-Rp60k
+   for Rp240k/kg PLA
+
+Materials
+- Adaptor : 46k
+- MG995   : 48k
+- Ship    : 20k
+- NodeMCU : 45k
+- Total   : 159k
+
+Grand     : Rp210k
