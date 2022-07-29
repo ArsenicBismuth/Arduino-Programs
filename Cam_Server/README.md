@@ -1,7 +1,5 @@
 [Ez] Reference:
 - Wiring with UNO: https://willmakes.tv/2021/programming-esp32cam-arduino/
-- Change SSID & stuff in `myconfig.h`.
-- OTA password = `esp32admin`.
 - No support for 5GHz network.
 - Brownout error: Need external 5V, read below (it's as simple as **abc**).
 
@@ -21,3 +19,13 @@ Uploading with OTA works, make sure you follow this:
 - https://github.com/easytarget/esp32-cam-webserver#programming
 - The upload setting in Arduino IDE, not the "ESP32-CAM".
 - Upload as usual first, to make sure OTA feature is added in firmware.
+
+Settings:
+- Change SSID & stuff in `myconfig.h`.
+- OTA password = `esp32admin`.
+
+Running:
+- Running mode: After upload, flash cable removed.
+- Upload mode: Connected to Nano/uploader.
+- To be independent, must disconnect EVERYTHING (for some reason).
+- Otherwise, you need everything (Nano, cable data).
