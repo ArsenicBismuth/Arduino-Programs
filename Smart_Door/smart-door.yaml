@@ -28,6 +28,7 @@ wifi:
 
 captive_portal:
     
+# UI Controls
 number:
   - platform: template
     id: servo_number
@@ -45,9 +46,43 @@ number:
 
 button:
   - platform: template
+    name: Servo Open
+    on_press:
+      then:
+        - number.set:
+            id: servo_number
+            value: -100
+        - delay: 3s
+        - number.set:
+            id: servo_number
+            value: 0
+  - platform: template
     name: Servo Zero
     on_press:
       then:
+        - number.set:
+            id: servo_number
+            value: 0
+
+# Hardwares
+binary_sensor:
+  - platform: gpio
+    id: door_sensor
+    name: Door Sensor
+    device_class: door
+    pin:
+      number: GPIO15
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on_off: 3s
+    on_release:
+      then: # Auto-lock when door is closed
+        - number.set:
+            id: servo_number
+            value: 100
+        - delay: 3s
         - number.set:
             id: servo_number
             value: 0
