@@ -1,5 +1,16 @@
 esphome:
   name: smart-door
+  on_boot:
+    - priority: 600
+      then: # Power connected = closed, lock after delay
+        - delay: 3s
+        - number.set:
+            id: servo_number
+            value: 100
+        - delay: 3s
+        - number.set:
+            id: servo_number
+            value: 0
 
 esp32:
   board: nodemcu-32s
@@ -45,8 +56,11 @@ number:
             level: !lambda 'return x / 100.0;'
 
 button:
+  # Most components have REST API, read more: https://esphome.io/web-api/#api-rest
   - platform: template
     name: Servo Open
+    id: servo_open
+    # Equivalent: http://smart-door.local/button/servo_open/press
     on_press:
       then:
         - number.set:
@@ -58,6 +72,7 @@ button:
             value: 0
   - platform: template
     name: Servo Zero
+    id: servo_zero
     on_press:
       then:
         - number.set:
@@ -66,12 +81,13 @@ button:
 
 # Hardwares
 binary_sensor:
+  # Optional, only when using a battery (always on)
   - platform: gpio
     id: door_sensor
     name: Door Sensor
     device_class: door
     pin:
-      number: GPIO15
+      number: GPIO12
       mode:
         input: true
         pullup: true
@@ -98,4 +114,5 @@ output:
     frequency: 50Hz
 
 web_server:
+  version: 3
   port: 80
