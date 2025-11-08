@@ -49,6 +49,8 @@ number:
     max_value: 100
     step: 1
     optimistic: true
+    web_server:
+      sorting_group_id: sorting_group_servo_settings
     set_action:
       then:
         - servo.write:
@@ -58,9 +60,11 @@ number:
 button:
   # Most components have REST API, read more: https://esphome.io/web-api/#api-rest
   - platform: template
-    name: Servo Open
+    name: Open
     id: servo_open
     # Equivalent: http://smart-door.local/button/servo_open/press
+    web_server:
+      sorting_group_id: sorting_group_door_actions
     on_press:
       then:
         - number.set:
@@ -71,8 +75,10 @@ button:
             id: servo_number
             value: 0
   - platform: template
-    name: Servo Close
+    name: Close
     id: servo_close
+    web_server:
+      sorting_group_id: sorting_group_door_actions
     on_press:
       then:
         - number.set:
@@ -83,8 +89,10 @@ button:
             id: servo_number
             value: 0
   - platform: template
-    name: Servo Zero
+    name: Zero
     id: servo_zero
+    web_server:
+      sorting_group_id: sorting_group_servo_settings
     on_press:
       then:
         - number.set:
@@ -129,3 +137,10 @@ output:
 web_server:
   version: 3
   port: 80
+  sorting_groups:
+    - id: sorting_group_door_actions
+      name: "Door Actions"
+      sorting_weight: 10
+    - id: sorting_group_servo_settings
+      name: "Servo Settings"
+      sorting_weight: 20
