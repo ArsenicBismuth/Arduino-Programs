@@ -71,6 +71,18 @@ button:
             id: servo_number
             value: 0
   - platform: template
+    name: Servo Close
+    id: servo_close
+    on_press:
+      then:
+        - number.set:
+            id: servo_number
+            value: 100
+        - delay: 3s
+        - number.set:
+            id: servo_number
+            value: 0
+  - platform: template
     name: Servo Zero
     id: servo_zero
     on_press:
@@ -91,8 +103,9 @@ binary_sensor:
       mode:
         input: true
         pullup: true
+        # Means door is closed on release
     filters:
-      - delayed_on_off: 3s
+      - delayed_on_off: 1s
     on_release:
       then: # Auto-lock when door is closed
         - number.set:
