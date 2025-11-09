@@ -1,16 +1,16 @@
 esphome:
   name: smart-door
-  on_boot:
-    - priority: 600
-      then: # Power connected = closed, lock after delay
-        - delay: !lambda 'return id(servo_duration).state * 1000;'
-        - number.set:
-            id: servo_number
-            value: 100
-        - delay: !lambda 'return id(servo_duration).state * 1000;'
-        - number.set:
-            id: servo_number
-            value: 0
+  # on_boot:
+  #   - priority: 600
+  #     then: # Power connected = closed, lock after delay
+  #       - delay: !lambda 'return id(servo_duration).state * 1000;'
+  #       - number.set:
+  #           id: servo_number
+  #           value: 100
+  #       - delay: !lambda 'return id(servo_duration).state * 1000;'
+  #       - number.set:
+  #           id: servo_number
+  #           value: 0
 
 esp32:
   board: nodemcu-32s
@@ -71,8 +71,8 @@ button:
   # Most components have REST API, read more: https://esphome.io/web-api/#api-rest
   - platform: template
     name: Open
-    id: servo_open
-    # Equivalent: http://smart-door.local/button/servo_open/press
+    id: door_open
+    # Equivalent: http://smart-door.local/button/open/press (using name, not id)
     web_server:
       sorting_group_id: sorting_group_door_actions
     on_press:
@@ -86,7 +86,7 @@ button:
             value: 0
   - platform: template
     name: Close
-    id: servo_close
+    id: door_close
     web_server:
       sorting_group_id: sorting_group_door_actions
     on_press:
