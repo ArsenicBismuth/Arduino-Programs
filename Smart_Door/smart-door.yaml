@@ -133,6 +133,26 @@ binary_sensor:
         - number.set:
             id: servo_number
             value: 0
+  - platform: gpio
+    id: door_button
+    name: Door Button
+    device_class: door
+    pin:
+      number: GPIO14
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on_off: 0.2s
+    on_release:
+      then: # Open the door
+        - number.set:
+            id: servo_number
+            value: -100
+        - delay: !lambda 'return id(servo_duration).state * 1000;'
+        - number.set:
+            id: servo_number
+            value: 0
 
 servo:
   - id: servo_hw
