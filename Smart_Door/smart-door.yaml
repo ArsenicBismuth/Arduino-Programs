@@ -76,14 +76,17 @@ button:
     web_server:
       sorting_group_id: sorting_group_door_actions
     on_press:
-      then:
-        - number.set:
-            id: servo_number
-            value: -100
-        - delay: !lambda 'return id(servo_duration).state * 1000;'
-        - number.set:
-            id: servo_number
-            value: 0
+      # Move servo until the door is opened, or timeout
+      - number.set:
+          id: servo_number
+          value: -100
+      - wait_until:
+          condition:
+            binary_sensor.is_on: door_sensor
+          timeout: !lambda 'return id(servo_duration).state * 1000 + 500;'
+      - number.set:
+          id: servo_number
+          value: 0
   - platform: template
     name: Close
     id: door_close
@@ -143,16 +146,19 @@ binary_sensor:
         input: true
         pullup: true
     filters:
-      - delayed_on_off: 0.2s
+      - delayed_on_off: 100ms
     on_release:
-      then: # Open the door
-        - number.set:
-            id: servo_number
-            value: -100
-        - delay: !lambda 'return id(servo_duration).state * 1000;'
-        - number.set:
-            id: servo_number
-            value: 0
+      # Open the door
+      - number.set:
+          id: servo_number
+          value: -100
+      - wait_until:
+          condition:
+            binary_sensor.is_on: door_sensor
+          timeout: !lambda 'return id(servo_duration).state * 1000 + 500;'
+      - number.set:
+          id: servo_number
+          value: 0
 
 servo:
   - id: servo_hw
