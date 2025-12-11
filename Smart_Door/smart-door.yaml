@@ -3,14 +3,8 @@ esphome:
   # on_boot:
   #   - priority: 600
   #     then: # Power connected = closed, lock after delay
-  #       - delay: !lambda 'return id(servo_duration).state * 1000;'
-  #       - number.set:
-  #           id: servo_number
-  #           value: 100
-  #       - delay: !lambda 'return id(servo_duration).state * 1000;'
-  #       - number.set:
-  #           id: servo_number
-  #           value: 0
+  ##       - delay: !lambda 'return id(servo_duration).state * `0;'
+  #       - button.press: door_close
 
 esp32:
   board: nodemcu-32s
