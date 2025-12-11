@@ -31,6 +31,7 @@ ota:
 wifi:
   ssid: "Ab-Apart"
   password: !secret wifi_password
+  fast_connect: true
 
   # Enable fallback hotspot (captive portal) in case wifi connection fails
   ap:
@@ -126,7 +127,7 @@ binary_sensor:
         pullup: true
         # Means door is closed on release
     filters:
-      - delayed_on_off: 1s
+      - delayed_on_off: 500ms
     on_release:
       then: # Low = closed. Auto-lock when door is closed
         - button.press: door_close
