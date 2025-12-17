@@ -78,7 +78,9 @@ button:
       - wait_until:
           condition:
             binary_sensor.is_on: door_sensor
-          timeout: !lambda 'return id(servo_duration).state * 1000 + 500;'
+          timeout: !lambda 'return id(servo_duration).state * 1000 + 1000;'
+      # Continue opening a bit after the door is opened
+      - delay: !lambda 'return 3000;'
       - number.set:
           id: servo_number
           value: 0
