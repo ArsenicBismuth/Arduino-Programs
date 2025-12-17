@@ -90,14 +90,18 @@ button:
     web_server:
       sorting_group_id: sorting_group_door_actions
     on_press:
-      then:
-        - number.set:
-            id: servo_number
-            value: 100
-        - delay: !lambda 'return id(servo_duration).state * 1000;'
-        - number.set:
-            id: servo_number
-            value: 0
+      # Only trigger closing if the door is not currently opening
+      - if:
+          condition:
+            lambda: 'return id(servo_number).state >= 0;'
+          then:
+            - number.set:
+                id: servo_number
+                value: 100
+            - delay: !lambda 'return id(servo_duration).state * 1000;'
+            - number.set:
+                id: servo_number
+                value: 0
   - platform: template
     name: Zero
     id: servo_zero
