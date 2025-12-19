@@ -33,6 +33,8 @@ wifi:
     password: !secret ap_password
 
 captive_portal:
+
+http_request:
     
 # UI Controls
 number:
@@ -113,6 +115,50 @@ button:
             id: servo_number
             value: 0
 
+substitutions:
+  wa_token: !secret wa_token
+  wa_phone_number: !secret wa_phone_number
+
+text:
+  # Send WhatsApp response based on message
+  - platform: template
+    id: wa_message
+    name: WhatsApp Message
+    mode: text
+    optimistic: false
+    set_action:
+      then:
+        - logger.log:
+            format: "%s"
+            args: ["x.c_str()"]
+        - if:
+            condition:
+              - lambda: 'return x == "status";'
+            then:
+              - http_request.post:
+                  url: !secret wa_app_url
+                  request_headers:
+                    Authorization: "Bearer $wa_token"
+                    Content-Type: application/json
+                  json: |-
+                    std::string template_name;
+                    template_name = "door_status_open";
+                    if (id(door_sensor).state == false)
+                      template_name = "door_status_closed";
+
+                    root["messaging_product"] = "whatsapp";
+                    root["to"] = $wa_phone_number;
+                    root["type"] = "template";
+                    root["template"]["name"] = template_name;
+                    root["template"]["language"]["code"] = "en";
+                    root["template"]["components"][0]["type"] = "body";
+                    root["template"]["components"][0]["parameters"][0]["type"] = "text";
+                    root["template"]["components"][0]["parameters"][0]["parameter_name"] = "time_close";
+                    root["template"]["components"][0]["parameters"][0]["text"] = "11:22";
+                    root["template"]["components"][0]["parameters"][1]["type"] = "text";
+                    root["template"]["components"][0]["parameters"][1]["parameter_name"] = "time_open";
+                    root["template"]["components"][0]["parameters"][1]["text"] = "19:46";
+
 # Hardwares
 binary_sensor:
   # Optional, only when using a battery (always on)
@@ -127,7 +173,8 @@ binary_sensor:
         pullup: true
         # Means door is closed on release
     filters:
-      - delayed_on_off: 500ms
+      # 2s wait to allow magnetic connector to connect
+      - delayed_off: 2000ms
     on_release:
       then: # Low = closed. Auto-lock when door is closed
         - button.press: door_close
