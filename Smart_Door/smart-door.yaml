@@ -58,10 +58,20 @@ number:
     web_server:
       sorting_group_id: sorting_group_servo_settings
     set_action:
+      # Detach if given value is 0
       then:
         - servo.write:
             id: servo_hw
             level: !lambda 'return x / 100.0;'
+        - if:
+            condition:
+              lambda: 'return x == 0;'
+            then:
+              - delay: !lambda 'return 50;'
+              - servo.detach:
+                  id: servo_hw
+              - logger.log:
+                  format: "Servo detached"
 
 button:
   # Most components have REST API, read more: https://esphome.io/web-api/#api-rest
