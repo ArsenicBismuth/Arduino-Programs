@@ -34,7 +34,22 @@ wifi:
 captive_portal:
 
 http_request:
-    
+
+time:
+  - platform: sntp
+    id: time_now
+    timezone: Europe/Berlin
+
+globals:
+  - id: global_open_time
+    type: std::string
+    restore_value: true
+    initial_value: ""
+  - id: global_close_time
+    type: std::string
+    restore_value: true
+    initial_value: ""
+
 # UI Controls
 number:
   - platform: template
@@ -83,6 +98,13 @@ button:
       sorting_group_id: sorting_group_door_actions
     on_press:
       # Move servo until the door is opened, or timeout
+      - globals.set:
+          id: global_open_time
+          value: !lambda |-
+            char str[30];
+            time_t currTime = id(time_now).now().timestamp;
+            strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
+            return std::string(str);
       - number.set:
           id: servo_number
           value: -100
@@ -102,6 +124,13 @@ button:
       sorting_group_id: sorting_group_door_actions
     on_press:
       # Only trigger closing if the door is not currently opening
+      - globals.set:
+          id: global_close_time
+          value: !lambda |-
+            char str[30];
+            time_t currTime = id(time_now).now().timestamp;
+            strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
+            return std::string(str);
       - if:
           condition:
             lambda: 'return id(servo_number).state >= 0;'
@@ -163,10 +192,23 @@ text:
                     root["template"]["components"][0]["type"] = "body";
                     root["template"]["components"][0]["parameters"][0]["type"] = "text";
                     root["template"]["components"][0]["parameters"][0]["parameter_name"] = "time_close";
-                    root["template"]["components"][0]["parameters"][0]["text"] = "11:22";
+                    root["template"]["components"][0]["parameters"][0]["text"] = id(time_close).state;
                     root["template"]["components"][0]["parameters"][1]["type"] = "text";
                     root["template"]["components"][0]["parameters"][1]["parameter_name"] = "time_open";
-                    root["template"]["components"][0]["parameters"][1]["text"] = "19:46";
+                    root["template"]["components"][0]["parameters"][1]["text"] = id(time_open).state;
+
+text_sensor:
+  # Just for displaying globals in web UI
+  - platform: template
+    id: time_close
+    name: Door Last Closed
+    lambda: 'return id(global_close_time);'
+    update_interval: 30s
+  - platform: template
+    id: time_open
+    name: Door Last Opened
+    lambda: 'return id(global_open_time);'
+    update_interval: 30s
 
 # Hardwares
 binary_sensor:
