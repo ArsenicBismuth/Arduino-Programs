@@ -1,3 +1,7 @@
+substitutions:
+  telegram_token: !secret telegram_bot_token
+  telegram_chat: !secret telegram_chat_id
+
 esphome:
   name: smart-door
   on_boot:
@@ -12,6 +16,9 @@ esp32:
 
 # Enable logging
 logger:
+  logs:
+    # Prevent component from spamming the logs
+    http_request.idf: ERROR
 
 # Enable Home Assistant API
 api:
@@ -49,6 +56,10 @@ globals:
     type: std::string
     restore_value: true
     initial_value: ""
+  - id: last_update_id
+    type: int
+    restore_value: true
+    initial_value: "0"
 
 # UI Controls
 number:
@@ -152,50 +163,85 @@ button:
         - number.set:
             id: servo_number
             value: 0
-
-substitutions:
-  wa_token: !secret wa_token
-  wa_phone_number: !secret wa_phone_number
-
-text:
-  # Send WhatsApp response based on message
+  # Hidden button to trigger status message (called from interval)
   - platform: template
-    id: wa_message
-    name: WhatsApp Message
-    mode: text
-    optimistic: false
-    set_action:
+    id: send_status_message
+    internal: true
+    on_press:
       then:
-        - logger.log:
-            format: "%s"
-            args: ["x.c_str()"]
-        - if:
-            condition:
-              - lambda: 'return x == "status";'
-            then:
-              - http_request.post:
-                  url: !secret wa_app_url
-                  request_headers:
-                    Authorization: "Bearer $wa_token"
-                    Content-Type: application/json
-                  json: |-
-                    std::string template_name;
-                    template_name = "door_status_open";
-                    if (id(door_sensor).state == false)
-                      template_name = "door_status_closed";
+        - http_request.post:
+            url: "https://api.telegram.org/bot${telegram_token}/sendMessage"
+            request_headers:
+              Content-Type: application/json
+            json: |-
+              std::string status_emoji = id(door_sensor).state ? "🟩" : "🟥";
+              std::string status_text = id(door_sensor).state ? "OPEN" : "CLOSED";
+              
+              std::string message = "*Status: Door is " + status_text + "* " + status_emoji + "\n";
+              message += "• Last opened: " + id(time_open).state + "\n";
+              message += "• Last closed: " + id(time_close).state;
+              
+              root["chat_id"] = ${telegram_chat};
+              root["text"] = message;
+              root["parse_mode"] = "Markdown";
 
-                    root["messaging_product"] = "whatsapp";
-                    root["to"] = $wa_phone_number;
-                    root["type"] = "template";
-                    root["template"]["name"] = template_name;
-                    root["template"]["language"]["code"] = "en";
-                    root["template"]["components"][0]["type"] = "body";
-                    root["template"]["components"][0]["parameters"][0]["type"] = "text";
-                    root["template"]["components"][0]["parameters"][0]["parameter_name"] = "time_close";
-                    root["template"]["components"][0]["parameters"][0]["text"] = id(time_close).state;
-                    root["template"]["components"][0]["parameters"][1]["type"] = "text";
-                    root["template"]["components"][0]["parameters"][1]["parameter_name"] = "time_open";
-                    root["template"]["components"][0]["parameters"][1]["text"] = id(time_open).state;
+interval:
+  # Poll Telegram for new messages every 1 second
+  - interval: 1s
+    then:
+      - http_request.get:
+          url: "https://api.telegram.org/bot${telegram_token}/getUpdates?offset=-1&limit=1"
+          capture_response: true
+          on_response:
+            - if:
+                condition:
+                  lambda: return response->status_code == 200;
+                then:
+                  - lambda: |-
+                      json::parse_json(body, [](JsonObject root) -> bool {
+                        // Check if response is ok and has results
+                        if (!root["ok"] || !root["result"].is<JsonArray>()) {
+                          return false;
+                        }
+                        
+                        JsonArray results = root["result"].as<JsonArray>();
+                        if (results.size() == 0) {
+                          return false;
+                        }
+                        
+                        // Get the latest update
+                        JsonObject update = results[0];
+                        int update_id = update["update_id"] | 0;
+                        
+                        // Skip if already processed
+                        if (update_id <= id(last_update_id)) {
+                          return false;
+                        }
+                        id(last_update_id) = update_id;
+                        
+                        // Get message text (check both message and edited_message)
+                        JsonVariant msg_var = update["message"];
+                        if (msg_var.isNull()) {
+                          msg_var = update["edited_message"];
+                        }
+                        if (msg_var.isNull()) {
+                          return false;
+                        }
+                        
+                        const char* text = msg_var["text"] | "";
+                        ESP_LOGI("telegram", "Received: %s", text);
+                        
+                        // Handle /status command
+                        if (strcmp(text, "/status") == 0) {
+                          id(send_status_message).press();
+                        }
+                        
+                        return true;
+                      });
+                else:
+                  - logger.log:
+                      format: "Telegram API error: %d"
+                      args: ['response->status_code']
 
 text_sensor:
   # Just for displaying globals in web UI
