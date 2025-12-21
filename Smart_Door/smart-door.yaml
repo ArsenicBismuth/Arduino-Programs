@@ -1,13 +1,20 @@
 substitutions:
   telegram_token: !secret telegram_bot_token
   telegram_chat: !secret telegram_chat_id
+  use_battery: true
+    # No battery: Auto-close on power.
+    # Battery: Close on door sensor.
 
 esphome:
   name: smart-door
   on_boot:
     - priority: 550
-      then: # Power connected = closed
-        - button.press: door_close
+      then: # No-battery mode: Power connected = closed
+        - if:
+            condition:
+              lambda: return ${0 if use_battery else 1};
+            then:
+              - button.press: door_close
 
 esp32:
   board: nodemcu-32s
@@ -143,7 +150,7 @@ button:
             binary_sensor.is_on: door_sensor
           timeout: !lambda 'return id(servo_duration).state * 1000 + 1000;'
       # Continue opening a bit after the door is opened
-      - delay: !lambda 'return 3000;'
+      - delay: !lambda 'return 1500;'
       - number.set:
           id: servo_number
           value: 0
@@ -201,7 +208,7 @@ button:
             request_headers:
               Content-Type: application/json
             json: |-
-              std::string status_emoji = id(door_sensor).state ? "🟩" : "🟥";
+              std::string status_emoji = id(door_sensor).state ? "🟥" : "🟩";
               std::string status_text = id(door_sensor).state ? "OPEN" : "CLOSED";
               
               std::string message = "*Status: Door is " + status_text + "* " + status_emoji + "\n";
@@ -300,11 +307,14 @@ binary_sensor:
         pullup: true
         # Means door is closed on release
     filters:
-      # 2s wait to allow magnetic connector to connect
-      - delayed_off: 2000ms
+      - delayed_off: 500ms
     on_release:
       then: # Low = closed. Auto-lock when door is closed
-        - button.press: door_close
+        - if:
+            condition:
+              lambda: return ${1 if use_battery else 0};
+            then:
+              - button.press: door_close
   - platform: gpio
     id: door_button
     name: Door Button
