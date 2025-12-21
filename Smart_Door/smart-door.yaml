@@ -46,7 +46,22 @@ time:
   - platform: sntp
     id: time_now
     timezone: Europe/Berlin
-
+    on_time_sync:
+      - if:
+          condition:
+            lambda: return id(pending_close_time) == true;
+          then:
+            # Update the previously pending close time
+            - globals.set:
+                id: global_close_time
+                value: !lambda |-
+                  char str[30];
+                  time_t currTime = id(time_now).now().timestamp;
+                  strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
+                  return std::string(str);
+            - globals.set:
+                id: pending_close_time
+                value: "false"
 globals:
   - id: global_open_time
     type: std::string
@@ -60,6 +75,10 @@ globals:
     type: int
     restore_value: true
     initial_value: "0"
+  - id: pending_close_time
+    type: bool
+    restore_value: false
+    initial_value: "false"
 
 # UI Controls
 number:
@@ -135,13 +154,21 @@ button:
       sorting_group_id: sorting_group_door_actions
     on_press:
       # Only trigger closing if the door is not currently opening
-      - globals.set:
-          id: global_close_time
-          value: !lambda |-
-            char str[30];
-            time_t currTime = id(time_now).now().timestamp;
-            strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
-            return std::string(str);
+      - if:
+          condition:
+            time.has_time:
+          then:
+            - globals.set:
+                id: global_close_time
+                value: !lambda |-
+                  char str[30];
+                  time_t currTime = id(time_now).now().timestamp;
+                  strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
+                  return std::string(str);
+          else:
+            - globals.set:
+                id: pending_close_time
+                value: "true"
       - if:
           condition:
             lambda: 'return id(servo_number).state >= 0;'
@@ -231,9 +258,12 @@ interval:
                         const char* text = msg_var["text"] | "";
                         ESP_LOGI("telegram", "Received: %s", text);
                         
-                        // Handle /status command
+                        // Handle commands
                         if (strcmp(text, "/status") == 0) {
                           id(send_status_message).press();
+                        } else if (strcmp(text, "/open") == 0) {
+                          id(door_open).press();
+                          // Telegram can also schedule send by long-press the send button
                         }
                         
                         return true;
