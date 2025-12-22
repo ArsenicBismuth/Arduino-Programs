@@ -144,7 +144,7 @@ button:
           value: -100
       - wait_until:
           condition:
-            binary_sensor.is_on: door_sensor
+            binary_sensor.is_on: door_is_open
           timeout: !lambda 'return id(servo_duration).state * 1000 + 1000;'
       # Continue opening a bit after the door is opened
       - delay: !lambda 'return 1500;'
@@ -203,8 +203,8 @@ button:
             request_headers:
               Content-Type: application/json
             json: |-
-              std::string status_emoji = id(door_sensor).state ? "🟥" : "🟩";
-              std::string status_text = id(door_sensor).state ? "OPEN" : "CLOSED";
+              std::string status_emoji = id(door_is_open).state ? "🟥" : "🟩";
+              std::string status_text = id(door_is_open).state ? "OPEN" : "CLOSED";
 
               char str[30];
               time_t currTime = id(global_open_time);
@@ -309,8 +309,8 @@ text_sensor:
 binary_sensor:
   # Optional, only when using a battery (always on)
   - platform: gpio
-    id: door_sensor
-    name: Door Sensor
+    id: door_is_open
+    name: Door is Open
     device_class: door
     pin:
       number: GPIO12
