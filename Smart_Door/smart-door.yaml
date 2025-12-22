@@ -62,20 +62,18 @@ time:
             - globals.set:
                 id: global_close_time
                 value: !lambda |-
-                  char str[30];
                   time_t currTime = id(time_now).now().timestamp;
-                  strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
-                  return std::string(str);
+                  return currTime;
             - globals.set:
                 id: pending_close_time
                 value: "false"
 globals:
   - id: global_open_time
-    type: std::string
+    type: time_t
     restore_value: true
     initial_value: ""
   - id: global_close_time
-    type: std::string
+    type: time_t
     restore_value: true
     initial_value: ""
   - id: last_update_id
@@ -93,6 +91,7 @@ number:
     id: servo_duration
     name: Servo Rotation Duration
     min_value: 1
+    restore_value: true
     initial_value: 4.5
     max_value: 6
     step: 0.5
@@ -138,10 +137,8 @@ button:
       - globals.set:
           id: global_open_time
           value: !lambda |-
-            char str[30];
             time_t currTime = id(time_now).now().timestamp;
-            strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
-            return std::string(str);
+            return currTime;
       - number.set:
           id: servo_number
           value: -100
@@ -168,10 +165,8 @@ button:
             - globals.set:
                 id: global_close_time
                 value: !lambda |-
-                  char str[30];
                   time_t currTime = id(time_now).now().timestamp;
-                  strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
-                  return std::string(str);
+                  return currTime;
           else:
             - globals.set:
                 id: pending_close_time
@@ -210,10 +205,19 @@ button:
             json: |-
               std::string status_emoji = id(door_sensor).state ? "🟥" : "🟩";
               std::string status_text = id(door_sensor).state ? "OPEN" : "CLOSED";
-              
+
+              char str[30];
+              time_t currTime = id(global_open_time);
+              strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
+              std::string open_time = std::string(str);
+
+              currTime = id(global_close_time);
+              strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
+              std::string close_time = std::string(str);
+
               std::string message = "*Status: Door is " + status_text + "* " + status_emoji + "\n";
-              message += "• Last opened: " + id(time_open).state + "\n";
-              message += "• Last closed: " + id(time_close).state;
+              message += "• Last opened: " + open_time + "\n";
+              message += "• Last closed: " + close_time;
               
               root["chat_id"] = ${telegram_chat};
               root["text"] = message;
@@ -285,12 +289,20 @@ text_sensor:
   - platform: template
     id: time_close
     name: Door Last Closed
-    lambda: 'return id(global_close_time);'
+    lambda: |-
+      char str[30];
+      time_t currTime = id(global_close_time);
+      strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
+      return std::string(str);
     update_interval: 30s
   - platform: template
     id: time_open
     name: Door Last Opened
-    lambda: 'return id(global_open_time);'
+    lambda: |-
+      char str[30];
+      time_t currTime = id(global_open_time);
+      strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
+      return std::string(str);
     update_interval: 30s
 
 # Hardwares
