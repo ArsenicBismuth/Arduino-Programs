@@ -4,6 +4,8 @@ substitutions:
   use_battery: true
     # No battery: Auto-close on power.
     # Battery: Close on door sensor.
+  door_open_notify_time: 5
+    # In seconds
 
 esphome:
   name: smart-door
@@ -81,6 +83,10 @@ globals:
     restore_value: true
     initial_value: "0"
   - id: pending_close_time
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: door_open_notify_sent
     type: bool
     restore_value: false
     initial_value: "false"
@@ -224,9 +230,30 @@ button:
               root["parse_mode"] = "Markdown";
 
 interval:
-  # Poll Telegram for new messages every 1 second
   - interval: 1s
     then:
+      # Check if door still opens: Door is open and more than 5 seconds since
+      - if:
+          condition:
+            lambda: return id(door_is_open).state && !id(door_open_notify_sent) && id(time_now).now().timestamp - id(global_open_time) > ${door_open_notify_time};
+          then:
+            - globals.set:
+                id: door_open_notify_sent
+                value: "true"
+            - logger.log:
+                format: "Door is opened for more than ${door_open_notify_time} seconds"
+            - http_request.post:
+                url: "https://api.telegram.org/bot${telegram_token}/sendMessage"
+                request_headers:
+                  Content-Type: application/json
+                json: |-
+                  std::string message = "*Warning: Door is OPEN 🟥* \n";
+
+                  root["chat_id"] = ${telegram_chat};
+                  root["text"] = message;
+                  root["parse_mode"] = "Markdown";
+
+      # Poll Telegram for new messages every 1 second    
       - http_request.get:
           url: "https://api.telegram.org/bot${telegram_token}/getUpdates?offset=-1&limit=1"
           capture_response: true
@@ -322,6 +349,9 @@ binary_sensor:
       - delayed_off: 500ms
     on_release:
       then: # Low = closed. Auto-lock when door is closed
+        - globals.set:
+            id: door_open_notify_sent
+            value: "false"
         - if:
             condition:
               lambda: return ${1 if use_battery else 0};
