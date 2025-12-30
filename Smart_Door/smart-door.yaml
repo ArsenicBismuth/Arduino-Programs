@@ -4,7 +4,7 @@ substitutions:
   use_battery: true
     # No battery: Auto-close on power.
     # Battery: Close on door sensor.
-  door_open_notify_time: 5
+  door_open_notify_time: 15
     # In seconds
 
 esphome:
@@ -349,9 +349,15 @@ binary_sensor:
       - delayed_off: 500ms
     on_release:
       then: # Low = closed. Auto-lock when door is closed
-        - globals.set:
-            id: door_open_notify_sent
-            value: "false"
+        - if:
+            # If previously we sent open warning, and not it's closed, then send new status
+            condition:
+              lambda: return id(door_open_notify_sent);
+            then:
+              - globals.set:
+                  id: door_open_notify_sent
+                  value: "false"
+              - button.press: send_status_message
         - if:
             condition:
               lambda: return ${1 if use_battery else 0};
