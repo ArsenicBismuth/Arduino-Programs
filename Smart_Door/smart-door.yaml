@@ -23,6 +23,9 @@ esp32:
   framework:
     type: esp-idf
 
+safe_mode:
+  disabled: true
+
 # Enable logging
 logger:
   logs:
@@ -140,23 +143,27 @@ button:
       sorting_group_id: sorting_group_door_actions
     on_press:
       # Move servo until the door is opened, or timeout
-      - globals.set:
-          id: global_open_time
-          value: !lambda |-
-            time_t currTime = id(time_now).now().timestamp;
-            return currTime;
-      - number.set:
-          id: servo_number
-          value: -100
-      - wait_until:
-          condition:
-            binary_sensor.is_on: door_is_open
-          timeout: !lambda 'return id(servo_duration).state * 1000 + 1000;'
-      # Continue opening a bit after the door is opened
-      - delay: !lambda 'return 1500;'
-      - number.set:
-          id: servo_number
-          value: 0
+      if:
+        condition: # Only if not currently moving
+          lambda: 'return id(servo_number).state == 0;'
+        then:
+        - globals.set:
+            id: global_open_time
+            value: !lambda |-
+              time_t currTime = id(time_now).now().timestamp;
+              return currTime;
+        - number.set:
+            id: servo_number
+            value: -100
+        - wait_until:
+            condition:
+              binary_sensor.is_on: door_is_open
+            timeout: !lambda 'return id(servo_duration).state * 1000 + 1000;'
+        # Continue opening a bit after the door is opened
+        - delay: !lambda 'return 1500;'
+        - number.set:
+            id: servo_number
+            value: 0
   - platform: template
     name: Close
     id: door_close
@@ -346,7 +353,7 @@ binary_sensor:
         pullup: true
         # Means door is closed on release
     filters:
-      - delayed_off: 500ms
+      - delayed_off: 100ms
     on_release:
       then: # Low = closed. Auto-lock when door is closed
         - if:
