@@ -93,6 +93,10 @@ globals:
     type: bool
     restore_value: false
     initial_value: "false"
+  - id: telegram_poll_counter
+    type: int
+    restore_value: false
+    initial_value: "0"
 
 # UI Controls
 number:
@@ -260,63 +264,77 @@ interval:
                   root["text"] = message;
                   root["parse_mode"] = "Markdown";
 
-      # Poll Telegram for new messages every 1 second    
-      - http_request.get:
-          url: "https://api.telegram.org/bot${telegram_token}/getUpdates?offset=-1&limit=1"
-          capture_response: true
-          on_response:
-            - if:
-                condition:
-                  lambda: return response->status_code == 200;
-                then:
-                  - lambda: |-
-                      json::parse_json(body, [](JsonObject root) -> bool {
-                        // Check if response is ok and has results
-                        if (!root["ok"] || !root["result"].is<JsonArray>()) {
-                          return false;
-                        }
-                        
-                        JsonArray results = root["result"].as<JsonArray>();
-                        if (results.size() == 0) {
-                          return false;
-                        }
-                        
-                        // Get the latest update
-                        JsonObject update = results[0];
-                        int update_id = update["update_id"] | 0;
-                        
-                        // Skip if already processed
-                        if (update_id <= id(last_update_id)) {
-                          return false;
-                        }
-                        id(last_update_id) = update_id;
-                        
-                        // Get message text (check both message and edited_message)
-                        JsonVariant msg_var = update["message"];
-                        if (msg_var.isNull()) {
-                          msg_var = update["edited_message"];
-                        }
-                        if (msg_var.isNull()) {
-                          return false;
-                        }
-                        
-                        const char* text = msg_var["text"] | "";
-                        ESP_LOGI("telegram", "Received: %s", text);
-                        
-                        // Handle commands
-                        if (strcmp(text, "/status") == 0) {
-                          id(send_status_message).press();
-                        } else if (strcmp(text, "/open") == 0) {
-                          id(door_open).press();
-                          // Telegram can also schedule send by long-press the send button
-                        }
-                        
-                        return true;
-                      });
-                else:
-                  - logger.log:
-                      format: "Telegram API error: %d"
-                      args: ['response->status_code']
+      # Poll Telegram for new messages every 1 second (or 5s when door is closed). This allows faster detection of open => close.
+      - lambda: |-
+          // Increment counter
+          id(telegram_poll_counter) = id(telegram_poll_counter) + 1;
+          
+          // If door is open, only poll every 5 seconds (every 5th trigger)
+          // If door is closed, poll every second
+          bool should_poll = (!id(door_is_open).state) || (id(telegram_poll_counter) >= 5);
+          if (should_poll) {
+            id(telegram_poll_counter) = 0;  // Reset counter
+          }
+      - if:
+          condition:
+            lambda: return id(telegram_poll_counter) == 0;
+          then:
+            - http_request.get:
+                url: "https://api.telegram.org/bot${telegram_token}/getUpdates?offset=-1&limit=1"
+                capture_response: true
+                on_response:
+                  - if:
+                      condition:
+                        lambda: return response->status_code == 200;
+                      then:
+                        - lambda: |-
+                            json::parse_json(body, [](JsonObject root) -> bool {
+                              // Check if response is ok and has results
+                              if (!root["ok"] || !root["result"].is<JsonArray>()) {
+                                return false;
+                              }
+                              
+                              JsonArray results = root["result"].as<JsonArray>();
+                              if (results.size() == 0) {
+                                return false;
+                              }
+                              
+                              // Get the latest update
+                              JsonObject update = results[0];
+                              int update_id = update["update_id"] | 0;
+                              
+                              // Skip if already processed
+                              if (update_id <= id(last_update_id)) {
+                                return false;
+                              }
+                              id(last_update_id) = update_id;
+                              
+                              // Get message text (check both message and edited_message)
+                              JsonVariant msg_var = update["message"];
+                              if (msg_var.isNull()) {
+                                msg_var = update["edited_message"];
+                              }
+                              if (msg_var.isNull()) {
+                                return false;
+                              }
+                              
+                              const char* text = msg_var["text"] | "";
+                              ESP_LOGI("telegram", "Received: %s", text);
+                              
+                              // Handle commands
+                              if (strcmp(text, "/status") == 0) {
+                                id(send_status_message).press();
+                              } else if (strcmp(text, "/open") == 0) {
+                                id(door_open).press();
+                                // Telegram can also schedule send by long-press the send button
+                              }
+                              
+                              return true;
+                            });
+                      else:
+                        - logger.log:
+                            format: "Telegram API error: %d"
+                            args: ['response->status_code']
 
 text_sensor:
   # Just for displaying globals in web UI
