@@ -22,6 +22,8 @@ esp32:
   board: nodemcu-32s
   framework:
     type: esp-idf
+    sdkconfig_options:
+        CONFIG_LWIP_MAX_SOCKETS: '16'
 
 safe_mode:
   disabled: true
