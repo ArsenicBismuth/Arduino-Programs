@@ -6,6 +6,9 @@ substitutions:
     # Battery: Close on door sensor.
   door_open_notify_time: 15
     # In seconds
+  door_capacitive_th: 1250
+    # 1400 => 1230
+    # Using physical button instead of conductive material reduces sensitivity
 
 esphome:
   name: smart-door
@@ -55,6 +58,10 @@ wifi:
 captive_portal:
 
 http_request:
+
+esp32_touch:
+  # Display the capacitive reading
+  # setup_mode: true
 
 time:
   - platform: sntp
@@ -367,7 +374,7 @@ binary_sensor:
     name: Door is Open
     device_class: door
     pin:
-      number: GPIO12
+      number: GPIO14
       mode:
         input: true
         pullup: true
@@ -390,16 +397,12 @@ binary_sensor:
               lambda: return ${1 if use_battery else 0};
             then:
               - button.press: door_close
-  - platform: gpio
+  - platform: esp32_touch
     id: door_button
     name: Door Button
     device_class: door
-    pin:
-      number: GPIO14
-      inverted: true
-      mode:
-        input: true
-        pullup: true
+    pin: GPIO27
+    threshold: ${door_capacitive_th}
     filters:
       - delayed_on_off: 100ms
     on_press:
