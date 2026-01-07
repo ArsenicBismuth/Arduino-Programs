@@ -52,7 +52,7 @@ wifi:
     ssid: "Smart-Door Fallback Hotspot"
     password: !secret ap_password
 
-captive_portal:
+# captive_portal:
 
 http_request:
 
@@ -124,8 +124,8 @@ number:
     max_value: 6
     step: 0.5
     optimistic: true
-    web_server:
-      sorting_group_id: sorting_group_servo_settings
+    # web_server:
+    #   sorting_group_id: sorting_group_servo_settings
   - platform: template
     id: servo_number
     name: Servo Control
@@ -134,8 +134,8 @@ number:
     max_value: 100
     step: 1
     optimistic: true
-    web_server:
-      sorting_group_id: sorting_group_servo_settings
+    # web_server:
+    #   sorting_group_id: sorting_group_servo_settings
     set_action:
       # Detach if given value is 0
       then:
@@ -158,8 +158,8 @@ button:
     name: Open
     id: door_open
     # Equivalent: http://smart-door.local/button/open/press (using name, not id)
-    web_server:
-      sorting_group_id: sorting_group_door_actions
+    # web_server:
+    #   sorting_group_id: sorting_group_door_actions
     on_press:
       # Move servo until the door is opened, or timeout
       if:
@@ -186,8 +186,8 @@ button:
   - platform: template
     name: Close
     id: door_close
-    web_server:
-      sorting_group_id: sorting_group_door_actions
+    # web_server:
+    #   sorting_group_id: sorting_group_door_actions
     on_press:
       # Only trigger closing if the door is not currently opening
       - if:
@@ -217,8 +217,8 @@ button:
   - platform: template
     name: Zero
     id: servo_zero
-    web_server:
-      sorting_group_id: sorting_group_servo_settings
+    # web_server:
+    #   sorting_group_id: sorting_group_servo_settings
     on_press:
       then:
         - number.set:
@@ -434,13 +434,13 @@ output:
     pin: GPIO13
     frequency: 50Hz
 
-web_server:
-  version: 3
-  port: 80
-  sorting_groups:
-    - id: sorting_group_door_actions
-      name: "Door Actions"
-      sorting_weight: 10
-    - id: sorting_group_servo_settings
-      name: "Servo Settings"
-      sorting_weight: 20
+# web_server:
+#   version: 3
+#   port: 80
+#   sorting_groups:
+#     - id: sorting_group_door_actions
+#       name: "Door Actions"
+#       sorting_weight: 10
+#     - id: sorting_group_servo_settings
+#       name: "Servo Settings"
+#       sorting_weight: 20
