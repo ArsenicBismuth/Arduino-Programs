@@ -74,6 +74,7 @@ time:
             - globals.set:
                 id: pending_close_time
                 value: "false"
+
 globals:
   - id: global_open_time
     type: time_t
@@ -99,6 +100,18 @@ globals:
     type: int
     restore_value: false
     initial_value: "0"
+
+# Enables the ability to read debug information.
+debug:
+  update_interval: 1min # How often to check the memory.
+
+sensor:
+  # Creates a sensor in Home Assistant with the free memory value.
+  - platform: debug
+    free:
+      name: "Heap Free"
+      unit_of_measurement: "B" # B for Bytes
+      icon: "mdi:memory"
 
 # UI Controls
 number:
@@ -358,6 +371,11 @@ text_sensor:
       strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
       return std::string(str);
     update_interval: 30s
+  # Creates a sensor that shows the reason for the last reboot.
+  - platform: debug
+    reset_reason:
+      name: "Reset Reason"
+      icon: "mdi:information-outline"
 
 # Hardwares
 binary_sensor:
