@@ -1,11 +1,9 @@
 substitutions:
   telegram_token: !secret telegram_bot_token
   telegram_chat: !secret telegram_chat_id
-  use_battery: true
+  use_battery: false
     # No battery: Auto-close on power.
     # Battery: Close on door sensor.
-  door_open_notify_time: 15
-    # In seconds
 
 esphome:
   name: smart-door
@@ -89,10 +87,6 @@ globals:
     restore_value: true
     initial_value: "0"
   - id: pending_close_time
-    type: bool
-    restore_value: false
-    initial_value: "false"
-  - id: door_open_notify_sent
     type: bool
     restore_value: false
     initial_value: "false"
@@ -258,27 +252,6 @@ button:
 interval:
   - interval: 1s
     then:
-      # Check if door still opens: Door is open and more than 5 seconds since
-      - if:
-          condition:
-            lambda: return id(door_is_open).state && !id(door_open_notify_sent) && id(time_now).now().timestamp - id(global_open_time) > ${door_open_notify_time};
-          then:
-            - globals.set:
-                id: door_open_notify_sent
-                value: "true"
-            - logger.log:
-                format: "Door is opened for more than ${door_open_notify_time} seconds"
-            - http_request.post:
-                url: "https://api.telegram.org/bot${telegram_token}/sendMessage"
-                request_headers:
-                  Content-Type: application/json
-                json: |-
-                  std::string message = "*Warning: Door is OPEN 🟥* \n";
-
-                  root["chat_id"] = ${telegram_chat};
-                  root["text"] = message;
-                  root["parse_mode"] = "Markdown";
-
       # Poll Telegram for new messages every 1 second (or 5s when door is closed). This allows faster detection of open => close.
       - lambda: |-
           // Increment counter
@@ -392,22 +365,9 @@ binary_sensor:
         # Means door is closed on release
     filters:
       - delayed_off: 100ms
-    on_release:
-      then: # Low = closed. Auto-lock when door is closed
-        - if:
-            # If previously we sent open warning, and not it's closed, then send new status
-            condition:
-              lambda: return id(door_open_notify_sent);
-            then:
-              - globals.set:
-                  id: door_open_notify_sent
-                  value: "false"
-              - button.press: send_status_message
-        - if:
-            condition:
-              lambda: return ${1 if use_battery else 0};
-            then:
-              - button.press: door_close
+    # on_release: # Not used for battery-less mode
+    #   then: # Low = closed. Auto-lock when door is closed
+    #     - button.press: door_close
   - platform: gpio
     id: door_button
     name: Door Button
