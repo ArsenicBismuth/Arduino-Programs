@@ -293,54 +293,76 @@ interval:
             - http_request.get:
                 url: "https://api.telegram.org/bot${telegram_token}/getUpdates?offset=-1&limit=1"
                 capture_response: true
+                on_error:
+                  - logger.log:
+                      format: "Telegram API error: %d"
+                      args: ['response->status_code']
                 on_response:
                   - if:
                       condition:
                         lambda: return response->status_code == 200;
                       then:
                         - lambda: |-
-                            json::parse_json(body, [](JsonObject root) -> bool {
-                              // Check if response is ok and has results
-                              if (!root["ok"] || !root["result"].is<JsonArray>()) {
-                                return false;
-                              }
-                              
-                              JsonArray results = root["result"].as<JsonArray>();
-                              if (results.size() == 0) {
-                                return false;
-                              }
-                              
-                              // Get the latest update
-                              JsonObject update = results[0];
-                              int update_id = update["update_id"] | 0;
-                              
-                              // Skip if already processed
-                              if (update_id <= id(last_update_id)) {
-                                return false;
-                              }
-                              id(last_update_id) = update_id;
-                              
-                              // Get message text (check both message and edited_message)
-                              JsonVariant msg_var = update["message"];
-                              if (msg_var.isNull()) {
-                                msg_var = update["edited_message"];
-                              }
-                              if (msg_var.isNull()) {
-                                return false;
-                              }
-                              
-                              const char* text = msg_var["text"] | "";
-                              
-                              // Handle commands
-                              if (strcmp(text, "/status") == 0) {
-                                id(send_status_message).press();
-                              } else if (strcmp(text, "/open") == 0) {
-                                id(door_open).press();
-                                // Telegram can also schedule send by long-press the send button
-                              }
-                              
-                              return true;
-                            });
+                            // Simple string search instead of JSON parsing
+                            std::string body_str = body;
+                            
+                            // Check if response contains "ok":true
+                            if (body_str.find("\"ok\":true") == std::string::npos) {
+                              return;
+                            }
+                            
+                            // Find update_id in the response
+                            size_t update_id_pos = body_str.find("\"update_id\":");
+                            if (update_id_pos == std::string::npos) {
+                              return;
+                            }
+                            
+                            // Extract update_id value
+                            size_t id_start = body_str.find_first_of("0123456789", update_id_pos);
+                            if (id_start == std::string::npos) {
+                              return;
+                            }
+                            size_t id_end = body_str.find_first_not_of("0123456789", id_start);
+                            if (id_end == std::string::npos) {
+                              id_end = body_str.length();
+                            }
+                            
+                            int update_id = std::stoi(body_str.substr(id_start, id_end - id_start));
+                            
+                            // Skip if already processed
+                            if (update_id <= id(last_update_id)) {
+                              return;
+                            }
+                            id(last_update_id) = update_id;
+                            
+                            // Search for message text (check just "message", ignore "edited_message")
+                            size_t msg_pos = body_str.find("\"message\":");
+                            if (msg_pos == std::string::npos) {
+                              return;
+                            }
+                            
+                            // Find text field within the message
+                            size_t text_pos = body_str.find("\"text\":\"", msg_pos);
+                            if (text_pos == std::string::npos) {
+                              return;
+                            }
+                            
+                            // Extract text value
+                            size_t text_start = text_pos + 8; // Length of "\"text\":\""
+                            size_t text_end = body_str.find("\"", text_start);
+                            if (text_end == std::string::npos) {
+                              return;
+                            }
+                            
+                            std::string text = body_str.substr(text_start, text_end - text_start);
+                            
+                            // Handle commands
+                            if (text == "/status") {
+                              id(send_status_message).press();
+                            } else if (text == "/open") {
+                              id(door_open).press();
+                              // Telegram can also schedule send by long-press the send button
+                            }
                       else:
                         - logger.log:
                             format: "Telegram API error: %d"
