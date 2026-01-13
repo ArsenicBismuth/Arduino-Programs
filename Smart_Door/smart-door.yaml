@@ -275,7 +275,7 @@ button:
 interval:
   - interval: 1s
     then:
-      # Poll Telegram for new messages every 1 second (or 5s when door is closed). This allows faster detection of open => close.
+      # Poll Telegram for new messages every N seconds (or 5N when door is open). This allows faster detection of open => close.
       - lambda: |-
           // Increment counter
           id(telegram_poll_counter) = id(telegram_poll_counter) + 1;
@@ -401,7 +401,7 @@ binary_sensor:
         input: true
         pullup: true
     filters:
-      - delayed_on_off: 100ms
+      - delayed_on_off: 20ms
     on_press:
       then: # High = pressed. Open the door
         - button.press: door_open
