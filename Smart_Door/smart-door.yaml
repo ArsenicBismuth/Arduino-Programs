@@ -33,6 +33,8 @@ safe_mode:
 
 # Enable logging
 logger:
+  level: ERROR
+  initial_level: ERROR
   logs:
     # Prevent component from spamming the logs
     http_request.idf: ERROR
@@ -328,7 +330,6 @@ interval:
                               }
                               
                               const char* text = msg_var["text"] | "";
-                              ESP_LOGI("telegram", "Received: %s", text);
                               
                               // Handle commands
                               if (strcmp(text, "/status") == 0) {
