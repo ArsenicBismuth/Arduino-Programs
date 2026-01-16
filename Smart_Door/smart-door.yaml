@@ -1,11 +1,9 @@
 substitutions:
   telegram_token: !secret telegram_bot_token
   telegram_chat: !secret telegram_chat_id
-  use_battery: true
+  use_battery: false
     # No battery: Auto-close on power.
     # Battery: Close on door sensor.
-  door_open_notify_time: 15
-    # In seconds
 
 esphome:
   name: smart-door
@@ -17,6 +15,11 @@ esphome:
               lambda: return ${0 if use_battery else 1};
             then:
               - button.press: door_close
+              - delay: !lambda 'return id(servo_duration).state * 1000 + 1000;'
+              - button.press: send_status_message
+              # Wait for the door to close and send status
+              # If it's completely open = power disconnected = no message.
+              # If it's partially open = power connected but sensor says open = "OPENED" message.
 
 esp32:
   board: nodemcu-32s
@@ -30,6 +33,8 @@ safe_mode:
 
 # Enable logging
 logger:
+  level: ERROR
+  initial_level: ERROR
   logs:
     # Prevent component from spamming the logs
     http_request.idf: ERROR
@@ -37,6 +42,7 @@ logger:
 # Enable Home Assistant API
 api:
   password: ""
+  reboot_timeout: 0s
 
 ota:
   - platform: esphome
@@ -89,10 +95,6 @@ globals:
     restore_value: true
     initial_value: "0"
   - id: pending_close_time
-    type: bool
-    restore_value: false
-    initial_value: "false"
-  - id: door_open_notify_sent
     type: bool
     restore_value: false
     initial_value: "false"
@@ -166,6 +168,7 @@ button:
         condition: # Only if not currently moving
           lambda: 'return id(servo_number).state == 0;'
         then:
+        - button.press: send_opening_message
         - globals.set:
             id: global_open_time
             value: !lambda |-
@@ -179,7 +182,7 @@ button:
               binary_sensor.is_on: door_is_open
             timeout: !lambda 'return id(servo_duration).state * 1000 + 1000;'
         # Continue opening a bit after the door is opened
-        - delay: !lambda 'return 1500;'
+        - delay: !lambda 'return 2000;'
         - number.set:
             id: servo_number
             value: 0
@@ -254,32 +257,26 @@ button:
               root["chat_id"] = ${telegram_chat};
               root["text"] = message;
               root["parse_mode"] = "Markdown";
+  - platform: template
+    id: send_opening_message
+    internal: true
+    on_press:
+      then:
+        - http_request.post:
+            url: "https://api.telegram.org/bot${telegram_token}/sendMessage"
+            request_headers:
+              Content-Type: application/json
+            json: |-
+              std::string message = "*Status: Door is OPENING...* 🟥\n";
+              
+              root["chat_id"] = ${telegram_chat};
+              root["text"] = message;
+              root["parse_mode"] = "Markdown";
 
 interval:
   - interval: 1s
     then:
-      # Check if door still opens: Door is open and more than 5 seconds since
-      - if:
-          condition:
-            lambda: return id(door_is_open).state && !id(door_open_notify_sent) && id(time_now).now().timestamp - id(global_open_time) > ${door_open_notify_time};
-          then:
-            - globals.set:
-                id: door_open_notify_sent
-                value: "true"
-            - logger.log:
-                format: "Door is opened for more than ${door_open_notify_time} seconds"
-            - http_request.post:
-                url: "https://api.telegram.org/bot${telegram_token}/sendMessage"
-                request_headers:
-                  Content-Type: application/json
-                json: |-
-                  std::string message = "*Warning: Door is OPEN 🟥* \n";
-
-                  root["chat_id"] = ${telegram_chat};
-                  root["text"] = message;
-                  root["parse_mode"] = "Markdown";
-
-      # Poll Telegram for new messages every 1 second (or 5s when door is closed). This allows faster detection of open => close.
+      # Poll Telegram for new messages every N seconds (or 5N when door is open). This allows faster detection of open => close.
       - lambda: |-
           // Increment counter
           id(telegram_poll_counter) = id(telegram_poll_counter) + 1;
@@ -297,55 +294,76 @@ interval:
             - http_request.get:
                 url: "https://api.telegram.org/bot${telegram_token}/getUpdates?offset=-1&limit=1"
                 capture_response: true
+                on_error:
+                  - logger.log:
+                      format: "Telegram API error: %d"
+                      args: ['response->status_code']
                 on_response:
                   - if:
                       condition:
                         lambda: return response->status_code == 200;
                       then:
                         - lambda: |-
-                            json::parse_json(body, [](JsonObject root) -> bool {
-                              // Check if response is ok and has results
-                              if (!root["ok"] || !root["result"].is<JsonArray>()) {
-                                return false;
-                              }
-                              
-                              JsonArray results = root["result"].as<JsonArray>();
-                              if (results.size() == 0) {
-                                return false;
-                              }
-                              
-                              // Get the latest update
-                              JsonObject update = results[0];
-                              int update_id = update["update_id"] | 0;
-                              
-                              // Skip if already processed
-                              if (update_id <= id(last_update_id)) {
-                                return false;
-                              }
-                              id(last_update_id) = update_id;
-                              
-                              // Get message text (check both message and edited_message)
-                              JsonVariant msg_var = update["message"];
-                              if (msg_var.isNull()) {
-                                msg_var = update["edited_message"];
-                              }
-                              if (msg_var.isNull()) {
-                                return false;
-                              }
-                              
-                              const char* text = msg_var["text"] | "";
-                              ESP_LOGI("telegram", "Received: %s", text);
-                              
-                              // Handle commands
-                              if (strcmp(text, "/status") == 0) {
-                                id(send_status_message).press();
-                              } else if (strcmp(text, "/open") == 0) {
-                                id(door_open).press();
-                                // Telegram can also schedule send by long-press the send button
-                              }
-                              
-                              return true;
-                            });
+                            // Simple string search instead of JSON parsing
+                            std::string body_str = body;
+                            
+                            // Check if response contains "ok":true
+                            if (body_str.find("\"ok\":true") == std::string::npos) {
+                              return;
+                            }
+                            
+                            // Find update_id in the response
+                            size_t update_id_pos = body_str.find("\"update_id\":");
+                            if (update_id_pos == std::string::npos) {
+                              return;
+                            }
+                            
+                            // Extract update_id value
+                            size_t id_start = body_str.find_first_of("0123456789", update_id_pos);
+                            if (id_start == std::string::npos) {
+                              return;
+                            }
+                            size_t id_end = body_str.find_first_not_of("0123456789", id_start);
+                            if (id_end == std::string::npos) {
+                              id_end = body_str.length();
+                            }
+                            
+                            int update_id = std::stoi(body_str.substr(id_start, id_end - id_start));
+                            
+                            // Skip if already processed
+                            if (update_id <= id(last_update_id)) {
+                              return;
+                            }
+                            id(last_update_id) = update_id;
+                            
+                            // Search for message text (check just "message", ignore "edited_message")
+                            size_t msg_pos = body_str.find("\"message\":");
+                            if (msg_pos == std::string::npos) {
+                              return;
+                            }
+                            
+                            // Find text field within the message
+                            size_t text_pos = body_str.find("\"text\":\"", msg_pos);
+                            if (text_pos == std::string::npos) {
+                              return;
+                            }
+                            
+                            // Extract text value
+                            size_t text_start = text_pos + 8; // Length of "\"text\":\""
+                            size_t text_end = body_str.find("\"", text_start);
+                            if (text_end == std::string::npos) {
+                              return;
+                            }
+                            
+                            std::string text = body_str.substr(text_start, text_end - text_start);
+                            
+                            // Handle commands
+                            if (text == "/status") {
+                              id(send_status_message).press();
+                            } else if (text == "/open") {
+                              id(door_open).press();
+                              // Telegram can also schedule send by long-press the send button
+                            }
                       else:
                         - logger.log:
                             format: "Telegram API error: %d"
@@ -392,22 +410,9 @@ binary_sensor:
         # Means door is closed on release
     filters:
       - delayed_off: 100ms
-    on_release:
-      then: # Low = closed. Auto-lock when door is closed
-        - if:
-            # If previously we sent open warning, and not it's closed, then send new status
-            condition:
-              lambda: return id(door_open_notify_sent);
-            then:
-              - globals.set:
-                  id: door_open_notify_sent
-                  value: "false"
-              - button.press: send_status_message
-        - if:
-            condition:
-              lambda: return ${1 if use_battery else 0};
-            then:
-              - button.press: door_close
+    # on_release: # Not used for battery-less mode
+    #   then: # Low = closed. Auto-lock when door is closed
+    #     - button.press: door_close
   - platform: gpio
     id: door_button
     name: Door Button
@@ -419,7 +424,7 @@ binary_sensor:
         input: true
         pullup: true
     filters:
-      - delayed_on_off: 100ms
+      - delayed_on_off: 20ms
     on_press:
       then: # High = pressed. Open the door
         - button.press: door_open
