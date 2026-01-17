@@ -120,6 +120,7 @@ number:
   - platform: template
     id: servo_duration
     name: Servo Rotation Duration
+    icon: "mdi:timer-sand"
     min_value: 1
     restore_value: true
     initial_value: 4.5
@@ -131,6 +132,7 @@ number:
   - platform: template
     id: servo_number
     name: Servo Control
+    icon: "mdi:rotate-right"
     min_value: -100
     initial_value: 0
     max_value: 100
@@ -159,6 +161,7 @@ button:
   - platform: template
     name: Open
     id: door_open
+    icon: "mdi:lock-open-variant-outline"
     # Equivalent: http://smart-door.local/button/open/press (using name, not id)
     web_server:
       sorting_group_id: sorting_group_door_actions
@@ -189,6 +192,7 @@ button:
   - platform: template
     name: Close
     id: door_close
+    icon: "mdi:lock-outline"
     web_server:
       sorting_group_id: sorting_group_door_actions
     on_press:
@@ -220,6 +224,7 @@ button:
   - platform: template
     name: Zero
     id: servo_zero
+    icon: "mdi:numeric-0-circle-outline"
     web_server:
       sorting_group_id: sorting_group_servo_settings
     on_press:
@@ -374,6 +379,7 @@ text_sensor:
   - platform: template
     id: time_close
     name: Door Last Closed
+    icon: "mdi:timer-lock-outline"
     lambda: |-
       char str[30];
       time_t currTime = id(global_close_time);
@@ -383,6 +389,7 @@ text_sensor:
   - platform: template
     id: time_open
     name: Door Last Opened
+    icon: "mdi:timer-lock-open-outline"
     lambda: |-
       char str[30];
       time_t currTime = id(global_open_time);
@@ -402,6 +409,7 @@ binary_sensor:
     id: door_is_open
     name: Door is Open
     device_class: door
+    icon: "mdi:door-open"
     pin:
       number: GPIO12
       mode:
@@ -417,6 +425,7 @@ binary_sensor:
     id: door_button
     name: Door Button
     device_class: door
+    icon: "mdi:exit-run"
     pin:
       number: GPIO14
       inverted: true
