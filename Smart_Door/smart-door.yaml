@@ -2,6 +2,7 @@ substitutions:
   telegram_token: !secret telegram_bot_token
   telegram_chat: !secret telegram_chat_id
   use_battery: false
+  use_telegram: false
     # No battery: Auto-close on power.
     # Battery: Close on door sensor.
 
@@ -233,45 +234,56 @@ button:
     internal: true
     on_press:
       then:
-        - http_request.post:
-            url: "https://api.telegram.org/bot${telegram_token}/sendMessage"
-            request_headers:
-              Content-Type: application/json
-            json: |-
-              std::string status_emoji = id(door_is_open).state ? "🟥" : "🟩";
-              std::string status_text = id(door_is_open).state ? "OPEN" : "CLOSED";
+        - if:
+            condition:
+              lambda: return ${1 if use_telegram else 0};
+            then:
+              - http_request.post:
+                  url: "https://api.telegram.org/bot${telegram_token}/sendMessage"
+                  request_headers:
+                    Content-Type: application/json
+                  json: |-
+                    std::string status_emoji = id(door_is_open).state ? "🟥" : "🟩";
+                    std::string status_text = id(door_is_open).state ? "OPEN" : "CLOSED";
 
-              char str[30];
-              time_t currTime = id(global_open_time);
-              strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
-              std::string open_time = std::string(str);
+                    char str[30];
+                    time_t currTime = id(global_open_time);
+                    strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
+                    std::string open_time = std::string(str);
 
-              currTime = id(global_close_time);
-              strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
-              std::string close_time = std::string(str);
+                    currTime = id(global_close_time);
+                    strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
+                    std::string close_time = std::string(str);
 
-              std::string message = "*Status: Door is " + status_text + "* " + status_emoji + "\n";
-              message += "• Last opened: " + open_time + "\n";
-              message += "• Last closed: " + close_time;
-              
-              root["chat_id"] = ${telegram_chat};
-              root["text"] = message;
-              root["parse_mode"] = "Markdown";
+                    std::string message = "*Status: Door is " + status_text + "* " + status_emoji + "\n";
+                    message += "• Last opened: " + open_time + "\n";
+                    message += "• Last closed: " + close_time;
+                    
+                    root["chat_id"] = ${telegram_chat};
+                    root["text"] = message;
+                    root["parse_mode"] = "Markdown";
   - platform: template
     id: send_opening_message
     internal: true
     on_press:
-      then:
-        - http_request.post:
-            url: "https://api.telegram.org/bot${telegram_token}/sendMessage"
-            request_headers:
-              Content-Type: application/json
-            json: |-
-              std::string message = "*Status: Door is OPENING...* 🟥\n";
-              
-              root["chat_id"] = ${telegram_chat};
-              root["text"] = message;
-              root["parse_mode"] = "Markdown";
+      - if:
+          condition:
+            lambda: return ${1 if use_telegram else 0};
+          then:
+            - http_request.post:
+                url: "https://api.telegram.org/bot${telegram_token}/sendMessage"
+                request_headers:
+                  Content-Type: application/json
+                json: |-
+                  std::string message = "*Status: Door is OPENING...* 🟥\n";
+                  
+                  root["chat_id"] = ${telegram_chat};
+                  root["text"] = message;
+                  root["parse_mode"] = "Markdown";
+  - platform: restart
+    name: "Restart"
+    icon: "mdi:restart"
+    entity_category: diagnostic
 
 interval:
   - interval: 1s
@@ -289,7 +301,7 @@ interval:
           }
       - if:
           condition:
-            lambda: return id(telegram_poll_counter) == 0;
+            lambda: return id(telegram_poll_counter) == 0 && ${1 if use_telegram else 0};
           then:
             - http_request.get:
                 url: "https://api.telegram.org/bot${telegram_token}/getUpdates?offset=-1&limit=1"
