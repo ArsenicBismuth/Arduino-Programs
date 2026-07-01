@@ -5,6 +5,7 @@ substitutions:
   use_telegram: false
     # No battery: Auto-close on power.
     # Battery: Close on door sensor.
+  servo_acceleration: 100  # Ramp speed in servo_number units per second (-100..100 scale)
 
 esphome:
   name: smart-door
@@ -16,7 +17,6 @@ esphome:
               lambda: return ${0 if use_battery else 1};
             then:
               - button.press: door_close
-              - delay: !lambda 'return id(servo_duration).state * 1000 + 1000;'
               - button.press: send_status_message
               # Wait for the door to close and send status
               # If it's completely open = power disconnected = no message.
@@ -103,6 +103,14 @@ globals:
     type: int
     restore_value: false
     initial_value: "0"
+  - id: servo_motion_target
+    type: float
+    restore_value: false
+    initial_value: "0"
+  - id: servo_motion_active
+    type: bool
+    restore_value: false
+    initial_value: "false"
 
 # Enables the ability to read debug information.
 debug:
@@ -157,6 +165,27 @@ number:
               - logger.log:
                   format: "Servo detached"
 
+script:
+  - id: servo_ramp_to
+    mode: restart
+    parameters:
+      target: float
+    then:
+      - lambda: |-
+          id(servo_motion_target) = target;
+          id(servo_motion_active) = true;
+      - wait_until:
+          condition:
+            lambda: 'return !id(servo_motion_active);'
+          timeout: 30s
+      - if:
+          condition:
+            lambda: 'return target == 0.0f;'
+          then:
+            - delay: 50ms
+            - servo.detach:
+                id: servo_hw
+
 button:
   # Most components have REST API, read more: https://esphome.io/web-api/#api-rest
   - platform: template
@@ -170,21 +199,23 @@ button:
       # Move servo until the door is opened, or timeout
       if:
         condition: # Only if not currently moving
-          lambda: 'return id(servo_number).state == 0;'
+          lambda: 'return !id(servo_motion_active) && id(servo_number).state == 0;'
         then:
-        - button.press: send_opening_message
-        - globals.set:
-            id: global_open_time
-            value: !lambda |-
-              time_t currTime = id(time_now).now().timestamp;
-              return currTime;
-        - number.set:
-            id: servo_number
-            value: -100
-        - delay: !lambda 'return id(servo_duration).state * 1000 + 2000;'
-        - number.set:
-            id: servo_number
-            value: 0
+          - button.press: send_opening_message
+          - globals.set:
+              id: global_open_time
+              value: !lambda |-
+                time_t currTime = id(time_now).now().timestamp;
+                return currTime;
+          - script.execute:
+              id: servo_ramp_to
+              target: -100.0
+          - script.wait: servo_ramp_to
+          - delay: !lambda 'return id(servo_duration).state * 1000;'
+          - script.execute:
+              id: servo_ramp_to
+              target: 0.0
+          - script.wait: servo_ramp_to
   - platform: template
     name: Close
     id: door_close
@@ -208,15 +239,17 @@ button:
                 value: "true"
       - if:
           condition:
-            lambda: 'return id(servo_number).state >= 0;'
+            lambda: 'return !id(servo_motion_active) && id(servo_number).state >= 0;'
           then:
-            - number.set:
-                id: servo_number
-                value: 100
+            - script.execute:
+                id: servo_ramp_to
+                target: 100.0
+            - script.wait: servo_ramp_to
             - delay: !lambda 'return id(servo_duration).state * 1000;'
-            - number.set:
-                id: servo_number
-                value: 0
+            - script.execute:
+                id: servo_ramp_to
+                target: 0.0
+            - script.wait: servo_ramp_to
   - platform: template
     name: Zero
     id: servo_zero
@@ -225,6 +258,9 @@ button:
       sorting_group_id: sorting_group_servo_settings
     on_press:
       then:
+        - script.stop: servo_ramp_to
+        - lambda: |-
+            id(servo_motion_active) = false;
         - number.set:
             id: servo_number
             value: 0
@@ -286,6 +322,30 @@ button:
     entity_category: diagnostic
 
 interval:
+  - interval: 50ms
+    then:
+      - if:
+          condition:
+            lambda: 'return id(servo_motion_active);'
+          then:
+            - lambda: |-
+                const float dt = 0.05f;
+                const float rate = ${servo_acceleration};
+                float current = id(servo_number).state;
+                float target = id(servo_motion_target);
+                float dist = target - current;
+                float step = rate * dt;
+
+                if (fabsf(dist) <= step) {
+                  id(servo_number).publish_state(target);
+                  id(servo_motion_active) = false;
+                } else {
+                  float move = (dist > 0) ? step : -step;
+                  id(servo_number).publish_state(current + move);
+                }
+            - servo.write:
+                id: servo_hw
+                level: !lambda 'return id(servo_number).state / 100.0;'
   - interval: 1s
     then:
       # Poll Telegram for new messages every N seconds (or 5N when door is open). This allows faster detection of open => close.
