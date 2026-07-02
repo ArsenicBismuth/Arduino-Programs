@@ -16,6 +16,7 @@ esphome:
             condition:
               lambda: return ${0 if use_battery else 1};
             then:
+              - delay: !lambda 'return 200;'
               - button.press: door_close
               - button.press: send_status_message
               # Wait for the door to close and send status
