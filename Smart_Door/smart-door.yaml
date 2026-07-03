@@ -1,8 +1,10 @@
 substitutions:
   telegram_token: !secret telegram_bot_token
   telegram_chat: !secret telegram_chat_id
-  use_battery: false
+  close_on_startup: false
+  close_on_sensor: true
   use_telegram: false
+  # Recommendations:
     # No battery: Auto-close on power.
     # Battery: Close on door sensor.
   servo_acceleration: 100  # Ramp speed in servo_number units per second (-100..100 scale)
@@ -11,10 +13,10 @@ esphome:
   name: smart-door
   on_boot:
     - priority: 550
-      then: # No-battery mode: Power connected = closed
+      then: # Power connected = closed
         - if:
             condition:
-              lambda: return ${0 if use_battery else 1};
+              lambda: return ${1 if close_on_startup else 0};
             then:
               - delay: !lambda 'return 200;'
               - button.press: door_close
@@ -486,9 +488,12 @@ binary_sensor:
         # Means door is closed on release
     filters:
       - delayed_off: 100ms
-    # on_release: # Not used for battery-less mode
-    #   then: # Low = closed. Auto-lock when door is closed
-    #     - button.press: door_close
+    on_release:
+      - if:
+          condition:
+            lambda: return ${1 if close_on_sensor else 0};
+          then:
+            - button.press: door_close
   - platform: gpio
     id: door_button
     name: Door Button
