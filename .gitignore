@@ -7,3 +7,4 @@ Wifi_Feeder/temp/
 
 secrets.yaml
 .esphome
+.vscode
