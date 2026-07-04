@@ -36,7 +36,7 @@ packages:
   tailscale:
     url: https://github.com/Csontikka/esphome-tailscale
     ref: main
-    files: [packages/tailscale/tailscale.yaml]
+    files: [packages/tailscale/tailscale-core.yaml]
     refresh: 0s
     
 safe_mode:
@@ -79,7 +79,8 @@ tailscale:
   hostname: "esp32-tailscale"
 
 time:
-  - platform: sntp
+  # - platform: sntp
+  - id: !extend tailscale_time
     timezone: Europe/Berlin
     on_time_sync:
       - if:
