@@ -159,6 +159,7 @@ select:
       - "Quiet"
     web_server:
       sorting_group_id: sorting_group_servo_settings
+      sorting_weight: 10
     set_action:
       then:
         - if:
@@ -192,6 +193,7 @@ number:
     optimistic: true
     web_server:
       sorting_group_id: sorting_group_servo_settings
+      sorting_weight: 20
   - platform: template
     id: servo_target
     name: Servo Target
@@ -204,6 +206,7 @@ number:
     optimistic: true
     web_server:
       sorting_group_id: sorting_group_servo_settings
+      sorting_weight: 30
   - platform: template
     id: servo_number
     name: Servo Control
@@ -215,6 +218,7 @@ number:
     optimistic: true
     web_server:
       sorting_group_id: sorting_group_servo_settings
+      sorting_weight: 40
     set_action:
       # Detach if given value is 0
       then:
@@ -322,6 +326,7 @@ button:
     icon: "mdi:numeric-0-circle-outline"
     web_server:
       sorting_group_id: sorting_group_servo_settings
+      sorting_weight: 50
     on_press:
       then:
         - script.stop: servo_ramp_to
