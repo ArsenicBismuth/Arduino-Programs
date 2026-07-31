@@ -24,6 +24,25 @@ esphome:
               # Wait for the door to close and send status
               # If it's completely open = power disconnected = no message.
               # If it's partially open = power connected but sensor says open = "OPENED" message.
+    - priority: 200
+      then: # Apply the selected preset (Fast/Quiet) on boot
+        - if:
+            condition:
+              lambda: 'return id(servo_preset).state == "Fast";'
+            then:
+              - number.set:
+                  id: servo_target
+                  value: 100
+              - number.set:
+                  id: servo_duration
+                  value: 6
+            else:
+              - number.set:
+                  id: servo_target
+                  value: 25
+              - number.set:
+                  id: servo_duration
+                  value: 10
 
 esp32:
   board: nodemcu-32s
@@ -127,6 +146,39 @@ sensor:
       icon: "mdi:memory"
 
 # UI Controls
+select:
+  - platform: template
+    id: servo_preset
+    name: Servo Preset
+    icon: "mdi:tune-variant"
+    optimistic: true
+    restore_value: true
+    initial_option: "Fast"
+    options:
+      - "Fast"
+      - "Quiet"
+    web_server:
+      sorting_group_id: sorting_group_servo_settings
+    set_action:
+      then:
+        - if:
+            condition:
+              lambda: 'return x == "Fast";'
+            then:
+              - number.set:
+                  id: servo_target
+                  value: 100
+              - number.set:
+                  id: servo_duration
+                  value: 6
+            else:
+              - number.set:
+                  id: servo_target
+                  value: 25
+              - number.set:
+                  id: servo_duration
+                  value: 10
+
 number:
   - platform: template
     id: servo_duration
@@ -134,7 +186,7 @@ number:
     icon: "mdi:timer-sand"
     min_value: 1
     restore_value: true
-    initial_value: 4.5
+    initial_value: 6
     max_value: 10
     step: 0.5
     optimistic: true
