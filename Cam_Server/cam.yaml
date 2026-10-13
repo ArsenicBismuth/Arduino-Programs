@@ -54,3 +54,10 @@ esp32_camera:
 web_server:
   version: 3
   port: 80
+
+# Serve the camera image directly over HTTP (independent of the web_server UI)
+esp32_camera_web_server:
+  - port: 8080
+    mode: stream
+  - port: 8081
+    mode: snapshot
