@@ -43,7 +43,8 @@ esp32_camera:
   # ⚠️ CRITICAL NON-PSRAM SETTINGS ⚠️
   frame_buffer_location: DRAM  # Force-route buffers away from PSRAM
   frame_buffer_count: 1        # Keep at 1 to minimize memory usage
-  resolution: QQVGA            # Start low (160x120) or QVGA (320x240) to prevent OOM crashes
+  resolution: VGA              # 640x480
+  #resolution: XGA             # 1024x768
   jpeg_quality: 15             # Lower quality (higher number) means smaller memory footprint
 
   # Image settings
