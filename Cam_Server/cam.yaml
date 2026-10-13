@@ -9,10 +9,6 @@ esp32:
 # Enable logging
 logger:
 
-# Enable Home Assistant API
-api:
-  max_connections: 3
-
 ota:
   - platform: esphome
     password: ""
@@ -52,10 +48,6 @@ esp32_camera:
 
   # Image settings
   name: My Camera
-
-web_server:
-  version: 3
-  port: 80
 
 # Serve the camera image directly over HTTP (independent of the web_server UI)
 esp32_camera_web_server:
