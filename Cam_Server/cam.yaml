@@ -33,10 +33,6 @@ i2c:
     sda: GPIO26
     scl: GPIO27
 
-psram:
-  mode: quad
-  speed: 80MHz
-
 esp32_camera:
   external_clock:
     pin: GPIO0
@@ -47,6 +43,12 @@ esp32_camera:
   href_pin: GPIO23
   pixel_clock_pin: GPIO22
   power_down_pin: GPIO32
+
+  # ⚠️ CRITICAL NON-PSRAM SETTINGS ⚠️
+  frame_buffer_location: DRAM  # Force-route buffers away from PSRAM
+  frame_buffer_count: 1        # Keep at 1 to minimize memory usage
+  resolution: QQVGA            # Start low (160x120) or QVGA (320x240) to prevent OOM crashes
+  jpeg_quality: 15             # Lower quality (higher number) means smaller memory footprint
 
   # Image settings
   name: My Camera
