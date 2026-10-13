@@ -11,7 +11,7 @@ logger:
 
 # Enable Home Assistant API
 api:
-  password: ""
+  max_connections: 3
 
 ota:
   - platform: esphome
@@ -32,6 +32,10 @@ i2c:
   - id: camera_i2c
     sda: GPIO26
     scl: GPIO27
+
+psram:
+  mode: quad
+  speed: 80MHz
 
 esp32_camera:
   external_clock:
