@@ -45,7 +45,7 @@ esp32_camera:
   frame_buffer_count: 1        # Keep at 1 to minimize memory usage
   resolution: VGA              # 640x480
   #resolution: XGA             # 1024x768
-  jpeg_quality: 15             # Lower quality (higher number) means smaller memory footprint
+  jpeg_quality: 30             # Lower quality (higher number) means smaller memory footprint
 
   # Image settings
   name: My Camera
