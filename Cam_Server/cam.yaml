@@ -157,3 +157,21 @@ switch:
       - lambda: |-
           id(my_camera).set_vertical_flip(false);
           id(my_camera).update_camera_parameters();
+
+# --- On-board flash LED (GPIO4) ----------------------------------------------
+# Note: GPIO4 is shared with the SD card's HS2_DATA1 line, so don't use SD card
+output:
+  - platform: ledc
+    pin: GPIO4
+    id: flash_led_pwm
+    frequency: 1000Hz
+
+light:
+  - platform: monochromatic
+    name: "Flash LED"
+    id: cam_flash_led
+    output: flash_led_pwm
+    icon: mdi:flashlight
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+    default_transition_length: 0s
