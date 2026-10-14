@@ -44,11 +44,21 @@ esp32_camera:
   frame_buffer_location: DRAM  # Force-route buffers away from PSRAM
   frame_buffer_count: 1        # Keep at 1 to minimize memory usage
   resolution: VGA              # 640x480
-  #resolution: XGA             # 1024x768
   jpeg_quality: 30             # Lower quality (higher number) means smaller memory footprint
 
   # Image settings
   name: My Camera
+  id: my_camera
+
+  # Boot-time orientation. Both default to true; set explicitly so the
+  # "Mirror Horizontal" / "Mirror Vertical" switches below start in sync.
+  vertical_flip: true
+  horizontal_mirror: true
+
+# Browser control UI + REST API (v3). Also hosts the runtime camera controls.
+web_server:
+  version: 3
+  port: 80
 
 # Serve the camera image directly over HTTP (independent of the web_server UI)
 esp32_camera_web_server:
@@ -56,3 +66,94 @@ esp32_camera_web_server:
     mode: stream
   - port: 8081
     mode: snapshot
+
+# --- Resolution selector -----------------------------------------------------
+select:
+  - platform: template
+    name: "Resolution"
+    id: cam_resolution
+    icon: mdi:aspect-ratio
+    entity_category: config
+    optimistic: true
+    initial_option: "640x480"
+    options:
+      - "160x120"   # QQVGA
+      - "320x240"   # QVGA
+      - "400x296"   # CIF
+      - "640x480"   # VGA  <- boot resolution
+      - "800x600"   # SVGA
+      - "1024x768"  # XGA
+    set_action:
+      - lambda: |-
+          sensor_t *s = esp_camera_sensor_get();
+          if (s == nullptr) {
+            ESP_LOGW("cam_ctl", "Camera sensor unavailable");
+            return;
+          }
+          framesize_t f = FRAMESIZE_VGA;
+          if      (x == "160x120") f = FRAMESIZE_QQVGA;
+          else if (x == "320x240") f = FRAMESIZE_QVGA;
+          else if (x == "400x296") f = FRAMESIZE_CIF;
+          else if (x == "640x480") f = FRAMESIZE_VGA;
+          else if (x == "800x600") f = FRAMESIZE_SVGA;
+          else if (x == "1024x768") f = FRAMESIZE_XGA;
+          s->set_framesize(s, f);
+          ESP_LOGI("cam_ctl", "Resolution -> %s", x.c_str());
+
+# --- Compression (JPEG quality) slider ---------------------------------------
+# higher = more compression. Significantly matters to support higher resolution
+number:
+  - platform: template
+    name: "Compression"
+    id: cam_compression
+    icon: mdi:image-size-select-small
+    entity_category: config
+    optimistic: true
+    mode: slider
+    min_value: 6
+    max_value: 63
+    step: 1
+    initial_value: 30
+    set_action:
+      - lambda: |-
+          sensor_t *s = esp_camera_sensor_get();
+          if (s == nullptr) {
+            ESP_LOGW("cam_ctl", "Camera sensor unavailable");
+            return;
+          }
+          s->set_quality(s, (int) x);
+          ESP_LOGI("cam_ctl", "Compression -> %d", (int) x);
+
+# --- Mirror H / V checkboxes -------------------------------------------------
+switch:
+  - platform: template
+    name: "Mirror Horizontal"
+    id: cam_hmirror
+    icon: mdi:flip-horizontal
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_ON   # matches `horizontal_mirror: true` above
+    turn_on_action:
+      - lambda: |-
+          id(my_camera).set_horizontal_mirror(true);
+          id(my_camera).update_camera_parameters();
+    turn_off_action:
+      - lambda: |-
+          id(my_camera).set_horizontal_mirror(false);
+          id(my_camera).update_camera_parameters();
+
+  - platform: template
+    name: "Mirror Vertical"
+    id: cam_vflip
+    icon: mdi:flip-vertical
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_ON   # matches `vertical_flip: true` above
+    turn_on_action:
+      - lambda: |-
+          id(my_camera).set_vertical_flip(true);
+          id(my_camera).update_camera_parameters();
+    turn_off_action:
+      - lambda: |-
+          id(my_camera).set_vertical_flip(false);
+          id(my_camera).update_camera_parameters();
