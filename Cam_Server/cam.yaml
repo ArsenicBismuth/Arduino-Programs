@@ -1,6 +1,24 @@
 esphome:
   name: cam
 
+  # Without PSRAM the camera can't allocate an XGA-sized frame buffer at boot
+  # (1024x768 reserves ~154 KB contiguous internal RAM, VGA only ~60 KB), so
+  # `resolution:` below stays at VGA and we switch to XGA here instead.
+  # `set_framesize()` only rewrites sensor registers - no new allocation - which
+  # is exactly why changing resolution at runtime always worked.
+  # priority -100.0 runs after every component (incl. the camera) is initialised.
+  on_boot:
+    - priority: -100.0
+      then:
+        - lambda: |-
+            sensor_t *s = esp_camera_sensor_get();
+            if (s == nullptr) {
+              ESP_LOGW("cam_ctl", "Camera sensor unavailable; keeping boot resolution");
+              return;
+            }
+            s->set_framesize(s, FRAMESIZE_XGA);
+            ESP_LOGI("cam_ctl", "Boot resolution -> 1024x768 (XGA)");
+
 esp32:
   board: esp32cam
   framework:
@@ -43,7 +61,7 @@ esp32_camera:
   # ⚠️ CRITICAL NON-PSRAM SETTINGS ⚠️
   frame_buffer_location: DRAM  # Force-route buffers away from PSRAM
   frame_buffer_count: 1        # Keep at 1 to minimize memory usage
-  resolution: VGA              # 640x480 - Can run higher, but somehow crash if set higher on startup
+  resolution: VGA              # Boot buffer size only - on_boot switches the sensor to XGA after init
   jpeg_quality: 30             # Lower quality (higher number) means smaller memory footprint
 
   # Image settings
@@ -75,7 +93,7 @@ select:
     icon: mdi:aspect-ratio
     entity_category: config
     optimistic: true
-    initial_option: "640x480"
+    initial_option: "1024x768"
     options:
       - "160x120"    # QQVGA
       - "320x240"    # QVGA
