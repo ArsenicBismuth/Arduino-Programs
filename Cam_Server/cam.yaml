@@ -43,7 +43,7 @@ esp32_camera:
   # ⚠️ CRITICAL NON-PSRAM SETTINGS ⚠️
   frame_buffer_location: DRAM  # Force-route buffers away from PSRAM
   frame_buffer_count: 1        # Keep at 1 to minimize memory usage
-  resolution: 1024x768
+  resolution: VGA              # 640x480 - Can run higher, but somehow crash if set higher on startup
   jpeg_quality: 30             # Lower quality (higher number) means smaller memory footprint
 
   # Image settings
@@ -75,7 +75,7 @@ select:
     icon: mdi:aspect-ratio
     entity_category: config
     optimistic: true
-    initial_option: "1024x768"
+    initial_option: "640x480"
     options:
       - "160x120"    # QQVGA
       - "320x240"    # QVGA
@@ -85,7 +85,6 @@ select:
       - "1024x768"   # XGA
       - "1280x1024"  # SXGA
       - "1600x1200"  # UXGA
-      - "1920x1080"  # FHD
     set_action:
       - lambda: |-
           sensor_t *s = esp_camera_sensor_get();
@@ -102,7 +101,6 @@ select:
           else if (x == "1024x768") f = FRAMESIZE_XGA;
           else if (x == "1280x1024") f = FRAMESIZE_SXGA;
           else if (x == "1600x1200") f = FRAMESIZE_UXGA;
-          else if (x == "1920x1080") f = FRAMESIZE_FHD;
           s->set_framesize(s, f);
           ESP_LOGI("cam_ctl", "Resolution -> %s", x.c_str());
 
