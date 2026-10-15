@@ -1,7 +1,5 @@
-myconfig.h
-.pioenvs
-.piolibdeps
-.clang_complete
-.gcc-flags.json
-.pio
-.vscode
+# Gitignore settings for ESPHome
+# This is an example and may include too much for your use-case.
+# You can modify this file to suit your needs.
+/.esphome/
+/secrets.yaml
