@@ -79,9 +79,13 @@ esp32_camera:
   horizontal_mirror: true
 
 # Browser control UI + REST API (v3). Also hosts the runtime camera controls.
+# cam_stream.js/.css inject a "Camera" panel that opens the :8080 MJPEG stream
+# on demand (button click), so no stream connection is made on page load.
 web_server:
   version: 3
   port: 80
+  js_include: cam_stream.js
+  css_include: cam_stream.css
 
 # Serve the camera image directly over HTTP (independent of the web_server UI)
 esp32_camera_web_server:
