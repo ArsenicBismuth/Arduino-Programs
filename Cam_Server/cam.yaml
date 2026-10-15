@@ -73,10 +73,9 @@ esp32_camera:
   name: My Camera
   id: my_camera
 
-  # Boot-time orientation. Both default to true; set explicitly so the
-  # "Mirror Horizontal" / "Mirror Vertical" switches below start in sync.
-  vertical_flip: true
-  horizontal_mirror: true
+  # Boot-time orientation
+  vertical_flip: false
+  horizontal_mirror: false
 
 # Browser control UI + REST API (v3). Also hosts the runtime camera controls.
 # cam_stream.js/.css inject a "Camera" panel that opens the :8080 MJPEG stream
@@ -347,7 +346,7 @@ switch:
     icon: mdi:flip-horizontal
     entity_category: config
     optimistic: true
-    restore_mode: ALWAYS_ON   # matches `horizontal_mirror: true` above
+    restore_mode: ALWAYS_OFF   # matches init config above
     turn_on_action:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
@@ -363,7 +362,7 @@ switch:
     icon: mdi:flip-vertical
     entity_category: config
     optimistic: true
-    restore_mode: ALWAYS_ON   # matches `vertical_flip: true` above
+    restore_mode: ALWAYS_OFF   # matches init config above
     turn_on_action:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
