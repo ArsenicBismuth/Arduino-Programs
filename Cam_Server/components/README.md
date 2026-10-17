@@ -1,43 +1,50 @@
-# Vendored external components
+# SD card components
 
-These components are a local snapshot of
-[`n-serrette/esphome_sd_card`](https://github.com/n-serrette/esphome_sd_card)
-(`main` branch), vendored so we can carry one local patch. `cam.yaml` loads them via:
+`latest_snapshot/` is the local component described below; the rest of this directory is
+the SD card driver and file server that `cam.yaml` includes.
+
+## latest_snapshot (local)
+
+Serves the newest snapshot straight off the card, no UI:
+
+```
+GET http://<host>/latest  ->  newest *.jpg in /sdcard, as image/jpeg
+```
 
 ```yaml
-external_components:
-  - source:
-      type: local
-      path: components
-    components: [sd_mmc_card, sd_file_server]
+latest_snapshot:
+  id: latest_snapshot_srv
+  url: /latest
+  root: /sdcard
+  extension: .jpg
 ```
 
-## Local patch
+"Newest" is the lexicographically largest matching name, which is correct here because
+files are timestamped (`snap_YYYYMMDD_HHMMSS.jpg`).
 
-`sd_file_server/sd_file_server.cpp` → `SDFileServer::handle_download()`
+## Troubleshooting log
 
-Upstream passed a **temporary** MIME string straight into the response:
+### 2026-10-17 — SD file downloads returned an empty response
 
-```cpp
-auto *response = request->beginResponse(200, Path::mime_type(path).c_str(), file.data(), file.size());
-```
+**Symptom.** `GET /file/<name>.jpg` (and a first cut of `GET /latest`) returned no headers
+and no body: browser `net::ERR_EMPTY_RESPONSE`, `curl` exit 52. Meanwhile the `/file`
+directory index worked, and the MJPEG/snapshot servers on `:8080`/`:8081` delivered larger
+images fine.
 
-Under the esp-idf framework `httpd_resp_set_type()` stores that pointer **without
-copying** it, and `httpd_resp_send()` dereferences it later when it builds the response
-header. By then `Path::mime_type(path)` (a short string) has been destroyed, so the
-header is assembled from freed stack memory; `httpd_resp_send()` then bails out with
-`ESP_ERR_HTTPD_RESP_HDR` **before sending a single byte**, and the browser reports an
-empty response (`net::ERR_EMPTY_RESPONSE`). The folder index still worked because it
-uses a string literal (`"text/html"`), which has static lifetime.
+**Root cause.** Every failing path buffered the whole ~21 KB image in one heap allocation
+(`std::vector<uint8_t>::resize()`, or a growing `std::string`). This is a **non-PSRAM**
+ESP32-CAM whose camera already holds DRAM frame buffers, so there is no free *contiguous*
+block that large. `operator new` fails, and ESPHome's `throw_stubs.cpp` turns a failed
+allocation into `esp_system_abort("std::bad_alloc")` — an immediate reset. The connection
+dies before a single byte is sent.
 
-Fix (keep the string alive until after `send()` returns):
+The paths that *worked* never allocated a frame-sized buffer: the index only builds a
+small string, and `:8080`/`:8081` stream the camera's existing buffer. This also explains
+why the device felt slow and flaky while it was happening.
 
-```cpp
-std::string mime = Path::mime_type(path);
-auto *response = request->beginResponse(200, mime.c_str(), file.data(), file.size());
-```
+**Fix.** Stream the file to the socket in 512-byte chunks (`httpd_resp_send_chunk`) from a
+static buffer — see `latest_snapshot.cpp`. Peak extra memory is ~0.5 KB instead of
+~21 KB.
 
-## Re-vendoring an upstream update
-
-Copy `components/sd_mmc_card` and `components/sd_file_server` from a newer upstream
-ref, then re-apply the patch above to `sd_file_server.cpp`.
+The disabled `sd_file_server` has the same problem: `handle_download()` buffers the whole
+file in RAM, so it needs the same treatment if it is ever re-enabled.

@@ -37,19 +37,13 @@ esp32:
       # Long file names, needed for names like snap_20261017_141530.jpg
       CONFIG_FATFS_LFN_STACK: "y"
 
-# SD card support (external component) - used to save snapshots and browse files.
-#
-# Vendored locally (snapshot of github://n-serrette/esphome_sd_card@main) so it can be
-# patched: upstream's sd_file_server passes a *temporary* MIME string to beginResponse().
-# Under esp-idf, httpd_resp_set_type() stores that pointer without copying it, so
-# content_type dangles before the response is sent and file downloads return nothing
-# (ERR_EMPTY_RESPONSE). components/sd_file_server/sd_file_server.cpp carries the fix.
+# SD card support (external component) - used to save snapshots and serve the newest one.
+# The SD driver is components/sd_mmc_card; sd_file_server (the /file browser UI) sits next
+# to it but is disabled, see the block further down.
 external_components:
   - source:
       type: local
       path: components
-    # sd_file_server is temporarily disabled (faster builds while testing /latest).
-    # Re-add it here and uncomment the sd_file_server: block further down to restore.
     components: [sd_mmc_card, latest_snapshot]
 
 # Enable logging
@@ -158,9 +152,9 @@ sd_mmc_card:
 # Browse/download the card in a browser at http://<host>/file
 # (upload and deletion don't work reliably under the esp-idf framework).
 #
-# TEMPORARILY DISABLED - less to compile while testing /latest (see below).
-# To restore: uncomment this block and re-add sd_file_server to
-# external_components.components near the top of this file.
+# Disabled: /latest below covers the usual case, and its download path still buffers the
+# whole file in RAM - the bug /latest works around (see components/README.md). To restore,
+# uncomment this block and re-add sd_file_server to external_components.components above.
 # sd_file_server:
 #   id: sd_files
 #   url_prefix: file
@@ -169,8 +163,10 @@ sd_mmc_card:
 #   enable_deletion: false
 #   enable_upload: false
 
-# Minimal test endpoint (no UI): http://<host>/latest streams the newest *.jpg on
-# the card. Local component in components/latest_snapshot (see its logs for tracing).
+# Serve the newest snapshot straight off the card, no UI:
+#   GET http://<host>/latest  ->  newest *.jpg in /sdcard, as image/jpeg
+# Local component in components/latest_snapshot; it streams the file in small chunks so
+# the whole image is never buffered in RAM (see components/README.md -> "Troubleshooting log").
 latest_snapshot:
   id: latest_snapshot_srv
   url: /latest
