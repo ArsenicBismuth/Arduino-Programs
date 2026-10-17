@@ -129,11 +129,9 @@ void SDFileServer::write_row(AsyncResponseStream *response, sd_mmc_card::FileInf
   response->print("</td><td><div class=\"file-actions\">");
   if (!info.is_directory) {
     if (this->download_enabled_) {
-      response->print("<button onClick=\"download_file('");
+      response->print("<a class=\"action-link\" href=\"");
       response->print(uri.c_str());
-      response->print("','");
-      response->print(file_name.c_str());
-      response->print("')\">Download</button>");
+      response->print("\" target=\"_blank\" rel=\"noopener\">Open</a>");
     }
     if (this->deletion_enabled_) {
       response->print("<button onClick=\"delete_file('");
@@ -152,17 +150,19 @@ void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string cons
   <head>
     <meta charset=UTF-8>
     <meta name=viewport content="width=device-width, initial-scale=1,user-scalable=no">
+    <meta name="color-scheme" content="dark">
     <title>SD Card Files</title>
     <style>
     body {
       font-family: 'Segoe UI', system-ui, sans-serif;
       margin: 0;
       padding: 2rem;
-      background: #f5f5f7;
-      color: #1d1d1f;
+      background: #121212;
+      color: #e6e6e6;
+      color-scheme: dark;
     }
     h1 {
-      color: #0066cc;
+      color: #6cb0ff;
       margin-bottom: 1.5rem;
       display: flex;
       align-items: center;
@@ -171,9 +171,10 @@ void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string cons
     .container {
       max-width: 1200px;
       margin: 0 auto;
-      background: white;
+      background: #1e1e1e;
+      border: 1px solid #2e2e2e;
       border-radius: 12px;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
       padding: 2rem;
     }
     table {
@@ -184,32 +185,33 @@ void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string cons
     th, td {
       padding: 12px;
       text-align: left;
-      border-bottom: 1px solid #e0e0e0;
+      border-bottom: 1px solid #2e2e2e;
     }
     th {
-      background: #f8f9fa;
+      background: #262626;
       font-weight: 500;
     }
     .file-actions {
       display: flex;
       gap: 8px;
     }
-    button {
+    button, .action-link {
       padding: 6px 12px;
       border: none;
       border-radius: 6px;
-      background: #0066cc;
+      background: #1f6feb;
       color: white;
+      text-decoration: none;
       cursor: pointer;
       transition: background 0.2s;
     }
-    button:hover {
-      background: #0052a3;
+    button:hover, .action-link:hover {
+      background: #388bfd;
     }
     .upload-form {
       margin-bottom: 2rem;
       padding: 1rem;
-      background: #f8f9fa;
+      background: #262626;
       border-radius: 8px;
     }
     .upload-form input[type="file"] {
@@ -218,10 +220,10 @@ void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string cons
     .breadcrumb {
       margin-bottom: 1.5rem;
       font-size: 0.9rem;
-      color: #666;
+      color: #9e9e9e;
     }
     .breadcrumb a {
-      color: #0066cc;
+      color: #6cb0ff;
       text-decoration: none;
     }
     .breadcrumb a:hover {
@@ -233,11 +235,11 @@ void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string cons
       content: ">";
     }
     .folder {
-      color: #0066cc;
+      color: #6cb0ff;
       font-weight: 500;
     }
     .file-type {
-      color: #666;
+      color: #9e9e9e;
       font-size: 0.9rem;
     }
     .folder-icon {
@@ -252,10 +254,10 @@ void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string cons
       gap: 1rem;
     }
     .header-actions button {
-      background: #4CAF50;
+      background: #2ea043;
     }
     .header-actions button:hover {
-      background: #45a049;
+      background: #3fb950;
     }
   </style>
   </head>
@@ -301,15 +303,6 @@ void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string cons
   response->print("</tbody></table>"
                     "<script>"
                     "function delete_file(path) {fetch(path, {method: \"DELETE\"});}"
-                    "function download_file(path, filename) {"
-                    "fetch(path).then(response => response.blob())"
-                    ".then(blob => {"
-                    "const link = document.createElement('a');"
-                    "link.href = URL.createObjectURL(blob);"
-                    "link.download = filename;"
-                    "link.click();"
-                    "}).catch(console.error);"
-                    "} "
                     "</script>"
                     "</body></html>");
 
