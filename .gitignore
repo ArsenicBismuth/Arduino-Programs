@@ -4,3 +4,5 @@ Wifi_Feeder/bootstrap/
 *.lnk
 
 Wifi_Feeder/temp/
+
+__pycache__/

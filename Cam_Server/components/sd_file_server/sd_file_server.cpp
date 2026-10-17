@@ -324,10 +324,18 @@ void SDFileServer::handle_download(AsyncWebServerRequest *request, std::string c
     request->send(401, "application/json", "{ \"error\": \"failed to read file\" }");
     return;
   }
+  // Keep the mime string alive across send(): ESP-IDF's httpd_resp_set_type() stores
+  // the content-type pointer as-is (it does not copy it) and httpd_resp_send()
+  // dereferences it later when building the response header. Passing
+  // Path::mime_type(path).c_str() directly leaves content_type pointing at a destroyed
+  // temporary, so the header is built from garbage, httpd_resp_send() bails out with
+  // ESP_ERR_HTTPD_RESP_HDR before sending a single byte and the browser sees an empty
+  // response (ERR_EMPTY_RESPONSE). Using a named local keeps the pointer valid.
+  std::string mime = Path::mime_type(path);
 #ifdef USE_ESP_IDF
-  auto *response = request->beginResponse(200, Path::mime_type(path).c_str(), file.data(), file.size());
+  auto *response = request->beginResponse(200, mime.c_str(), file.data(), file.size());
 #else
-  auto *response = request->beginResponseStream(Path::mime_type(path).c_str());
+  auto *response = request->beginResponseStream(mime.c_str());
   response->print(std::string(file.begin(), file.end()).c_str());
 #endif
 
