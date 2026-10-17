@@ -37,14 +37,14 @@ esp32:
       # Long file names, needed for names like snap_20261017_141530.jpg
       CONFIG_FATFS_LFN_STACK: "y"
 
-# SD card support (external component) - used to save snapshots and serve the newest one.
-# The SD driver is components/sd_mmc_card; sd_file_server (the /file browser UI) sits next
-# to it but is disabled, see the block further down.
+# SD card support (external component) - used to save snapshots and browse the card.
+# The SD driver is components/sd_mmc_card; the /file browser is components/sd_file_server,
+# locally patched to stream downloads (see components/README.md).
 external_components:
   - source:
       type: local
       path: components
-    components: [sd_mmc_card, latest_snapshot]
+    components: [sd_mmc_card, sd_file_server, latest_snapshot]
 
 # Enable logging
 logger:
@@ -151,17 +151,13 @@ sd_mmc_card:
 
 # Browse/download the card in a browser at http://<host>/file
 # (upload and deletion don't work reliably under the esp-idf framework).
-#
-# Disabled: /latest below covers the usual case, and its download path still buffers the
-# whole file in RAM - the bug /latest works around (see components/README.md). To restore,
-# uncomment this block and re-add sd_file_server to external_components.components above.
-# sd_file_server:
-#   id: sd_files
-#   url_prefix: file
-#   root_path: "/"
-#   enable_download: true
-#   enable_deletion: false
-#   enable_upload: false
+sd_file_server:
+  id: sd_files
+  url_prefix: file
+  root_path: "/"
+  enable_download: true
+  enable_deletion: false
+  enable_upload: false
 
 # Serve the newest snapshot straight off the card, no UI:
 #   GET http://<host>/latest  ->  newest *.jpg in /sdcard, as image/jpeg

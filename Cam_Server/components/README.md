@@ -46,5 +46,10 @@ why the device felt slow and flaky while it was happening.
 static buffer — see `latest_snapshot.cpp`. Peak extra memory is ~0.5 KB instead of
 ~21 KB.
 
-The disabled `sd_file_server` has the same problem: `handle_download()` buffers the whole
-file in RAM, so it needs the same treatment if it is ever re-enabled.
+`sd_file_server` had the same problem: `handle_download()` read the file with
+`SdMmc::read_file()`, which resizes a vector to the whole file. It is now patched to
+stream the same way, so `GET /file/<name>.jpg` works.
+
+Known limitation: the `/file` index still builds its whole page in RAM first
+(`beginResponseStream`), so it will hit the same ceiling once the card holds a few dozen
+snapshots. Streaming the index would be a small follow-up patch.

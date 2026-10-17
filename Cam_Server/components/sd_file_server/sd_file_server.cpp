@@ -1,4 +1,7 @@
 #include "sd_file_server.h"
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <map>
 #include "esphome/core/log.h"
 #include "esphome/components/network/util.h"
@@ -319,21 +322,42 @@ void SDFileServer::handle_download(AsyncWebServerRequest *request, std::string c
     return;
   }
 
+  // Keep the content-type string alive until the response has been sent: httpd stores the
+  // pointer as-is.
+  std::string mime = Path::mime_type(path);
+#ifdef USE_ESP_IDF
+  // Stream the file in small chunks instead of reading it into memory first: a whole-file
+  // buffer (~20 KB per snapshot) does not fit in this board's heap, and a failed
+  // allocation aborts the device (see components/README.md).
+  std::string absolute_path = sd_mmc_card::build_path(path.c_str());
+  FILE *file = fopen(absolute_path.c_str(), "rb");
+  if (file == nullptr) {
+    ESP_LOGE(TAG, "Failed to open file for reading: %s (%s)", absolute_path.c_str(), strerror(errno));
+    request->send(401, "application/json", "{ \"error\": \"failed to read file\" }");
+    return;
+  }
+
+  httpd_req_t *req = *request;
+  httpd_resp_set_type(req, mime.c_str());
+
+  static char buffer[512];
+  size_t read = 0;
+  while ((read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+    if (httpd_resp_send_chunk(req, buffer, read) != ESP_OK)
+      break;
+  }
+  fclose(file);
+  httpd_resp_send_chunk(req, nullptr, 0);
+#else
   auto file = this->sd_mmc_card_->read_file(path);
   if (file.size() == 0) {
     request->send(401, "application/json", "{ \"error\": \"failed to read file\" }");
     return;
   }
-  // Keep the content-type string alive until send() returns.
-  std::string mime = Path::mime_type(path);
-#ifdef USE_ESP_IDF
-  auto *response = request->beginResponse(200, mime.c_str(), file.data(), file.size());
-#else
   auto *response = request->beginResponseStream(mime.c_str());
   response->print(std::string(file.begin(), file.end()).c_str());
-#endif
-
   request->send(response);
+#endif
 }
 
 void SDFileServer::handle_delete(AsyncWebServerRequest *request) {

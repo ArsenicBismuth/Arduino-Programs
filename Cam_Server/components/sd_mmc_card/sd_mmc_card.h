@@ -189,6 +189,11 @@ template<typename... Ts> class SdMmcDeleteFileAction : public Action<Ts...> {
   SdMmc *parent_;
 };
 
+#ifdef USE_ESP_IDF
+/// Absolute VFS path (mount point + path) of a card-relative path.
+std::string build_path(const char *path);
+#endif
+
 long double convertBytes(uint64_t, MemoryUnits);
 std::string memory_unit_to_string(MemoryUnits);
 MemoryUnits memory_unit_from_size(size_t);
