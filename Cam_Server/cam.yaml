@@ -38,8 +38,16 @@ esp32:
       CONFIG_FATFS_LFN_STACK: "y"
 
 # SD card support (external component) - used to save snapshots and browse files.
+#
+# Vendored locally (snapshot of github://n-serrette/esphome_sd_card@main) so it can be
+# patched: upstream's sd_file_server passes a *temporary* MIME string to beginResponse().
+# Under esp-idf, httpd_resp_set_type() stores that pointer without copying it, so
+# content_type dangles before the response is sent and file downloads return nothing
+# (ERR_EMPTY_RESPONSE). components/sd_file_server/sd_file_server.cpp carries the fix.
 external_components:
-  - source: github://n-serrette/esphome_sd_card@main
+  - source:
+      type: local
+      path: components
     components: [sd_mmc_card, sd_file_server]
 
 # Enable logging
