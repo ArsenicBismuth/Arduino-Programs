@@ -48,7 +48,9 @@ external_components:
   - source:
       type: local
       path: components
-    components: [sd_mmc_card, sd_file_server]
+    # sd_file_server is temporarily disabled (faster builds while testing /latest).
+    # Re-add it here and uncomment the sd_file_server: block further down to restore.
+    components: [sd_mmc_card, latest_snapshot]
 
 # Enable logging
 logger:
@@ -155,13 +157,25 @@ sd_mmc_card:
 
 # Browse/download the card in a browser at http://<host>/file
 # (upload and deletion don't work reliably under the esp-idf framework).
-sd_file_server:
-  id: sd_files
-  url_prefix: file
-  root_path: "/"
-  enable_download: true
-  enable_deletion: false
-  enable_upload: false
+#
+# TEMPORARILY DISABLED - less to compile while testing /latest (see below).
+# To restore: uncomment this block and re-add sd_file_server to
+# external_components.components near the top of this file.
+# sd_file_server:
+#   id: sd_files
+#   url_prefix: file
+#   root_path: "/"
+#   enable_download: true
+#   enable_deletion: false
+#   enable_upload: false
+
+# Minimal test endpoint (no UI): http://<host>/latest streams the newest *.jpg on
+# the card. Local component in components/latest_snapshot (see its logs for tracing).
+latest_snapshot:
+  id: latest_snapshot_srv
+  url: /latest
+  root: /sdcard
+  extension: .jpg
 
 # --- Save the current frame to the SD card -----------------------------------
 # The write itself happens in esp32_camera's on_image trigger (see the camera
