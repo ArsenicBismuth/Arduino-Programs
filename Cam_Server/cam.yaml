@@ -28,6 +28,23 @@ esp32:
   board: esp32cam
   framework:
     type: esp-idf
+    # The SD card component needs FatFs and VFS directory support, which
+    # ESPHome excludes by default to save flash; re-enable both here.
+    advanced:
+      include_builtin_idf_components: ["fatfs", "spiffs"]
+      disable_vfs_support_dir: false
+    sdkconfig_options:
+      # Long file names, needed for names like snap_20261017_141530.jpg
+      CONFIG_FATFS_LFN_STACK: "y"
+
+# SD card support (external component) - used to save snapshots and browse the card.
+# The SD driver is components/sd_mmc_card; the /file browser is components/sd_file_server,
+# locally patched to stream downloads (see components/README.md).
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [sd_mmc_card, sd_file_server, latest_snapshot]
 
 # Enable logging
 logger:
@@ -47,6 +64,12 @@ wifi:
 
 captive_portal:
     
+# Network time, used to stamp snapshot filenames with local time.
+time:
+  - platform: sntp
+    id: cam_time
+    timezone: Europe/Berlin
+
 i2c:
   - id: camera_i2c
     sda: GPIO26
@@ -77,6 +100,27 @@ esp32_camera:
   vertical_flip: false
   horizontal_mirror: false
 
+  # Save the current frame to the SD card when the "Save Snapshot" button was
+  # pressed (see the button at the bottom). This is the only safe way to get a
+  # frame: esp32_camera's own framebuffer task owns the single DRAM frame buffer,
+  # so calling esp_camera_fb_get() directly always returns nullptr here.
+  on_image:
+    then:
+      - lambda: |-
+          if (!id(cam_save_requested))
+            return;
+          id(cam_save_requested) = false;
+          char path[64];
+          auto t = id(cam_time).now();
+          if (t.is_valid()) {
+            snprintf(path, sizeof(path), "/snap_%04d%02d%02d_%02d%02d%02d.jpg",
+                     t.year, t.month, t.day_of_month, t.hour, t.minute, t.second);
+          } else {
+            snprintf(path, sizeof(path), "/snap_nosync_%lu.jpg", (unsigned long) millis());
+          }
+          id(sd_card)->write_file(path, image.data, image.length);
+          ESP_LOGI("cam_ctl", "Saved %s (%u bytes)", path, (unsigned) image.length);
+
 # Browser control UI + REST API (v3). Also hosts the runtime camera controls.
 # cam_stream.js/.css inject a "Camera" panel that opens the :8080 MJPEG stream
 # on demand (button click), so no stream connection is made on page load.
@@ -92,6 +136,57 @@ esp32_camera_web_server:
     mode: stream
   - port: 8081
     mode: snapshot
+
+# --- microSD card (SDMMC, 1-bit) ---------------------------------------------
+# AI-Thinker ESP32-CAM slot wiring: CLK=GPIO14, CMD=GPIO15, D0=GPIO2. Use
+# 1-bit mode so GPIO4 (flash LED) and the GPIO12/13 strapping pins stay free;
+# a 4-bit hookup would collide with the flash LED on GPIO4.
+sd_mmc_card:
+  id: sd_card
+  mode_1bit: true
+  format_if_mount_failed: false   # never auto-format the card
+  clk_pin: GPIO14
+  cmd_pin: GPIO15
+  data0_pin: GPIO2
+
+# Browse/download the card in a browser at http://<host>/file
+# (upload and deletion don't work reliably under the esp-idf framework).
+sd_file_server:
+  id: sd_files
+  url_prefix: file
+  root_path: "/"
+  enable_download: true
+  enable_deletion: false
+  enable_upload: false
+
+# Serve the newest snapshot straight off the card, no UI:
+#   GET http://<host>/latest  ->  newest *.jpg in /sdcard, as image/jpeg
+# Local component in components/latest_snapshot; it streams the file in small chunks so
+# the whole image is never buffered in RAM (see components/README.md -> "Troubleshooting log").
+latest_snapshot:
+  id: latest_snapshot_srv
+  url: /latest
+  root: /sdcard
+  extension: .jpg
+
+# --- Save the current frame to the SD card -----------------------------------
+# The write itself happens in esp32_camera's on_image trigger (see the camera
+# config above); the button just raises a flag and asks the camera for a frame.
+globals:
+  - id: cam_save_requested
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+button:
+  - platform: template
+    name: "Save Snapshot"
+    id: cam_save_snapshot
+    icon: mdi:content-save
+    on_press:
+      - lambda: |-
+          id(cam_save_requested) = true;
+          id(my_camera)->request_image(camera::IDLE);
 
 # --- Resolution selector -----------------------------------------------------
 select:
@@ -552,7 +647,8 @@ switch:
           s->set_colorbar(s, 0);
 
 # --- On-board flash LED (GPIO4) ----------------------------------------------
-# Note: GPIO4 is shared with the SD card's HS2_DATA1 line, so don't use SD card
+# GPIO4 is the SD card's D1 line in 4-bit mode; the card above runs 1-bit, so
+# GPIO4 stays free for the flash LED.
 output:
   - platform: ledc
     pin: GPIO4
