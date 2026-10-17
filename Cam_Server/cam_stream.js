@@ -95,3 +95,70 @@ actions.append(button, expandButton, fsButton);
 header.append(title, actions);
 panel.append(header, img);
 document.body.appendChild(panel);
+
+// --- Help button: floating "?" that reveals the device's HTTP endpoints -------
+// Everything here shares the page's host; only the MJPEG / snapshot servers
+// use their own ports (see web_server + esp32_camera_web_server in cam.yaml).
+const SYMBOL_HELP = "?";
+
+const helpHost = `${location.protocol}//${location.hostname}`;
+const HELP_LINKS = [
+  ["/file", "Browse and download the SD card", `${helpHost}/file`],
+  ["/latest", "Newest snapshot as an image", `${helpHost}/latest`],
+  [":8080", "Live MJPEG stream", `${helpHost}:8080`],
+  [":8081", "Single snapshot", `${helpHost}:8081`],
+];
+
+const help = document.createElement("div");
+help.id = "cam-help";
+
+const helpButton = document.createElement("button");
+helpButton.id = "cam-help-toggle";
+helpButton.type = "button";
+helpButton.textContent = SYMBOL_HELP;
+helpButton.title = "Available URLs";
+helpButton.setAttribute("aria-label", "Available URLs");
+helpButton.setAttribute("aria-expanded", "false");
+helpButton.setAttribute("aria-controls", "cam-help-panel");
+
+const helpPanel = document.createElement("div");
+helpPanel.id = "cam-help-panel";
+
+const helpTitle = document.createElement("div");
+helpTitle.id = "cam-help-title";
+helpTitle.textContent = "Available URLs";
+
+const helpList = document.createElement("ul");
+helpList.id = "cam-help-list";
+for (const [label, description, href] of HELP_LINKS) {
+  const item = document.createElement("li");
+  const link = document.createElement("a");
+  link.href = href;
+  link.textContent = label;
+  link.title = `${description} - ${href}`;
+  link.target = "_blank";
+  link.rel = "noopener";
+  item.appendChild(link);
+  helpList.appendChild(item);
+}
+
+function setHelpOpen(open) {
+  help.classList.toggle("open", open);
+  helpButton.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+helpButton.addEventListener("click", () => setHelpOpen(!help.classList.contains("open")));
+
+// Dismiss when clicking anywhere else or pressing Escape.
+document.addEventListener("click", (event) => {
+  if (help.classList.contains("open") && !help.contains(event.target))
+    setHelpOpen(false);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape")
+    setHelpOpen(false);
+});
+
+helpPanel.append(helpTitle, helpList);
+help.append(helpButton, helpPanel);
+document.body.appendChild(help);

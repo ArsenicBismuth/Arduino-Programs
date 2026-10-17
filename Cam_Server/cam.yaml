@@ -194,7 +194,9 @@ esp32_camera:
 # =============================================================================
 # Browser control UI + REST API (v3). Also hosts the runtime camera controls.
 # cam_stream.js/.css inject a "Camera" panel that opens the :8080 MJPEG stream
-# on demand (button click), so no stream connection is made on page load.
+# on demand (button click), so no stream connection is made on page load. They
+# also add a floating "?" button listing the other endpoints: /file, /latest,
+# and the camera servers on :8080 (stream) / :8081 (snapshot).
 #
 # The UI groups entities into named sections using v3 sorting_groups; each
 # entity opts in with its own `web_server: { sorting_group_id, sorting_weight }`
