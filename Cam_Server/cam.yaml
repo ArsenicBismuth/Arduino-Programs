@@ -1,3 +1,23 @@
+# =============================================================================
+#  cam.yaml - ESP32-CAM (AI-Thinker, no PSRAM) + microSD snapshots
+#
+#  Grouped top-to-bottom by function (see the banner comments):
+#
+#    [1] Device & network   esphome / esp32 / logger / ota / wifi / time / i2c
+#    [2] Camera             esp32_camera, incl. the snapshot-on-image logic
+#    [3] Web                web_server + the MJPEG / snapshot HTTP servers
+#    [4] microSD storage    sd_mmc_card + /file browser + /latest endpoint
+#    [5] Snapshot logic     globals / Save button / Change Score / retention
+#    [6] Controls           Basic | Frame rate | Snapshots | Advanced image
+#
+#  ESPHome groups entities by *platform*, so every `select:` entry must live in
+#  one block (same for number/switch/output/light). Inside each block the
+#  entries are ordered to match the Control groups in [6].
+# =============================================================================
+
+# =============================================================================
+#  [1] DEVICE & NETWORK
+# =============================================================================
 esphome:
   name: cam
 
@@ -40,15 +60,6 @@ esp32:
       # Long file names, needed for names like snap_20261017_141530.jpg
       CONFIG_FATFS_LFN_STACK: "y"
 
-# SD card support (external component) - used to save snapshots and browse the card.
-# The SD driver is components/sd_mmc_card; the /file browser is components/sd_file_server,
-# locally patched to stream downloads (see components/README.md).
-external_components:
-  - source:
-      type: local
-      path: components
-    components: [sd_mmc_card, sd_file_server, latest_snapshot]
-
 # Enable logging
 logger:
 
@@ -66,7 +77,7 @@ wifi:
     password: !secret ap_password
 
 captive_portal:
-    
+
 # Network time, used to stamp snapshot filenames with local time.
 time:
   - platform: sntp
@@ -78,6 +89,9 @@ i2c:
     sda: GPIO26
     scl: GPIO27
 
+# =============================================================================
+#  [2] CAMERA
+# =============================================================================
 esp32_camera:
   external_clock:
     pin: GPIO0
@@ -102,6 +116,14 @@ esp32_camera:
   # Boot-time orientation
   vertical_flip: false
   horizontal_mirror: false
+
+  # Frame rates (see "Max FPS" / "Idle FPS" controls in [6]):
+  #   max_framerate  - cap while the MJPEG stream is open (schema allows up to 60)
+  #   idle_framerate - background frames when nothing is streaming. The periodic
+  #                    snapshot logic rides these, so this is the effective
+  #                    upper bound on how often a scheduled snapshot is taken.
+  max_framerate: 10 fps
+  idle_framerate: 0.1 fps
 
   # This is the only safe way to get a frame: esp32_camera's own framebuffer
   # task owns the single DRAM frame buffer, so calling esp_camera_fb_get()
@@ -170,6 +192,9 @@ esp32_camera:
             ESP_LOGE("cam_snap", "Failed to write %s", path);
           }
 
+# =============================================================================
+#  [3] WEB
+# =============================================================================
 # Browser control UI + REST API (v3). Also hosts the runtime camera controls.
 # cam_stream.js/.css inject a "Camera" panel that opens the :8080 MJPEG stream
 # on demand (button click), so no stream connection is made on page load.
@@ -185,6 +210,18 @@ esp32_camera_web_server:
     mode: stream
   - port: 8081
     mode: snapshot
+
+# =============================================================================
+#  [4] microSD STORAGE
+# =============================================================================
+# SD driver (components/sd_mmc_card), the /file browser (components/sd_file_server,
+# locally patched to stream downloads), and the /latest endpoint
+# (components/latest_snapshot) - see components/README.md.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [sd_mmc_card, sd_file_server, latest_snapshot]
 
 # --- microSD card (SDMMC, 1-bit) ---------------------------------------------
 # AI-Thinker ESP32-CAM slot wiring: CLK=GPIO14, CMD=GPIO15, D0=GPIO2. Use
@@ -218,9 +255,13 @@ latest_snapshot:
   root: /sdcard
   extension: .jpg
 
-# --- Save the current frame to the SD card -----------------------------------
-# The writes themselves happen in esp32_camera's on_image trigger (see the camera
-# config above); the button just raises a flag and asks the camera for a frame.
+# =============================================================================
+#  [5] SNAPSHOT LOGIC
+# =============================================================================
+# The writes themselves happen in esp32_camera's on_image trigger (see [2]); the
+# pieces here are the state it needs plus the manual-save button, the tuning
+# sensor and the retention pass.
+
 globals:
   - id: cam_save_requested
     type: bool
@@ -232,6 +273,7 @@ globals:
     restore_value: no
     initial_value: "0"
 
+# --- Manual "Save Snapshot" button -------------------------------------------
 button:
   - platform: template
     name: "Save Snapshot"
@@ -242,9 +284,7 @@ button:
           id(cam_save_requested) = true;
           id(my_camera)->request_image(camera::IDLE);
 
-# --- Change score (for tuning) + retention -----------------------------------
-# (The "Auto Snapshot" / "Change Gate" switches and the period / threshold /
-# retention numbers live with the other controls further down this file.)
+# --- Change score (for tuning the gate) --------------------------------------
 sensor:
   # Mean luma difference of the newest frame vs. the last kept one (0..255).
   # Useful for tuning "Change Threshold": watch it while something moves.
@@ -256,9 +296,10 @@ sensor:
     state_class: measurement
     update_interval: never
 
-# Retention: once a minute, delete a bounded batch of files older than the
-# retention window (age from the FAT mtime), then drop empty day folders.
-# The batch limit keeps each pass short so it can't stall the main loop.
+# --- Retention ---------------------------------------------------------------
+# Once a minute, delete a bounded batch of files older than the retention window
+# (age from the FAT mtime), then drop empty day folders. The batch limit keeps
+# each pass short so it can't stall the main loop.
 interval:
   - interval: 60s
     then:
@@ -267,8 +308,19 @@ interval:
           if (n > 0)
             ESP_LOGI("cam_snap", "Pruned %d old snapshot(s)", n);
 
-# --- Resolution selector -----------------------------------------------------
+# =============================================================================
+#  [6] CONTROLS
+#  Entities are grouped as: Basic -> Frame rate -> Snapshots -> Advanced image.
+#  (Advanced image controls were added for testing and are rarely touched.)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  Selects
+# -----------------------------------------------------------------------------
 select:
+  # --- Basic ------------------------------------------------------------------
+  # Resolution selector. `resolution:` in [2] only sizes the boot buffer; this
+  # rewrites the sensor registers live (no allocation).
   - platform: template
     name: "Resolution"
     id: cam_resolution
@@ -300,7 +352,8 @@ select:
           s->set_framesize(s, f);
           ESP_LOGI("cam_ctl", "Resolution -> %s", x.c_str());
 
-# --- White balance mode ------------------------------------------------------
+  # --- Advanced image (rarely used) ------------------------------------------
+  # White balance mode
   - platform: template
     name: "White Balance Mode"
     id: cam_wb_mode
@@ -325,7 +378,7 @@ select:
           s->set_wb_mode(s, m);
           ESP_LOGI("cam_ctl", "WB mode -> %s", x.c_str());
 
-# --- AGC gain ceiling --------------------------------------------------------
+  # AGC gain ceiling
   - platform: template
     name: "Gain Ceiling"
     id: cam_gain_ceiling
@@ -354,7 +407,7 @@ select:
           s->set_gainceiling(s, g);
           ESP_LOGI("cam_ctl", "Gain ceiling -> %s", x.c_str());
 
-# --- Special effect ----------------------------------------------------------
+  # Special effect
   - platform: template
     name: "Special Effect"
     id: cam_special_effect
@@ -383,9 +436,99 @@ select:
           s->set_special_effect(s, e);
           ESP_LOGI("cam_ctl", "Special effect -> %s", x.c_str());
 
-# --- Compression (JPEG quality) slider ---------------------------------------
-# higher = more compression. Significantly matters to support higher resolution
+# -----------------------------------------------------------------------------
+#  Numbers
+# -----------------------------------------------------------------------------
 number:
+  # --- Frame rate -------------------------------------------------------------
+  # `max_framerate` cap while the MJPEG stream is open. Written live via
+  # set_max_update_interval(); the sensor tops out well below 60 at higher
+  # resolutions, so treat 60 as the accepted ceiling, not a promise.
+  - platform: template
+    name: "Max FPS"
+    id: cam_max_fps
+    icon: mdi:speedometer
+    unit_of_measurement: fps
+    entity_category: config
+    optimistic: true
+    mode: box
+    min_value: 1
+    max_value: 60
+    step: 1
+    initial_value: 10
+    set_action:
+      - lambda: |-
+          id(my_camera)->set_max_update_interval((uint32_t) (1000.0f / x));
+          ESP_LOGI("cam_ctl", "Max FPS -> %.0f", x);
+
+  # Background frame rate. This is the cadence the periodic snapshot rides on,
+  # so raising it lets "Snapshot Period" actually fire more often (down to the
+  # period you set in the Snapshots group below).
+  - platform: template
+    name: "Idle FPS"
+    id: cam_idle_fps
+    icon: mdi:timer-sand
+    unit_of_measurement: fps
+    entity_category: config
+    optimistic: true
+    mode: box
+    min_value: 0.1
+    max_value: 1
+    step: 0.1
+    initial_value: 0.1
+    set_action:
+      - lambda: |-
+          id(my_camera)->set_idle_update_interval((uint32_t) (1000.0f / x));
+          ESP_LOGI("cam_ctl", "Idle FPS -> %.1f", x);
+
+  # --- Snapshots & retention --------------------------------------------------
+  # Minimum spacing between scheduled snapshots. The effective rate is also
+  # bounded by "Idle FPS" above (a snapshot can't be taken faster than frames
+  # arrive), and the change gate can skip frames that are too similar.
+  - platform: template
+    name: "Snapshot Period"
+    id: cam_period
+    icon: mdi:timer-outline
+    unit_of_measurement: s
+    entity_category: config
+    optimistic: true
+    mode: box
+    min_value: 2
+    max_value: 3600
+    step: 1
+    initial_value: 10
+
+  # Mean luma difference (0..255) below which a frame is considered "the same"
+  # and not written. Watch the "Change Score" sensor to tune this.
+  - platform: template
+    name: "Change Threshold"
+    id: cam_threshold
+    icon: mdi:delta
+    entity_category: config
+    optimistic: true
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 10
+
+  # Snapshots older than this are deleted by the retention pass in [5].
+  - platform: template
+    name: "Retention Days"
+    id: cam_retention_days
+    icon: mdi:calendar-remove
+    unit_of_measurement: d
+    entity_category: config
+    optimistic: true
+    mode: box
+    min_value: 1
+    max_value: 90
+    step: 1
+    initial_value: 7
+
+  # --- Advanced image (rarely used) ------------------------------------------
+  # Compression (JPEG quality): higher = more compression. Significantly
+  # matters to support higher resolution.
   - platform: template
     name: "Compression"
     id: cam_compression
@@ -403,7 +546,7 @@ number:
           s->set_quality(s, (int) x);
           ESP_LOGI("cam_ctl", "Compression -> %d", (int) x);
 
-# --- Image sliders (OV2640 range -2..2) --------------------------------------
+  # Image sliders (OV2640 range -2..2)
   - platform: template
     name: "Brightness"
     id: cam_brightness
@@ -455,9 +598,8 @@ number:
           s->set_saturation(s, (int) x);
           ESP_LOGI("cam_ctl", "Saturation -> %d", (int) x);
 
-# --- Exposure / gain sliders -------------------------------------------------
-# Exposure Value / Gain only take effect when "Auto Exposure (AEC)" /
-# "Auto Gain (AGC)" are switched OFF below.
+  # Exposure Value / Gain only take effect when "Auto Exposure (AEC)" /
+  # "Auto Gain (AGC)" are switched OFF (see the switches below).
   - platform: template
     name: "Exposure Value"
     id: cam_aec_value
@@ -509,48 +651,14 @@ number:
           s->set_agc_gain(s, (int) x);
           ESP_LOGI("cam_ctl", "Gain -> %d", (int) x);
 
-# --- Periodic snapshot controls (used by the camera's on_image trigger) -------
-  - platform: template
-    name: "Snapshot Period"
-    id: cam_period
-    icon: mdi:timer-outline
-    unit_of_measurement: s
-    entity_category: config
-    optimistic: true
-    mode: box
-    min_value: 2
-    max_value: 3600
-    step: 1
-    initial_value: 10
-  - platform: template
-    name: "Change Threshold"
-    id: cam_threshold
-    icon: mdi:delta
-    entity_category: config
-    optimistic: true
-    mode: slider
-    min_value: 0
-    max_value: 100
-    step: 1
-    initial_value: 10
-  - platform: template
-    name: "Retention Days"
-    id: cam_retention_days
-    icon: mdi:calendar-remove
-    unit_of_measurement: d
-    entity_category: config
-    optimistic: true
-    mode: box
-    min_value: 1
-    max_value: 90
-    step: 1
-    initial_value: 7
-
-# --- Mirror H / V checkboxes -------------------------------------------------
-# These drive the sensor directly (instead of id(my_camera).update_camera_parameters())
-# so they don't reset the brightness/contrast/WB/... values set from the controls
-# above every time you flip a mirror.
+# -----------------------------------------------------------------------------
+#  Switches
+# -----------------------------------------------------------------------------
 switch:
+  # --- Basic ------------------------------------------------------------------
+  # Mirror H / V drive the sensor directly (instead of
+  # id(my_camera).update_camera_parameters()) so they don't reset the
+  # brightness/contrast/WB/... values set from the controls every time you flip.
   - platform: template
     name: "Mirror Horizontal"
     id: cam_hmirror
@@ -583,8 +691,27 @@ switch:
           CAM_SENSOR_OR_RETURN();
           s->set_vflip(s, 0);
 
-# --- Auto exposure / gain / white balance ------------------------------------
-# restore_mode defaults below mirror the OV2640 power-on defaults.
+  # --- Snapshots & retention --------------------------------------------------
+  - platform: template
+    name: "Auto Snapshot"
+    id: cam_auto
+    icon: mdi:camera-timer
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  # When on, frames whose "Change Score" is below "Change Threshold" are
+  # skipped instead of written, so a static scene doesn't fill the card.
+  - platform: template
+    name: "Change Gate"
+    id: cam_gate_enabled
+    icon: mdi:compare
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  # --- Advanced image (rarely used) ------------------------------------------
+  # Auto exposure / gain / white balance. restore_mode defaults below mirror the
+  # OV2640 power-on defaults.
   - platform: template
     name: "Auto Exposure (AEC)"
     id: cam_aec
@@ -633,7 +760,7 @@ switch:
           CAM_SENSOR_OR_RETURN();
           s->set_whitebal(s, 0);
 
-# --- Advanced sensor toggles (rarely needed) ---------------------------------
+  # Advanced sensor toggles (rarely needed)
   - platform: template
     name: "AEC DSP (AEC2)"
     id: cam_aec2
@@ -762,24 +889,11 @@ switch:
           CAM_SENSOR_OR_RETURN();
           s->set_colorbar(s, 0);
 
-# --- Periodic snapshot enable / change gate ----------------------------------
-  - platform: template
-    name: "Auto Snapshot"
-    id: cam_auto
-    icon: mdi:camera-timer
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
-  - platform: template
-    name: "Change Gate"
-    id: cam_gate_enabled
-    icon: mdi:compare
-    entity_category: config
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
-
-# --- On-board flash LED (GPIO4) ----------------------------------------------
-# GPIO4 is the SD card's D1 line in 4-bit mode; the card above runs 1-bit, so
-# GPIO4 stays free for the flash LED.
+# -----------------------------------------------------------------------------
+#  Flash LED (Basic)
+# -----------------------------------------------------------------------------
+# On-board flash LED (GPIO4). GPIO4 is the SD card's D1 line in 4-bit mode; the
+# card above runs 1-bit, so GPIO4 stays free for the flash LED.
 output:
   - platform: ledc
     pin: GPIO4
