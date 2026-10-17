@@ -5,4 +5,8 @@ Wifi_Feeder/bootstrap/
 
 Wifi_Feeder/temp/
 
+secrets.yaml
+.esphome
+Smart_Door/.vscode/
+
 __pycache__/
