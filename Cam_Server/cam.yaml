@@ -10,9 +10,6 @@
 #    [5] Snapshot logic     globals / Save button / Change Score / retention
 #    [6] Controls           Basic | Frame rate | Snapshots | Advanced image
 #
-#  ESPHome groups entities by *platform*, so every `select:` entry must live in
-#  one block (same for number/switch/output/light). Inside each block the
-#  entries are ordered to match the Control groups in [6].
 # =============================================================================
 
 # =============================================================================
@@ -198,11 +195,32 @@ esp32_camera:
 # Browser control UI + REST API (v3). Also hosts the runtime camera controls.
 # cam_stream.js/.css inject a "Camera" panel that opens the :8080 MJPEG stream
 # on demand (button click), so no stream connection is made on page load.
+#
+# The UI groups entities into named sections using v3 sorting_groups; each
+# entity opts in with its own `web_server: { sorting_group_id, sorting_weight }`
+# block (search for "sorting_group_id" below). Groups sort by `sorting_weight`,
+# entities within a group sort by their `sorting_weight`.
 web_server:
   version: 3
   port: 80
   js_include: cam_stream.js
   css_include: cam_stream.css
+  sorting_groups:
+    - id: cam_grp_basic
+      name: "Basic"
+      sorting_weight: 10
+    - id: cam_grp_framerate
+      name: "Frame Rate"
+      sorting_weight: 20
+    - id: cam_grp_snapshots
+      name: "Snapshots"
+      sorting_weight: 30
+    - id: cam_grp_retention
+      name: "Retention"
+      sorting_weight: 40
+    - id: cam_grp_advanced
+      name: "Image Processing (Advanced)"
+      sorting_weight: 50
 
 # Serve the camera image directly over HTTP (independent of the web_server UI)
 esp32_camera_web_server:
@@ -283,6 +301,9 @@ button:
       - lambda: |-
           id(cam_save_requested) = true;
           id(my_camera)->request_image(camera::IDLE);
+    web_server:
+      sorting_group_id: cam_grp_snapshots
+      sorting_weight: 10
 
 # --- Change score (for tuning the gate) --------------------------------------
 sensor:
@@ -295,6 +316,9 @@ sensor:
     accuracy_decimals: 0
     state_class: measurement
     update_interval: never
+    web_server:
+      sorting_group_id: cam_grp_snapshots
+      sorting_weight: 40
 
 # --- Retention ---------------------------------------------------------------
 # Once a minute, delete a bounded batch of files older than the retention window
@@ -311,7 +335,8 @@ interval:
 # =============================================================================
 #  [6] CONTROLS
 #  Entities are grouped as: Basic -> Frame rate -> Snapshots -> Advanced image.
-#  (Advanced image controls were added for testing and are rarely touched.)
+#  Each entity's `web_server.sorting_group_id` selects its UI section and
+#  `sorting_weight` orders it inside that section.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -351,6 +376,9 @@ select:
           else if (x == "1600x1200") f = FRAMESIZE_UXGA;
           s->set_framesize(s, f);
           ESP_LOGI("cam_ctl", "Resolution -> %s", x.c_str());
+    web_server:
+      sorting_group_id: cam_grp_basic
+      sorting_weight: 10
 
   # --- Advanced image (rarely used) ------------------------------------------
   # White balance mode
@@ -377,6 +405,9 @@ select:
           else if (x == "Home")   m = 4;
           s->set_wb_mode(s, m);
           ESP_LOGI("cam_ctl", "WB mode -> %s", x.c_str());
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 80
 
   # AGC gain ceiling
   - platform: template
@@ -406,6 +437,9 @@ select:
           else if (x == "128X") g = GAINCEILING_128X;
           s->set_gainceiling(s, g);
           ESP_LOGI("cam_ctl", "Gain ceiling -> %s", x.c_str());
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 90
 
   # Special effect
   - platform: template
@@ -435,6 +469,9 @@ select:
           else if (x == "Sepia")      e = 6;
           s->set_special_effect(s, e);
           ESP_LOGI("cam_ctl", "Special effect -> %s", x.c_str());
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 100
 
 # -----------------------------------------------------------------------------
 #  Numbers
@@ -460,6 +497,9 @@ number:
       - lambda: |-
           id(my_camera)->set_max_update_interval((uint32_t) (1000.0f / x));
           ESP_LOGI("cam_ctl", "Max FPS -> %.0f", x);
+    web_server:
+      sorting_group_id: cam_grp_framerate
+      sorting_weight: 10
 
   # Background frame rate. This is the cadence the periodic snapshot rides on,
   # so raising it lets "Snapshot Period" actually fire more often (down to the
@@ -480,8 +520,11 @@ number:
       - lambda: |-
           id(my_camera)->set_idle_update_interval((uint32_t) (1000.0f / x));
           ESP_LOGI("cam_ctl", "Idle FPS -> %.1f", x);
+    web_server:
+      sorting_group_id: cam_grp_framerate
+      sorting_weight: 20
 
-  # --- Snapshots & retention --------------------------------------------------
+  # --- Snapshots --------------------------------------------------------------
   # Minimum spacing between scheduled snapshots. The effective rate is also
   # bounded by "Idle FPS" above (a snapshot can't be taken faster than frames
   # arrive), and the change gate can skip frames that are too similar.
@@ -497,6 +540,9 @@ number:
     max_value: 3600
     step: 1
     initial_value: 10
+    web_server:
+      sorting_group_id: cam_grp_snapshots
+      sorting_weight: 50
 
   # Mean luma difference (0..255) below which a frame is considered "the same"
   # and not written. Watch the "Change Score" sensor to tune this.
@@ -511,7 +557,11 @@ number:
     max_value: 100
     step: 1
     initial_value: 10
+    web_server:
+      sorting_group_id: cam_grp_snapshots
+      sorting_weight: 60
 
+  # --- Retention --------------------------------------------------------------
   # Snapshots older than this are deleted by the retention pass in [5].
   - platform: template
     name: "Retention Days"
@@ -525,6 +575,9 @@ number:
     max_value: 90
     step: 1
     initial_value: 7
+    web_server:
+      sorting_group_id: cam_grp_retention
+      sorting_weight: 10
 
   # --- Advanced image (rarely used) ------------------------------------------
   # Compression (JPEG quality): higher = more compression. Significantly
@@ -545,6 +598,9 @@ number:
           CAM_SENSOR_OR_RETURN();
           s->set_quality(s, (int) x);
           ESP_LOGI("cam_ctl", "Compression -> %d", (int) x);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 10
 
   # Image sliders (OV2640 range -2..2)
   - platform: template
@@ -563,6 +619,9 @@ number:
           CAM_SENSOR_OR_RETURN();
           s->set_brightness(s, (int) x);
           ESP_LOGI("cam_ctl", "Brightness -> %d", (int) x);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 20
 
   - platform: template
     name: "Contrast"
@@ -580,6 +639,9 @@ number:
           CAM_SENSOR_OR_RETURN();
           s->set_contrast(s, (int) x);
           ESP_LOGI("cam_ctl", "Contrast -> %d", (int) x);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 30
 
   - platform: template
     name: "Saturation"
@@ -597,6 +659,9 @@ number:
           CAM_SENSOR_OR_RETURN();
           s->set_saturation(s, (int) x);
           ESP_LOGI("cam_ctl", "Saturation -> %d", (int) x);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 40
 
   # Exposure Value / Gain only take effect when "Auto Exposure (AEC)" /
   # "Auto Gain (AGC)" are switched OFF (see the switches below).
@@ -616,6 +681,9 @@ number:
           CAM_SENSOR_OR_RETURN();
           s->set_aec_value(s, (int) x);
           ESP_LOGI("cam_ctl", "Exposure value -> %d", (int) x);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 50
 
   - platform: template
     name: "Exposure Level"
@@ -633,6 +701,9 @@ number:
           CAM_SENSOR_OR_RETURN();
           s->set_ae_level(s, (int) x);
           ESP_LOGI("cam_ctl", "AE level -> %d", (int) x);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 60
 
   - platform: template
     name: "Gain"
@@ -650,6 +721,9 @@ number:
           CAM_SENSOR_OR_RETURN();
           s->set_agc_gain(s, (int) x);
           ESP_LOGI("cam_ctl", "Gain -> %d", (int) x);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 70
 
 # -----------------------------------------------------------------------------
 #  Switches
@@ -674,6 +748,9 @@ switch:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
           s->set_hmirror(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_basic
+      sorting_weight: 20
 
   - platform: template
     name: "Mirror Vertical"
@@ -690,14 +767,20 @@ switch:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
           s->set_vflip(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_basic
+      sorting_weight: 30
 
-  # --- Snapshots & retention --------------------------------------------------
+  # --- Snapshots --------------------------------------------------------------
   - platform: template
     name: "Auto Snapshot"
     id: cam_auto
     icon: mdi:camera-timer
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: cam_grp_snapshots
+      sorting_weight: 20
 
   # When on, frames whose "Change Score" is below "Change Threshold" are
   # skipped instead of written, so a static scene doesn't fill the card.
@@ -708,6 +791,9 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: cam_grp_snapshots
+      sorting_weight: 30
 
   # --- Advanced image (rarely used) ------------------------------------------
   # Auto exposure / gain / white balance. restore_mode defaults below mirror the
@@ -727,6 +813,9 @@ switch:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
           s->set_exposure_ctrl(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 110
 
   - platform: template
     name: "Auto Gain (AGC)"
@@ -743,6 +832,9 @@ switch:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
           s->set_gain_ctrl(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 120
 
   - platform: template
     name: "Auto White Balance (AWB)"
@@ -759,6 +851,9 @@ switch:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
           s->set_whitebal(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 130
 
   # Advanced sensor toggles (rarely needed)
   - platform: template
@@ -776,6 +871,9 @@ switch:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
           s->set_aec2(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 140
 
   - platform: template
     name: "AWB Gain"
@@ -792,6 +890,9 @@ switch:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
           s->set_awb_gain(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 150
 
   - platform: template
     name: "Black Pixel Correction (BPC)"
@@ -808,6 +909,9 @@ switch:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
           s->set_bpc(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 160
 
   - platform: template
     name: "White Pixel Correction (WPC)"
@@ -824,6 +928,9 @@ switch:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
           s->set_wpc(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 170
 
   - platform: template
     name: "Lens Correction (LENC)"
@@ -840,6 +947,9 @@ switch:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
           s->set_lenc(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 180
 
   - platform: template
     name: "Downsize (DCW)"
@@ -856,6 +966,9 @@ switch:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
           s->set_dcw(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 190
 
   - platform: template
     name: "RAW Gamma (GMA)"
@@ -872,6 +985,9 @@ switch:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
           s->set_raw_gma(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 200
 
   - platform: template
     name: "Test Pattern"
@@ -888,6 +1004,9 @@ switch:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
           s->set_colorbar(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 210
 
 # -----------------------------------------------------------------------------
 #  Flash LED (Basic)
@@ -909,3 +1028,6 @@ light:
     entity_category: config
     restore_mode: RESTORE_DEFAULT_OFF
     default_transition_length: 0s
+    web_server:
+      sorting_group_id: cam_grp_basic
+      sorting_weight: 40
