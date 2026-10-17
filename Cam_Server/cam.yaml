@@ -1,10 +1,13 @@
 esphome:
   name: cam
 
-  # Shared helper used by the lambdas below: cam_sensor() returns the sensor
-  # (or null + warning), CAM_SENSOR_OR_RETURN() fetches it and bails out if null.
+  # Shared helpers used by the lambdas below:
+  #   cam_ctl.h      - cam_sensor() / CAM_SENSOR_OR_RETURN() camera helpers
+  #   cam_snapshot.h - cam_gate::* JPEG change detection and cam_store::* SD
+  #                    helpers (see the header for why they are memory-safe here)
   includes:
     - cam_ctl.h
+    - cam_snapshot.h
 
   # Without PSRAM the camera can't allocate an XGA-sized frame buffer at boot
   # (1024x768 reserves ~154 KB contiguous internal RAM, VGA only ~60 KB), so
@@ -100,26 +103,72 @@ esp32_camera:
   vertical_flip: false
   horizontal_mirror: false
 
-  # Save the current frame to the SD card when the "Save Snapshot" button was
-  # pressed (see the button at the bottom). This is the only safe way to get a
-  # frame: esp32_camera's own framebuffer task owns the single DRAM frame buffer,
-  # so calling esp_camera_fb_get() directly always returns nullptr here.
+  # This is the only safe way to get a frame: esp32_camera's own framebuffer
+  # task owns the single DRAM frame buffer, so calling esp_camera_fb_get()
+  # directly always returns nullptr here. Note on_image also fires for the
+  # camera's *idle* frames (~every 10 s, `idle_framerate`), so a periodic
+  # snapshot needs no extra request_image() polling - it piggybacks on frames
+  # the camera was going to take anyway.
   on_image:
     then:
       - lambda: |-
-          if (!id(cam_save_requested))
-            return;
-          id(cam_save_requested) = false;
-          char path[64];
+          const bool manual = id(cam_save_requested);
+          if (manual)
+            id(cam_save_requested) = false;
+
+          // --- scheduled snapshot, unless this is a manual "Save Snapshot" ---
+          if (!manual) {
+            if (!id(cam_auto)->state)
+              return;
+            const uint32_t period_ms = static_cast<uint32_t>(id(cam_period)->state * 1000.0f);
+            const uint32_t now = millis();
+            if (period_ms == 0 || now - id(cam_last_auto_ms) < period_ms)
+              return;
+            id(cam_last_auto_ms) = now;
+
+            // --- change gate: skip frames that look like the last one kept ---
+            if (id(cam_gate_enabled)->state) {
+              const int score = cam_gate::analyze(image.data, image.length);
+              if (score >= 0)
+                id(cam_change_score)->publish_state(score);
+              const float threshold = id(cam_threshold)->state;
+              if (score >= 0 && static_cast<float>(score) < threshold) {
+                ESP_LOGD("cam_snap", "Changed by %d (< %.0f), skipped", score, threshold);
+                return;
+              }
+            }
+          }
+
+          // --- write to /snap/<YYYYMMDD>/<HHMMSS>.jpg plus a /latest.jpg copy ---
+          char path[96];
           auto t = id(cam_time).now();
           if (t.is_valid()) {
-            snprintf(path, sizeof(path), "/snap_%04d%02d%02d_%02d%02d%02d.jpg",
-                     t.year, t.month, t.day_of_month, t.hour, t.minute, t.second);
+            char dir[48];
+            snprintf(dir, sizeof(dir), "/snap/%04d%02d%02d", t.year, t.month, t.day_of_month);
+            if (!id(sd_card)->is_directory(dir)) {
+              if (!id(sd_card)->is_directory("/snap"))
+                id(sd_card)->create_directory("/snap");
+              id(sd_card)->create_directory(dir);
+            }
+            snprintf(path, sizeof(path), "/sdcard%s/%02d%02d%02d.jpg",
+                     dir, t.hour, t.minute, t.second);
+          } else if (manual) {
+            // RTC not synced yet: keep manual saves working with a fallback name.
+            // Leading '0' keeps it sorted before "latest.jpg" for /latest.
+            snprintf(path, sizeof(path), "/sdcard/0nosync_%lu.jpg", (unsigned long) millis());
           } else {
-            snprintf(path, sizeof(path), "/snap_nosync_%lu.jpg", (unsigned long) millis());
+            ESP_LOGW("cam_snap", "Time not synced, skipping scheduled snapshot");
+            return;
           }
-          id(sd_card)->write_file(path, image.data, image.length);
-          ESP_LOGI("cam_ctl", "Saved %s (%u bytes)", path, (unsigned) image.length);
+
+          if (cam_store::write_file(path, image.data, image.length)) {
+            cam_store::write_file("/sdcard/latest.jpg", image.data, image.length);
+            cam_gate::commit();
+            ESP_LOGI("cam_snap", "Saved %s (%u bytes, score %d)",
+                     path, (unsigned) image.length, cam_gate::last_score());
+          } else {
+            ESP_LOGE("cam_snap", "Failed to write %s", path);
+          }
 
 # Browser control UI + REST API (v3). Also hosts the runtime camera controls.
 # cam_stream.js/.css inject a "Camera" panel that opens the :8080 MJPEG stream
@@ -170,13 +219,18 @@ latest_snapshot:
   extension: .jpg
 
 # --- Save the current frame to the SD card -----------------------------------
-# The write itself happens in esp32_camera's on_image trigger (see the camera
+# The writes themselves happen in esp32_camera's on_image trigger (see the camera
 # config above); the button just raises a flag and asks the camera for a frame.
 globals:
   - id: cam_save_requested
     type: bool
     restore_value: no
     initial_value: "false"
+  # millis() at the last scheduled (non-manual) snapshot, for the period check.
+  - id: cam_last_auto_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
 
 button:
   - platform: template
@@ -187,6 +241,31 @@ button:
       - lambda: |-
           id(cam_save_requested) = true;
           id(my_camera)->request_image(camera::IDLE);
+
+# --- Change score (for tuning) + retention -----------------------------------
+# (The "Auto Snapshot" / "Change Gate" switches and the period / threshold /
+# retention numbers live with the other controls further down this file.)
+sensor:
+  # Mean luma difference of the newest frame vs. the last kept one (0..255).
+  # Useful for tuning "Change Threshold": watch it while something moves.
+  - platform: template
+    name: "Change Score"
+    id: cam_change_score
+    icon: mdi:image-filter-center-focus
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+
+# Retention: once a minute, delete a bounded batch of files older than the
+# retention window (age from the FAT mtime), then drop empty day folders.
+# The batch limit keeps each pass short so it can't stall the main loop.
+interval:
+  - interval: 60s
+    then:
+      - lambda: |-
+          int n = cam_store::prune("/sdcard/snap", (int) id(cam_retention_days)->state, 100);
+          if (n > 0)
+            ESP_LOGI("cam_snap", "Pruned %d old snapshot(s)", n);
 
 # --- Resolution selector -----------------------------------------------------
 select:
@@ -430,6 +509,43 @@ number:
           s->set_agc_gain(s, (int) x);
           ESP_LOGI("cam_ctl", "Gain -> %d", (int) x);
 
+# --- Periodic snapshot controls (used by the camera's on_image trigger) -------
+  - platform: template
+    name: "Snapshot Period"
+    id: cam_period
+    icon: mdi:timer-outline
+    unit_of_measurement: s
+    entity_category: config
+    optimistic: true
+    mode: box
+    min_value: 2
+    max_value: 3600
+    step: 1
+    initial_value: 10
+  - platform: template
+    name: "Change Threshold"
+    id: cam_threshold
+    icon: mdi:delta
+    entity_category: config
+    optimistic: true
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 10
+  - platform: template
+    name: "Retention Days"
+    id: cam_retention_days
+    icon: mdi:calendar-remove
+    unit_of_measurement: d
+    entity_category: config
+    optimistic: true
+    mode: box
+    min_value: 1
+    max_value: 90
+    step: 1
+    initial_value: 7
+
 # --- Mirror H / V checkboxes -------------------------------------------------
 # These drive the sensor directly (instead of id(my_camera).update_camera_parameters())
 # so they don't reset the brightness/contrast/WB/... values set from the controls
@@ -645,6 +761,21 @@ switch:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
           s->set_colorbar(s, 0);
+
+# --- Periodic snapshot enable / change gate ----------------------------------
+  - platform: template
+    name: "Auto Snapshot"
+    id: cam_auto
+    icon: mdi:camera-timer
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+  - platform: template
+    name: "Change Gate"
+    id: cam_gate_enabled
+    icon: mdi:compare
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
 
 # --- On-board flash LED (GPIO4) ----------------------------------------------
 # GPIO4 is the SD card's D1 line in 4-bit mode; the card above runs 1-bit, so
