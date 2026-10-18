@@ -164,10 +164,15 @@ void SdMmc::list_directory_file_info_rec(const char *path, uint8_t depth,
   char entry_absolut_path[FILE_PATH_MAX];
   char entry_path[FILE_PATH_MAX];
   const size_t dirpath_len = MOUNT_POINT.size();
-  size_t entry_path_len = strlen(path);
   strlcpy(entry_path, path, sizeof(entry_path));
-  strlcpy(entry_path + entry_path_len, "/", sizeof(entry_path) - entry_path_len);
-  entry_path_len = strlen(entry_path);
+  // Only insert a separator when the caller's path doesn't already end in one. A directory
+  // requested with a trailing slash (e.g. /file/snap/20261018/) would otherwise yield entries
+  // like "/snap/20261018//001744.jpg", and every generated link would contain a doubled slash.
+  size_t entry_path_len = strlen(entry_path);
+  if (entry_path_len == 0 || entry_path[entry_path_len - 1] != '/') {
+    strlcpy(entry_path + entry_path_len, "/", sizeof(entry_path) - entry_path_len);
+    entry_path_len++;
+  }
 
   strlcpy(entry_absolut_path, MOUNT_POINT.c_str(), sizeof(entry_absolut_path));
   struct dirent *entry;
