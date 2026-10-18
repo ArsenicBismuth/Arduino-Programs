@@ -306,6 +306,10 @@ button:
     web_server:
       sorting_group_id: cam_grp_snapshots
       sorting_weight: 10
+  - platform: restart
+    name: "Restart"
+    icon: "mdi:restart"
+    entity_category: diagnostic
 
 # --- Change score (for tuning the gate) --------------------------------------
 sensor:
@@ -321,6 +325,15 @@ sensor:
     web_server:
       sorting_group_id: cam_grp_snapshots
       sorting_weight: 40
+  - platform: debug
+    free:
+      name: "Heap Free"
+      unit_of_measurement: "B" # B for Bytes
+      icon: "mdi:memory"
+
+# Enables the ability to read debug information.
+debug:
+  update_interval: 1min # How often to check the memory.
 
 # --- Retention ---------------------------------------------------------------
 # Once a day, delete files older than the retention window (age from the FAT
