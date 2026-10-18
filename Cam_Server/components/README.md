@@ -1,5 +1,8 @@
 # SD card components
 
+> Build/flash from the `esphome` conda environment: `conda activate esphome`, then
+> `esphome run cam.yaml`. (`python`/`pip` are not on PATH outside that env.)
+
 `latest_snapshot/` is the local component described below; the rest of this directory is
 the SD card driver and file server that `cam.yaml` includes.
 
@@ -143,6 +146,26 @@ slots.
 the camera stream on :8080 is open (that server has a single socket), and the serial log
 around the event — a reboot banner (`rst:0x…`, `Guru Meditation`, `abort()`) points at heap
 exhaustion rather than plain connection contention.
+
+### 2026-10-18 (d) — the chunked index page looked like it hung on a day folder
+
+**Symptom.** After the index was rewritten to stream chunks (2026-10-18 entry), `/file/snap`
+(two folders) still opened instantly, `/file` felt flaky, and `/file/snap/<date>` appeared to
+hang: the request stayed open for tens of seconds and often never rendered.
+
+**Root cause.** `handle_index()` writes the page as one `httpd_resp_send_chunk()` call per
+table row — dozens to ~100 tiny writes. It was the only streamed handler that did **not**
+call `set_tcp_nodelay()`, so Nagle was still on. Nagle sends one small segment and then waits
+for its ACK before sending the next, while the client deliberately delays that ACK
+(delayed-ACK, up to ~200 ms). The page therefore advanced roughly one row per round-trip:
+a 100-row day folder takes tens of seconds, the 2-row `/file/snap` stays instant, and any
+other request queued behind the single httpd task looks dropped. Downloads and `/latest`
+had already been given `TCP_NODELAY` in an earlier pass; the (newer) index was missed.
+
+**Fix.** `handle_index()` now sets `TCP_NODELAY` on the session before writing, the same way
+`handle_download()` and `/latest` do. `ChunkWriter` also stops after the first failed chunk
+instead of retrying every remaining one: a retry can block for the full 5 s send timeout per
+chunk, and with one httpd task that would wedge the whole web server for a closed client.
 
 ## Periodic snapshots + change gate (`cam_snapshot.h`)
 

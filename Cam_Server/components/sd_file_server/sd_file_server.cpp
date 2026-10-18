@@ -21,8 +21,11 @@ namespace sd_file_server {
 static const char *TAG = "sd_file_server";
 
 #ifdef USE_ESP_IDF
-// Files are streamed in small chunks; with Nagle enabled the client can wait an extra
-// round-trip between them. Turn it off for this response.
+// Every streamed response here is written as many small chunks (a 4 KB header, then one
+// chunk per table row, then the pager). With Nagle enabled each small write waits for the
+// previous one to be ACKed, and the client holds its ACK for the delayed-ACK timeout, so a
+// page made of ~100 rows crawls out one row per round-trip and looks like a hang. Turn
+// Nagle off for the whole response - not just the file downloads.
 static void set_tcp_nodelay(httpd_req_t *req) {
   int fd = httpd_req_to_sockfd(req);
   int one = 1;
@@ -48,11 +51,26 @@ class ChunkWriter {
  public:
 #ifdef USE_ESP_IDF
   explicit ChunkWriter(httpd_req_t *req) : req_(req) {}
-  bool write(const char *data, size_t len) { return httpd_resp_send_chunk(this->req_, data, len) == ESP_OK; }
-  bool finish() { return httpd_resp_send_chunk(this->req_, nullptr, 0) == ESP_OK; }
+  bool write(const char *data, size_t len) {
+    // Once a chunk fails the connection is unusable, so make every later write a no-op
+    // instead of retrying it: a retry can block for the full socket send timeout (5 s), and
+    // one httpd task serves every client, so a dead peer would otherwise freeze the whole
+    // web server for as many chunks as the page still has.
+    if (!this->ok_)
+      return false;
+    this->ok_ = httpd_resp_send_chunk(this->req_, data, len) == ESP_OK;
+    return this->ok_;
+  }
+  bool finish() {
+    if (!this->ok_)
+      return false;
+    this->ok_ = false;
+    return httpd_resp_send_chunk(this->req_, nullptr, 0) == ESP_OK;
+  }
 
  protected:
   httpd_req_t *req_;
+  bool ok_{true};
 #else
   explicit ChunkWriter(AsyncResponseStream *response) : response_(response) {}
   bool write(const char *data, size_t len) {
@@ -391,6 +409,9 @@ void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string cons
   httpd_resp_set_type(req, "text/html");
   httpd_resp_set_hdr(req, "Accept-Ranges", "none");
   set_connection_close(req);
+  // The page is written as one chunk per row; without this a listing of a day folder
+  // (dozens to hundreds of rows) stalls on Nagle+delayed-ACK and never finishes in time.
+  set_tcp_nodelay(req);
   ChunkWriter out(req);
 #else
   AsyncResponseStream *response = request->beginResponseStream("text/html");
