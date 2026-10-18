@@ -91,7 +91,7 @@ A debug view of the pipeline, at `kPrintIntervalMs`:
 
 ```
  roll_deg= -94.6 ptr_dps= 0.0 0.0 ptr_deg= -3.4 -3.2 ci_ms= 15.0 tx_s= 7 align= 100
- loop_hz= 728 i2c_us= 219 wait_us= 1208 imu_task_us= 1073 hid_task_us= 90 ev_hz= 66
+ loop_hz= 728
 ```
 
 | Field | Meaning |
@@ -104,12 +104,7 @@ A debug view of the pipeline, at `kPrintIntervalMs`:
 | `ci_ms` | negotiated BLE connection interval — the floor on pointer latency and the report rate. Shown once connected |
 | `tx_s` | reports actually sent per second, averaged over a second. Should track `1000 / ci_ms` |
 | `align` | share of those reports that went out in the aligned window rather than on the rate fallback. `100` means the loop places every report |
-| `loop_hz` | main loop passes per second — the ceiling on both the report rate and the sample rate |
-| `i2c_us` | average cost of one IMU transaction |
-| `wait_us` | average cost of the idle wait while the sensor has nothing ready |
-| `imu_task_us` | average cost of the whole `imuTask()` half of the loop (status poll, sample read, motion update) |
-| `hid_task_us` | average cost of the whole `hidTask()` half |
-| `ev_hz` | connection events per second as counted by the loop. Should equal `1000 / ci_ms`; much higher means `millis()` is running fast |
+| `loop_hz` | main loop passes per second — the ceiling on both the report rate and the sample rate. Below `1000 / ci_ms` the loop, not the link, is limiting |
 
 The sensor runs at 416 Hz, but the *effective* sample rate is one sample per main loop pass, so
 `loop_hz=` is the number that matters. A sample that is not read before the next one lands is simply
@@ -275,8 +270,7 @@ The rules that produce the "Now" column:
 - **One report per connection event, not more.** Sending faster than the link does not get motion to
   the host any sooner: the extra notifications stack in the driver's notification queue behind each
   other, and that queue *is* the latency. The window is spaced on the radio's own microsecond clock
-  rather than on the event counter, because only the clock is certain to advance; `ev_hz=` reports the
-  counter separately, so a disagreement between the two would be visible.
+  rather than on the event counter, because only the clock is certain to advance.
 - **A rate fallback covers a window the loop cannot reach.** Once a full interval has gone by with
   nothing sent, the report goes out regardless of the window. That is the rate limit rather than the
   phase, and it matters specifically when the main loop is slower than the connection interval: then
@@ -287,13 +281,12 @@ The rules that produce the "Now" column:
   more often than the loop runs, and the IMU cannot be sampled more often either. If `loop_hz` is below
   `1000 / ci_ms`, the loop, not the link, is setting the update rate.
 - **The loop is worth watching, because the cost was not where it looked.** Connecting used to halve it,
-  724 → 357 Hz, with `hid_task_us` jumping 192 → 1297 µs — and nothing in `hidTask` is expensive. The
-  cause is a level down: every Bluefruit connection or security query begins with
-  `serviceBluefruitBeforePollingState()`, which runs `manager().idleService()` and dispatches deferred
-  callbacks, which is the same work the core already does once per pass in `main()`'s
-  `nrf54l15_clean_idle_service()` and `yield()`. Asking three or four times a pass, 350 passes a second,
-  was pure duplication. Both states change only on connect, disconnect, pairing or a parameter update, so
-  they are now polled and cached (`kLinkPollMs`, `kConnPollMs`). Measured: `hid_task_us` 1297 → **90 µs**.
+  724 → 357 Hz, and nothing in `hidTask` is expensive enough to explain that. The cause is a level down:
+  every Bluefruit connection or security query begins with `serviceBluefruitBeforePollingState()`, which
+  runs `manager().idleService()` and dispatches deferred callbacks — the same work the core already does
+  once per pass in `main()`'s `nrf54l15_clean_idle_service()` and `yield()`. Asking three or four times a
+  pass, at 350 passes a second, was pure duplication. Both states change only on connect, disconnect,
+  pairing or a parameter update, so they are now polled and cached (`kLinkPollMs`, `kConnPollMs`).
 - **The connection interval is the host's decision.** This is the one delay that cannot be designed
   away. The interval is published at 7.5–15 ms through GAP characteristic `0x2A04`, and the core's HAL
   queues its own update request too, but both are only *requests* — the central decides. Android's
