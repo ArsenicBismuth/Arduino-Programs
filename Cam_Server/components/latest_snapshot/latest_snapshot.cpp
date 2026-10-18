@@ -4,6 +4,9 @@
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 
 #include "esphome/core/log.h"
 
@@ -14,7 +17,17 @@ static const char *TAG = "latest_snapshot";
 
 // Chunk used to copy the file to the socket. Deliberately a small static buffer:
 // the handler must never allocate a whole-file buffer (see the header / README).
-static char STREAM_BUF[512];
+static char STREAM_BUF[2048];
+
+// Files are streamed in small chunks; with Nagle enabled the client can wait an extra
+// round-trip between them. Turn it off for this response.
+static void set_tcp_nodelay(httpd_req_t *req) {
+  int fd = httpd_req_to_sockfd(req);
+  int one = 1;
+  if (fd >= 0 && setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) < 0) {
+    ESP_LOGW(TAG, "setsockopt(TCP_NODELAY) failed: %s", strerror(errno));
+  }
+}
 
 void LatestSnapshot::setup() { this->base_->add_handler(this); }
 
@@ -82,6 +95,7 @@ void LatestSnapshot::handleRequest(AsyncWebServerRequest *request) {
   httpd_req_t *req = *request;
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=latest.jpg");
+  set_tcp_nodelay(req);
 
   size_t total = 0;
   size_t n;

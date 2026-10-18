@@ -6,6 +6,11 @@
 #include <map>
 #include <string>
 #include <vector>
+#ifdef USE_ESP_IDF
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#endif
 #include "esphome/core/log.h"
 #include "esphome/components/network/util.h"
 #include "esphome/core/helpers.h"
@@ -14,6 +19,18 @@ namespace esphome {
 namespace sd_file_server {
 
 static const char *TAG = "sd_file_server";
+
+#ifdef USE_ESP_IDF
+// Files are streamed in small chunks; with Nagle enabled the client can wait an extra
+// round-trip between them. Turn it off for this response.
+static void set_tcp_nodelay(httpd_req_t *req) {
+  int fd = httpd_req_to_sockfd(req);
+  int one = 1;
+  if (fd >= 0 && setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) < 0) {
+    ESP_LOGW(TAG, "setsockopt(TCP_NODELAY) failed: %s", strerror(errno));
+  }
+}
+#endif
 
 // Sends the index page in small pieces instead of accumulating the whole page in a
 // std::string first. A day folder can hold thousands of snapshots; buffering the full
@@ -458,8 +475,11 @@ void SDFileServer::handle_download(AsyncWebServerRequest *request, std::string c
 
   httpd_req_t *req = *request;
   httpd_resp_set_type(req, mime.c_str());
+  set_tcp_nodelay(req);
 
-  static char buffer[512];
+  // 2 KB chunks keep the per-chunk framing and syscall overhead down while staying well
+  // within the heap budget.
+  static char buffer[2048];
   size_t read = 0;
   while ((read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
     if (httpd_resp_send_chunk(req, buffer, read) != ESP_OK)
