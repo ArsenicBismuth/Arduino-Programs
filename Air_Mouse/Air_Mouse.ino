@@ -1,11 +1,26 @@
 /*
- * Air_Mouse - Step 2: gyro-driven pointer rates
+ * Air_Mouse - Step 3: BLE HID mouse
  *
  * Board : Seeed XIAO nRF54L15 / Sense
  * Core  : lolren/nrf54-arduino-core  (board "XIAO nRF54L15 / Sense", variant xiao_nrf54l15)
  * IMU   : ST LSM6DS3TR-C on the back-pad bus, exposed as Wire1 (SDA = D12, SCL = D11), addr 0x6A
  *
- * Step 2 adds, on top of step 1:
+ * Step 3 adds BLE HID: the pointer rates now drive a real Bluetooth mouse that
+ * Android sees as an ordinary input device. Press the onboard button for a left
+ * click. The IMU pipeline is untouched, the HID layer only consumes its output.
+ *
+ * The transport rules that matter, and that the code below follows:
+ *   - Reports are only accepted once the link is encrypted, so the device must
+ *     pair first (Just Works, NoInputNoOutput - a mouse has no keypad).
+ *   - Motion is accumulated in degrees at the full 416 Hz and converted to
+ *     counts only when a report is actually sent. Sending at the IMU rate would
+ *     just queue notifications and add latency.
+ *   - HID relative X/Y are signed 8-bit, so a delta is clamped to +/-127.
+ *     Only what was really sent is subtracted from the accumulator, so the
+ *     sub-count remainder carries over and slow movement stays smooth.
+ *   - If a report fails to go out, the motion behind it stays pending.
+ *
+ * Step 2 added:
  *   - wider full scales and a faster ODR for pointer work: +/-4 g, +/-500 dps, 416 Hz.
  *     A quick wrist flick clips +/-2 g / 245 dps, which feels like the cursor
  *     "sticking" at full speed.
@@ -32,11 +47,15 @@
  *   ptr_deg       those rates integrated, wrapped to +/-180 deg (the pointer movement)
  *
  * Before running: hold the board still, it measures the gyro bias first.
+ * Then pair with "Air Mouse" from the host's Bluetooth settings.
+ *
+ * Requires the "BLE Support: Enabled" board menu option (the default).
  */
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
+#include <bluefruit.h>
 
 // ---------------------------------------------------------------------------
 // Board wiring
@@ -125,6 +144,45 @@ static const float kGravityFilterTauMs = 50.0f;  // ~3 Hz cutoff
 static const uint32_t kPrintIntervalMs = 50;  // 20 Hz
 
 // ---------------------------------------------------------------------------
+// HID transport
+// ---------------------------------------------------------------------------
+
+static const char kDeviceName[] = "Air Mouse";
+
+// Pointer gain: HID counts per degree of rotation. Sensible starting point;
+// hosts apply their own pointer acceleration on top of this.
+static const float kHidCountsPerDeg = 6.0f;
+
+// Report cadence. Never send faster than the connection interval: the extra
+// notifications just queue up and add latency without reaching the host
+// sooner. The core example asks for a 30-50 ms interval (see kConnInterval*),
+// so this matches it.
+static const uint32_t kHidReportIntervalMs = 30;
+
+// Connection interval, in 1.25 ms units (24 = 30 ms, 40 = 50 ms). The core's
+// own HID example uses this range because it leaves Android enough event
+// budget for LE Secure Connections on hosts with strict pairing timing.
+// Dropping to (8, 16) = 10-20 ms feels noticeably snappier, but only if your
+// host completes pairing at that rate.
+static const uint16_t kConnIntervalMin = 24;
+static const uint16_t kConnIntervalMax = 40;
+
+// Cap on unreported motion. If the link stalls for a second, an uncapped
+// accumulator would keep the cursor moving after the hand has stopped. Past
+// this the backlog is dropped instead.
+static const float kHidPendingCapDeg = 45.0f;
+
+// Onboard button, active low, as left click.
+static const uint8_t  kButtonPin        = PIN_BUTTON;
+static const uint32_t kButtonDebounceMs = 20;
+
+// Some hosts like a periodic zero-motion report to stay awake. The core's HID
+// example sends one every 100 ms. Off by default; enable it if the pointer
+// stops responding after the device has been idle.
+static const bool     kHidIdleReportEnabled = false;
+static const uint32_t kHidIdleReportMs      = 100;
+
+// ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
@@ -150,6 +208,30 @@ static float g_ptrRateDps[2]   = {0.0f, 0.0f};  // {horizontal, vertical}
 static float g_ptrDeg[2]       = {0.0f, 0.0f};  // integrated, wrapped
 
 static uint16_t g_stillCount = 0;
+
+// ---------------------------------------------------------------------------
+// HID state
+// ---------------------------------------------------------------------------
+
+// BLE peripheral objects. BLEDis and BLEBas are carried because the core's own
+// HID example advertises HIDS alongside them and notes that strict Android
+// hosts compare against that exact shape.
+BLEDis       bledis;
+BLEBas       blebas;
+BLEHidAdafruit blehid;
+
+// Pointer movement accumulated but not yet reported, in degrees. This is the
+// real accumulator; g_ptrDeg above is only a wrapped display copy.
+static float g_pendingDeg[2] = {0.0f, 0.0f};
+
+static uint32_t g_hidLastReportMs = 0;
+static uint32_t g_hidLastKeepaliveMs = 0;
+static uint8_t  g_hidLastButtons  = 0;
+
+// Debounced button state (see hidPollButton).
+static bool     g_buttonRaw      = false;
+static bool     g_buttonStable   = false;
+static uint32_t g_buttonChangeMs = 0;
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -498,11 +580,21 @@ static void updateMotion(const int16_t gyroRaw[3], const int16_t accelRaw[3], fl
   g_ptrRateDps[0] = kPointerHorizontalSign * horizontal;
   g_ptrRateDps[1] = kPointerVerticalSign * vertical;
 
-  // 6. Integrate into pointer movement. This is the quantity a HID report
-  //    would consume; a real mouse sends the delta since the last report and
-  //    resets, here it is wrapped purely to keep the readout bounded.
-  g_ptrDeg[0] = wrap180(g_ptrDeg[0] + g_ptrRateDps[0] * dtSec);
-  g_ptrDeg[1] = wrap180(g_ptrDeg[1] + g_ptrRateDps[1] * dtSec);
+  // 6. Integrate into pointer movement.
+  //    g_pendingDeg is the real accumulator that the HID layer drains; it is
+  //    capped so a stalled link cannot leave a backlog of motion that keeps the
+  //    cursor sliding after the hand has stopped.
+  //    g_ptrDeg is a wrapped copy for the serial readout only, and must not be
+  //    used for reporting: wrapping it would discard real rotation.
+  for (uint8_t i = 0; i < 2; ++i) {
+    g_pendingDeg[i] += g_ptrRateDps[i] * dtSec;
+    if (g_pendingDeg[i] > kHidPendingCapDeg) {
+      g_pendingDeg[i] = kHidPendingCapDeg;
+    } else if (g_pendingDeg[i] < -kHidPendingCapDeg) {
+      g_pendingDeg[i] = -kHidPendingCapDeg;
+    }
+    g_ptrDeg[i] = wrap180(g_ptrDeg[i] + g_ptrRateDps[i] * dtSec);
+  }
 }
 
 static void printState() {
@@ -535,7 +627,153 @@ static void printState() {
 }
 
 // ---------------------------------------------------------------------------
-// setup / loop
+// HID transport
+// ---------------------------------------------------------------------------
+
+static void hidConnectCallback(uint16_t connHandle) {
+  (void)connHandle;
+  Serial.println("ble=connected, pairing");
+  Bluefruit.Security.requestPairing();
+}
+
+static void hidDisconnectCallback(uint16_t connHandle, uint8_t reason) {
+  (void)connHandle;
+  Serial.print("ble=disconnected reason=0x");
+  Serial.println(reason, HEX);
+}
+
+static void hidStartAdvertising() {
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  // HID hosts filter on the Appearance field, and it belongs in the GAP
+  // database as well, which setAppearance above already did.
+  Bluefruit.Advertising.addAppearance(BLE_APPEARANCE_HID_MOUSE);
+  Bluefruit.Advertising.addService(blehid, blebas);
+  Bluefruit.ScanResponse.addName();
+
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.setInterval(32, 244);  // 20 ms fast, 152.5 ms slow
+  Bluefruit.Advertising.setFastTimeout(30);
+  Bluefruit.Advertising.start(0);
+}
+
+static void hidBegin() {
+  Bluefruit.begin();
+  Bluefruit.setName(kDeviceName);
+  Bluefruit.setAppearance(BLE_APPEARANCE_HID_MOUSE);
+  Bluefruit.setTxPower(4);
+
+  // A mouse has no display and no keypad, so advertise NoInputNoOutput. That
+  // makes the host pick LE Secure Connections Just Works instead of asking for
+  // a passkey this device could never show or type.
+  Bluefruit.Security.setIOCaps(false, false, false);
+
+  Bluefruit.Periph.setConnInterval(kConnIntervalMin, kConnIntervalMax);
+  Bluefruit.Periph.setConnectCallback(hidConnectCallback);
+  Bluefruit.Periph.setDisconnectCallback(hidDisconnectCallback);
+
+  bledis.setManufacturer("Air Mouse");
+  bledis.setModel("XIAO nRF54L15");
+  bledis.begin();
+  blebas.begin();
+  blebas.write(100);
+
+  // Compact Zephyr-style HID report, which is the shape Android and Sony HID
+  // hosts compare against. Note this drops the wheel and pan fields.
+  blehid.setZephyrCompatibleMouse(true);
+  blehid.begin();
+
+  pinMode(kButtonPin, INPUT_PULLUP);
+
+  hidStartAdvertising();
+  Serial.print("ble=advertising as \"");
+  Serial.print(kDeviceName);
+  Serial.println("\" (pair from the host, HID needs an encrypted link)");
+}
+
+// HID only accepts reports on an encrypted link. Before that, mouseReport()
+// silently returns false, so this is also the "is it worth trying" check.
+static bool hidLinkReady() {
+  return Bluefruit.connected() && Bluefruit.Security.isEncrypted(0) &&
+         blehid.mouseNotifyEnabled();
+}
+
+// Degrees to HID counts, truncated toward zero and clamped to the signed 8-bit
+// range the report uses.
+static int8_t hidCountsFor(float deg) {
+  const float counts = deg * kHidCountsPerDeg;
+  int whole = static_cast<int>(counts);
+  if (whole > 127) {
+    whole = 127;
+  } else if (whole < -127) {
+    whole = -127;
+  }
+  return static_cast<int8_t>(whole);
+}
+
+// Non-blocking debounce: PIN_BUTTON is active low with the internal pull-up.
+static void hidPollButton(uint32_t nowMs) {
+  const bool raw = (digitalRead(kButtonPin) == LOW);
+  if (raw != g_buttonRaw) {
+    g_buttonRaw = raw;
+    g_buttonChangeMs = nowMs;
+    return;
+  }
+  if (nowMs - g_buttonChangeMs < kButtonDebounceMs) {
+    return;
+  }
+  if (g_buttonStable != g_buttonRaw) {
+    g_buttonStable = g_buttonRaw;
+    Serial.println(g_buttonStable ? "button=down" : "button=up");
+  }
+}
+
+static void hidTask(uint32_t nowMs) {
+  hidPollButton(nowMs);
+
+  if (!hidLinkReady()) {
+    // Drop the backlog rather than firing it off in a burst the moment the
+    // link comes back, which would fling the cursor across the screen.
+    g_pendingDeg[0] = 0.0f;
+    g_pendingDeg[1] = 0.0f;
+    g_hidLastButtons = 0;
+    g_hidLastReportMs = nowMs;
+    g_hidLastKeepaliveMs = nowMs;
+    return;
+  }
+
+  // Never send faster than the connection interval: extra reports would only
+  // queue up in the stack, adding latency without reaching the host any sooner.
+  // A click therefore goes out on the next slot, and a send that fails waits
+  // for the next slot instead of spinning.
+  if ((nowMs - g_hidLastReportMs) < kHidReportIntervalMs) {
+    return;
+  }
+  g_hidLastReportMs = nowMs;
+
+  const uint8_t buttons = g_buttonStable ? MOUSE_BUTTON_LEFT : 0;
+  const bool buttonChanged = (buttons != g_hidLastButtons);
+  const int8_t dx = hidCountsFor(g_pendingDeg[0]);
+  const int8_t dy = hidCountsFor(g_pendingDeg[1]);
+  const bool keepaliveDue =
+      kHidIdleReportEnabled && ((nowMs - g_hidLastKeepaliveMs) >= kHidIdleReportMs);
+
+  if (dx == 0 && dy == 0 && !buttonChanged && !keepaliveDue) {
+    return;  // nothing to say, and no keepalive wanted yet
+  }
+
+  if (blehid.mouseReport(buttons, dx, dy, 0, 0)) {
+    // Subtract only what was actually sent. The remainder stays pending, which
+    // is what keeps slow movement smooth instead of quantised.
+    g_pendingDeg[0] -= static_cast<float>(dx) / kHidCountsPerDeg;
+    g_pendingDeg[1] -= static_cast<float>(dy) / kHidCountsPerDeg;
+    g_hidLastButtons = buttons;
+    g_hidLastKeepaliveMs = nowMs;
+  }
+  // On failure the motion simply stays pending and goes out on the next slot.
+}
+
+// ---------------------------------------------------------------------------
+// IMU task
 // ---------------------------------------------------------------------------
 
 static void announceSensor() {
@@ -547,37 +785,7 @@ static void announceSensor() {
   Serial.println(static_cast<char>('X' + kPointAxis));
 }
 
-void setup() {
-  Serial.begin(115200);
-  delay(300);
-
-  Serial.println();
-  Serial.println("Air_Mouse - step 2: gyro pointer rates");
-  Serial.println("bus=Wire1 (SDA=D12, SCL=D11)  target=LSM6DS3TR-C @ 0x6A/0x6B");
-
-  imuPowerRailOn();
-  imuBus.begin();
-  imuBus.setClock(400000);
-
-  if (!imuFind()) {
-    Serial.println("imu=not-found (Sense board? rail powered? D12/D11 connected?)");
-    return;
-  }
-
-  if (!imuConfigure()) {
-    Serial.println("imu=config-failed");
-    g_imuAddress = 0;
-    return;
-  }
-
-  announceSensor();
-  calibrateGyroBias();
-
-  g_lastSampleUs = micros();
-  g_lastPrintMs  = millis();
-}
-
-void loop() {
+static void imuTask() {
   // Recover from a missing or wedged sensor without needing a reset.
   if (g_imuAddress == 0) {
     if (imuFind() && imuConfigure()) {
@@ -627,4 +835,50 @@ void loop() {
     g_lastPrintMs = nowMs;
     printState();
   }
+}
+
+// ---------------------------------------------------------------------------
+// setup / loop
+// ---------------------------------------------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Serial.println();
+  Serial.println("Air_Mouse - step 3: BLE HID mouse");
+  Serial.println("bus=Wire1 (SDA=D12, SCL=D11)  target=LSM6DS3TR-C @ 0x6A/0x6B");
+
+  imuPowerRailOn();
+  imuBus.begin();
+  imuBus.setClock(400000);
+
+  if (!imuFind()) {
+    Serial.println("imu=not-found (Sense board? rail powered? D12/D11 connected?)");
+    return;
+  }
+
+  if (!imuConfigure()) {
+    Serial.println("imu=config-failed");
+    g_imuAddress = 0;
+    return;
+  }
+
+  announceSensor();
+  calibrateGyroBias();
+
+  g_lastSampleUs = micros();
+  g_lastPrintMs  = millis();
+
+  // BLE starts last so the calibration instructions are on screen before the
+  // device becomes connectable.
+  hidBegin();
+  g_hidLastReportMs = millis();
+}
+
+void loop() {
+  // Both tasks run from one loop. The IMU side never blocks on the radio, and
+  // the HID side is a no-op until a host pairs.
+  imuTask();
+  hidTask(millis());
 }
