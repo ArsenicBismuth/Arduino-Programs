@@ -20,6 +20,20 @@
  *     sub-count remainder carries over and slow movement stays smooth.
  *   - If a report fails to go out, the motion behind it stays pending.
  *
+ * I2C resilience, which is what the sensor side is built around:
+ *   - A 12-byte burst is ~110 bit times, so a marginal bus drops the odd
+ *     transaction. That is a bus property, not a bug, and it must not be
+ *     treated as "the sensor is gone".
+ *   - Reads are retried, and a failure that already cost milliseconds (the
+ *     driver timeout) is not retried at all, because stacking more timeouts
+ *     only stalls the sample loop.
+ *   - A dropped sample is free: dt is measured, so the next good sample
+ *     integrates over its own interval.
+ *   - Only a sustained run of failures triggers anything, and even then it is
+ *     bus recovery plus a configuration re-check. The gyro bias is never
+ *     re-measured, because re-measuring it would mean asking the user to hold
+ *     the board still again in the middle of a session.
+ *
  * Step 2 added:
  *   - wider full scales and a faster ODR for pointer work: +/-4 g, +/-500 dps, 416 Hz.
  *     A quick wrist flick clips +/-2 g / 245 dps, which feels like the cursor
@@ -45,6 +59,7 @@
  *   roll_deg      roll about the pointing axis, from gravity (drift free)
  *   ptr_dps       roll-compensated pointer rates, (horizontal, vertical) in deg/s
  *   ptr_deg       those rates integrated, wrapped to +/-180 deg (the pointer movement)
+ *   read_err      failed I2C transactions / attempted, shown only once non-zero
  *
  * Before running: hold the board still, it measures the gyro bias first.
  * Then pair with "Air Mouse" from the host's Bluetooth settings.
@@ -97,6 +112,34 @@ static const float kAccelGPerLsb    = kAccelMgPerLsb / 1000.0f;
 // Data-ready bits in the status register.
 static const uint8_t kGyroDataReady  = 0x02;
 static const uint8_t kAccelDataReady = 0x01;
+
+// ---------------------------------------------------------------------------
+// I2C reliability
+// ---------------------------------------------------------------------------
+
+// The sensor's I2C ceiling. This bus is short, but the failure mode of a
+// marginal one (edge rates, coupling from the BLE transmitter) is a single
+// NACK that kills a whole multi-byte burst. If the log shows read errors, drop
+// this to 100000 before suspecting anything else in the code.
+static const uint32_t kImuI2cClockHz = 400000;
+
+// A burst of 12 bytes is ~110 bit times, so even a tiny per-bit error rate
+// shows up as an occasional dead transaction. That is a property of the bus,
+// not a bug, and it must not be treated as "the sensor is gone": retry before
+// believing it. Only quick failures are worth retrying -- a transaction that
+// already burned milliseconds hit the driver timeout, and stacking more of
+// those just stalls the sample loop.
+static const uint8_t  kImuReadAttempts  = 3;
+static const uint32_t kImuRetryGapUs    = 50;
+static const uint32_t kImuRetryBudgetUs = 3000;
+
+// Consecutive dead transactions before the bus is reset, and the number of
+// failed resets before the part is treated as genuinely lost and looked for
+// again. The gyro bias is never re-measured: it describes the part, and
+// re-measuring it needs the board held still, which is not something to demand
+// from the user mid-session.
+static const uint16_t kImuConsecFaultLimit = 32;
+static const uint8_t  kImuRecoverLimit     = 8;
 
 // ---------------------------------------------------------------------------
 // Axis mapping - the part you verify on hardware
@@ -192,6 +235,13 @@ static uint8_t g_whoAmI     = 0;
 static float g_gyroBiasDps[3] = {0.0f, 0.0f, 0.0f};
 static bool  g_biasValid      = false;
 
+// I2C health. These exist so the serial log can say whether the sensor is
+// babbling or gone, which are very different problems.
+static uint32_t g_imuReads        = 0;  // transactions attempted
+static uint32_t g_imuReadErrors   = 0;  // transactions that failed every retry
+static uint16_t g_imuConsecErrors = 0;  // consecutive failures, cleared by a success
+static uint8_t  g_imuRecoveries   = 0;  // failed bus resets since the last clean reply
+
 static uint32_t g_lastSampleUs = 0;
 static uint32_t g_lastPrintMs  = 0;
 static bool     g_filtersPrimed = false;
@@ -273,6 +323,79 @@ static float alphaFor(float tauMs, float dtSec) {
 // I2C helpers
 // ---------------------------------------------------------------------------
 
+// One raw read transaction. Its two phases fail for different reasons and the
+// distinction is the whole diagnosis, so they are reported separately:
+//   stage 1 - the register-address write (endTransmission(false))
+//   stage 2 - the data read (requestFrom)
+//   stage 3 - the driver returned fewer bytes than it promised
+static bool imuReadOnce(uint8_t reg, uint8_t* buffer, size_t length,
+                        uint8_t* stageOut, uint8_t* codeOut) {
+  imuBus.beginTransmission(g_imuAddress);
+  imuBus.write(reg);
+
+  const uint8_t writeCode = imuBus.endTransmission(false);  // repeated start
+  if (writeCode != 0) {
+    if (stageOut != nullptr) *stageOut = 1;
+    if (codeOut != nullptr) *codeOut = writeCode;
+    return false;
+  }
+
+  const uint8_t received =
+      imuBus.requestFrom(static_cast<int>(g_imuAddress), static_cast<int>(length));
+  if (received != static_cast<uint8_t>(length)) {
+    if (stageOut != nullptr) *stageOut = 2;
+    if (codeOut != nullptr) *codeOut = received;
+    return false;
+  }
+
+  for (size_t i = 0; i < length; ++i) {
+    if (imuBus.available() <= 0) {
+      if (stageOut != nullptr) *stageOut = 3;
+      if (codeOut != nullptr) *codeOut = 0;
+      return false;
+    }
+    buffer[i] = static_cast<uint8_t>(imuBus.read());
+  }
+  return true;
+}
+
+// Unwedge the bus. A slave interrupted mid-byte holds SDA low, and until it
+// sees clocks again no transaction can even start, so no amount of retrying
+// helps. Drive SCL by hand until it lets go, then hand the pins back.
+static void imuBusRecover() {
+  imuBus.end();
+
+  pinMode(PIN_WIRE1_SDA, INPUT_PULLUP);
+  pinMode(PIN_WIRE1_SCL, INPUT_PULLUP);
+  delayMicroseconds(10);
+
+  if (digitalRead(PIN_WIRE1_SDA) == LOW) {
+    pinMode(PIN_WIRE1_SCL, OUTPUT);
+    for (uint8_t i = 0; i < 9; ++i) {
+      digitalWrite(PIN_WIRE1_SCL, LOW);
+      delayMicroseconds(5);
+      digitalWrite(PIN_WIRE1_SCL, HIGH);
+      delayMicroseconds(5);
+    }
+
+    // A STOP, so the next START is unambiguous: SDA rises while SCL is high.
+    pinMode(PIN_WIRE1_SDA, OUTPUT);
+    digitalWrite(PIN_WIRE1_SDA, LOW);
+    delayMicroseconds(5);
+    digitalWrite(PIN_WIRE1_SCL, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(PIN_WIRE1_SDA, HIGH);
+    delayMicroseconds(5);
+  }
+
+  pinMode(PIN_WIRE1_SCL, INPUT);
+  pinMode(PIN_WIRE1_SDA, INPUT);
+
+  imuBus.begin();
+  imuBus.setClock(kImuI2cClockHz);
+  delay(1);  // let the re-enabled peripheral settle before trusting a reply
+}
+
 static bool imuWrite(uint8_t reg, uint8_t value) {
   imuBus.beginTransmission(g_imuAddress);
   imuBus.write(reg);
@@ -280,29 +403,52 @@ static bool imuWrite(uint8_t reg, uint8_t value) {
   return imuBus.endTransmission() == 0;
 }
 
+// Retrying wrapper around imuReadOnce. A dropped sample costs the pointer
+// nothing -- dt is measured, so the next good sample integrates over its own
+// interval -- so the priority here is that a transient failure stays
+// transient, not that it never happens.
 static bool imuRead(uint8_t reg, uint8_t* buffer, size_t length) {
   if (buffer == nullptr || length == 0) {
     return false;
   }
 
-  imuBus.beginTransmission(g_imuAddress);
-  imuBus.write(reg);
-  if (imuBus.endTransmission(false) != 0) {  // repeated start, keep the bus
-    return false;
-  }
+  ++g_imuReads;
 
-  if (imuBus.requestFrom(static_cast<int>(g_imuAddress), static_cast<int>(length)) !=
-      static_cast<int>(length)) {
-    return false;
-  }
+  uint8_t stage = 0;
+  uint8_t code  = 0;
+  const uint32_t startUs = micros();
 
-  for (size_t i = 0; i < length; ++i) {
-    if (imuBus.available() <= 0) {
-      return false;
+  for (uint8_t attempt = 0; attempt < kImuReadAttempts; ++attempt) {
+    if (imuReadOnce(reg, buffer, length, &stage, &code)) {
+      g_imuConsecErrors = 0;
+      return true;
     }
-    buffer[i] = static_cast<uint8_t>(imuBus.read());
+    if (micros() - startUs >= kImuRetryBudgetUs) {
+      break;  // slow failure: it was a timeout, more waits will not help
+    }
+    delayMicroseconds(kImuRetryGapUs);
   }
-  return true;
+
+  ++g_imuReadErrors;
+  if (g_imuConsecErrors < 0xFFFF) {
+    ++g_imuConsecErrors;
+  }
+
+  // Report the first failure and then every 200th, so a flaky bus is visible
+  // without burying the motion readout under it.
+  if (g_imuReadErrors == 1 || (g_imuReadErrors % 200) == 0) {
+    Serial.print("imu=read-error stage=");
+    Serial.print(stage);
+    Serial.print(" code=");
+    Serial.print(code);
+    Serial.print(" consec=");
+    Serial.print(g_imuConsecErrors);
+    Serial.print(" total=");
+    Serial.print(g_imuReadErrors);
+    Serial.print('/');
+    Serial.println(g_imuReads);
+  }
+  return false;
 }
 
 static bool imuReadU8(uint8_t reg, uint8_t* value) {
@@ -385,6 +531,43 @@ static bool imuConfigure() {
   return imuWrite(kRegCtrl2G, kCtrl2GValue);
 }
 
+// Recovery, and only recovery. Called once the failures stop looking like
+// glitches. Nothing here re-measures the bias or requires the board to be held
+// still; a bad -- or missing -- sensor should degrade, not demand attention.
+static void imuServiceFaults() {
+  if (g_imuConsecErrors < kImuConsecFaultLimit) {
+    return;
+  }
+  g_imuConsecErrors = 0;
+
+  Serial.println("imu=bus recovery");
+  imuBusRecover();
+
+  // A drooping rail can reset the part, so verify the configuration rather
+  // than assume the glitch was pure bus. The measured bias survives either
+  // way, because it describes the part and not the session.
+  uint8_t who   = 0;
+  uint8_t stage = 0;
+  uint8_t code  = 0;
+  if (imuReadOnce(kRegWhoAmI, &who, 1, &stage, &code) && who == kExpectedWhoAmI) {
+    g_imuRecoveries = 0;
+    return;
+  }
+
+  Serial.println("imu=reconfiguring after reset");
+  if (imuConfigure()) {
+    g_imuRecoveries = 0;
+    return;
+  }
+
+  // Repeated failed resets: stop pretending this is a transient and go back to
+  // discovery. imuTask re-runs imuFind/imuConfigure and keeps the old bias.
+  if (++g_imuRecoveries >= kImuRecoverLimit) {
+    g_imuRecoveries = 0;
+    g_imuAddress    = 0;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Gyro bias calibration
 // ---------------------------------------------------------------------------
@@ -396,6 +579,11 @@ static bool calibrateGyroBias() {
   Serial.print("Hold the board still, measuring gyro bias (");
   Serial.print(kCalibrationSamples);
   Serial.println(" samples)...");
+
+  // Count the reads that died while calibrating. This is the failure rate
+  // *before* the radio starts, which is what separates "the BLE transmitter is
+  // coupling into the bus" from "this bus was always marginal".
+  const uint32_t errorsBefore = g_imuReadErrors;
 
   for (uint8_t attempt = 1; attempt <= kCalibrationMaxAttempts; ++attempt) {
     double sumDps[3] = {0.0, 0.0, 0.0};
@@ -431,7 +619,9 @@ static bool calibrateGyroBias() {
     }
 
     if (collected < kCalibrationSamples / 4) {
-      Serial.println("calibration failed: IMU stopped responding");
+      Serial.print("calibration failed: IMU stopped responding (read_err=");
+      Serial.print(g_imuReadErrors - errorsBefore);
+      Serial.println(')');
       return false;
     }
 
@@ -457,7 +647,9 @@ static bool calibrateGyroBias() {
       Serial.print(',');
       Serial.print(g_gyroBiasDps[2], 2);
       Serial.print(" spread_dps=");
-      Serial.println(worstSpreadDps, 2);
+      Serial.print(worstSpreadDps, 2);
+      Serial.print(" read_err=");
+      Serial.println(g_imuReadErrors - errorsBefore);
       return true;
     }
 
@@ -623,7 +815,17 @@ static void printState() {
   Serial.print(" ptr_deg= ");
   Serial.print(g_ptrDeg[0], 1);
   Serial.print(' ');
-  Serial.println(g_ptrDeg[1], 1);
+  Serial.print(g_ptrDeg[1], 1);
+
+  // Only shown once the bus has actually misbehaved: 0/4823 means the sensor
+  // is talking cleanly, a rising count means it is not.
+  if (g_imuReadErrors != 0) {
+    Serial.print(" read_err= ");
+    Serial.print(g_imuReadErrors);
+    Serial.print('/');
+    Serial.print(g_imuReads);
+  }
+  Serial.println();
 }
 
 // ---------------------------------------------------------------------------
@@ -798,12 +1000,19 @@ static void imuTask() {
       g_filtersPrimed = false;
     } else {
       g_imuAddress = 0;
+      // Rate-limited: a sensor that is truly absent should say so once in a
+      // while rather than every second forever.
+      static uint8_t notFoundTries = 0;
+      if ((notFoundTries++ % 5) == 0) {
+        Serial.println("imu=not-found, retrying");
+      }
       delay(1000);
       return;
     }
   }
 
   if (!imuDataReady()) {
+    imuServiceFaults();
     delay(1);
     return;
   }
@@ -811,10 +1020,11 @@ static void imuTask() {
   int16_t gyroRaw[3];
   int16_t accelRaw[3];
   if (!imuReadSample(gyroRaw, accelRaw)) {
-    Serial.println("imu=burst-read-failed");
-    g_imuAddress = 0;
-    g_biasValid = false;
-    delay(250);
+    // A dropped sample costs nothing: dt is measured, so the next good sample
+    // integrates over its own interval. Tearing the sensor down here is what
+    // turned a routine bus glitch into an endless re-init-and-recalibrate loop.
+    imuServiceFaults();
+    delay(1);
     return;
   }
 
@@ -851,7 +1061,7 @@ void setup() {
 
   imuPowerRailOn();
   imuBus.begin();
-  imuBus.setClock(400000);
+  imuBus.setClock(kImuI2cClockHz);
 
   if (!imuFind()) {
     Serial.println("imu=not-found (Sense board? rail powered? D12/D11 connected?)");

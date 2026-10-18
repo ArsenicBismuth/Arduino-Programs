@@ -41,8 +41,11 @@ Open the Serial Monitor at **115200** baud. On boot the sketch:
 
 ```
 Hold the board still, measuring gyro bias (300 samples)...
-bias_dps=0.31,-0.12,0.44 spread_dps=1.20
+bias_dps=0.31,-0.12,0.44 spread_dps=1.20 read_err=0
 ```
+
+`read_err` is how many I2C reads failed while calibrating. It should be `0` here: this
+happens before the radio starts, so a non-zero value means the bus is marginal on its own.
 
 4. starts advertising:
 
@@ -70,10 +73,44 @@ While idle-rate logging is on, the sketch prints a debug view:
 | `roll_deg` | roll about the pointing axis, from gravity — absolute and drift-free |
 | `ptr_dps` | roll-compensated pointer rates, (horizontal, vertical), deg/s |
 | `ptr_deg` | those rates integrated — pointer movement so far, wrapped to ±180° |
+| `read_err` | failed I2C transactions / attempted. Hidden until it is non-zero |
 
 `accel_mg` and `gyro_raw_dps` are also implemented in `printState()` but are currently commented
 out; they are the fields to re-enable when working out `kPointAxis`. Printed at 20 Hz, which is a
 display rate only — the IMU is still read at its full 416 Hz.
+
+## I2C reliability
+
+A 12-byte burst is roughly 110 bit times. On a real bus a few of those transactions die — a NACK
+from a marginal edge, coupling from the radio, a slave that lost a bit. That is normal, and the
+sketch is built so it stays normal instead of escalating:
+
+- **Every read is retried** (`kImuReadAttempts`, 3). Failures only count if every attempt fails.
+- **Slow failures are not retried.** If a transaction already burned milliseconds, it hit the
+  driver's timeout; stacking more timeouts just stalls the sample loop (`kImuRetryBudgetUs`).
+- **A dropped sample is free.** `dt` is measured, not assumed, so the next good sample integrates
+  over its own interval. Nothing is torn down.
+- **Only a sustained run of failures does anything** (`kImuConsecFaultLimit`, 32 in a row). That
+  triggers bus recovery, then a check that the part still has its configuration. The gyro bias is
+  **never** re-measured — that would mean asking you to hold the board still again mid-session.
+- **Bus recovery is real recovery**: if the slave is holding SDA low, no transaction can even
+  start, so the pins are driven by hand until it lets go and only then handed back.
+
+Watch `read_err` in the log:
+
+| Symptom | Likely cause |
+| --- | --- |
+| `read_err=0` before pairing, stays 0 | clean |
+| `read_err` climbs, `stage=1` | the register-address write was NACKed — bus/electrical |
+| `read_err` climbs, `stage=2` | the data phase failed — bus/electrical |
+| `read_err` well above 0 and `imu=bus recovery` appears | lower `kImuI2cClockHz` to `100000` first |
+
+```cpp
+static const uint32_t kImuI2cClockHz = 400000;  // try 100000 if read_err climbs
+```
+
+400 kHz is the sensor's ceiling. A slower clock gives the lines time to settle, which is the first
+thing to try for a marginal bus — and, unlike everything else here, it costs nothing.
 
 ## HID transport
 
