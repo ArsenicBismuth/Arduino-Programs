@@ -87,15 +87,17 @@ optional.
 
 ## Serial output
 
-While idle-rate logging is on, the sketch prints a debug view:
+A debug view of the pipeline, at `kPrintIntervalMs`:
 
 ```
- roll_deg= -0.4 ptr_dps= -0.3 0.1 ptr_deg= -1.2 0.6
+ roll_deg= -94.6 ptr_dps= 0.0 0.0 ptr_deg= -3.4 -3.2 ci_ms= 15.0 tx_s= 7 align= 100
+ loop_hz= 728 i2c_us= 219 wait_us= 1208 imu_task_us= 1073 hid_task_us= 90 ev_hz= 66
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `roll_deg` | roll about the pointing axis, from gravity — absolute and drift-free |
+| `roll_deg` | roll about the aiming axis, from gravity — absolute and drift-free |
+| `accel_mg` / `plane_g` / `gyro` | raw gravity, the gravity landing in the assumed plane, and raw rates. Only printed with `kPrintAxisDiag` on: they are the axis-mapping toolkit, see [Axis mapping](#axis-mapping--verified-on-hardware) |
 | `ptr_dps` | roll-compensated pointer rates, (horizontal, vertical), deg/s, after the deadzone — so `0.0` at rest is the confirmation that nothing is creeping |
 | `ptr_deg` | those rates integrated — pointer movement so far, wrapped to ±180° |
 | `read_err` | failed I2C transactions / attempted. Hidden until it is non-zero |
@@ -108,10 +110,6 @@ While idle-rate logging is on, the sketch prints a debug view:
 | `imu_task_us` | average cost of the whole `imuTask()` half of the loop (status poll, sample read, motion update) |
 | `hid_task_us` | average cost of the whole `hidTask()` half |
 | `ev_hz` | connection events per second as counted by the loop. Should equal `1000 / ci_ms`; much higher means `millis()` is running fast |
-
-`accel_mg` and `gyro_raw_dps` are also implemented in `printState()` but are currently commented
-out; they are the fields to re-enable when working out `kPointAxis`. Printed at 10 Hz, which is a
-display rate only.
 
 The sensor runs at 416 Hz, but the *effective* sample rate is one sample per main loop pass, so
 `loop_hz=` is the number that matters. A sample that is not read before the next one lands is simply
@@ -208,23 +206,14 @@ slow rotation, so rotation slower than roughly a degree per second is partly abs
 purely a bias issue costs convergence time; the current `kBiasTrackingAlpha` settles the startup
 residual in a few seconds.
 
-The tracker removes the *mean* residual, which is what creep is. It does not remove the *instantaneous*
-noise around that mean, and the old magnitude-gated design hid that noise by accident: the same 1.5 °/s
-threshold that deadlocked also acted as a deadband, absorbing everything below it. With the gate gone,
-roughly ±0.5 °/s of rest noise reaches the pointer — about 8 counts/s, which the accumulator turns into
-a one-count shimmer at a few hertz.
-
-`kHidDeadzoneDps` puts a deliberate deadband back, sized to that noise. It is *soft*: below the
-threshold the axis is held at zero, above it the rate is reduced by exactly the threshold rather than
-truncated at it. Truncating would put a step at the boundary, so motion would have to cross the
-threshold before moving at all and would then start at full rate; subtracting keeps the response
-continuous and turns the cost into a constant rate offset instead of a lost band. The measured rest
-noise is the number to size it against, and `0.0f` disables it for the raw gyro straight through.
-
-The honest cost: a deliberate 1 °/s sweep loses 60 % of itself. That is still milder than the 1.5 °/s
-hard deadband the sketch used to have, but it is the setting to lower first if fine positioning feels
-heavy. Nothing here can give both a perfectly still cursor and full slow-motion gain — that is the
-gyro's precision floor, and the way out of it is a second sensor, not a constant.
+The tracker removes the *mean* residual, which is what creep is. It does not remove the instantaneous
+noise around it, and the old magnitude gate hid that by accident: the same 1.5 °/s threshold also acted
+as a deadband. `kHidDeadzoneDps` puts a deliberate one back, sized to the measured ±0.5 °/s of rest
+noise. It is *soft* — below the threshold the axis is held at zero, above it the rate is reduced by
+exactly the threshold rather than truncated at it, so the response stays continuous at the edge and the
+cost is a constant rate offset instead of a lost band. A deliberate 1 °/s sweep loses 60 % of itself;
+that is still milder than the old 1.5 °/s hard gate, and it is the first knob to lower if fine
+positioning feels heavy. `0.0f` disables it.
 
 ## HID transport
 
@@ -264,7 +253,7 @@ not ours to remove:
 | IMU sample period | 2.4 ms (416 Hz) | one sample per loop pass — 2.4 ms once `loop_hz` ≥ 416 |
 | Gyro low-pass (`kGyroFilterTauMs`) | ~8 ms | ~3 ms |
 | Report throttle | 30 ms fixed | aligned to the connection event, ≤ 5 ms |
-| Connection interval | 30–50 ms | the host decides; 30 ms on Android |
+| Connection interval | 30–50 ms | the host decides; 15 ms here, 30 ms is Android's default |
 | **Sketch-side total** | **~100 ms** | **~10–35 ms** |
 
 Printing is *not* on that list. `HardwareSerial::write()` copies into a TX ring buffer and only spins
@@ -298,52 +287,31 @@ The rules that produce the "Now" column:
   more often than the loop runs, and the IMU cannot be sampled more often either. If `loop_hz` is below
   `1000 / ci_ms`, the loop, not the link, is setting the update rate.
 - **The loop is worth watching, because the cost was not where it looked.** Connecting used to halve it,
-  724 → 357 Hz, with `hid_task_us` climbing 192 → 1297 µs. Nothing in `hidTask` is expensive enough to
-  explain that. The cause is one level down: every Bluefruit connection or security query
-  (`Bluefruit.connected()`, `Security.isEncrypted()`) begins with `serviceBluefruitBeforePollingState()`,
-  which runs `manager().idleService()` *and* dispatches deferred callbacks. That is the same work the
-  core already does once per pass, unconditionally, in `main()`'s `nrf54l15_clean_idle_service()` and
-  `yield()` — so asking three or four separate times a pass, at 350 passes a second, was pure
-  duplication of a live-link service routine. The link state and the connection interval change only on
-  connect, disconnect, pairing or a parameter update, so both are now polled on a timer and cached
-  (`kLinkPollMs`, `kConnPollMs`); the report path tests the cached value. Nothing starves, because the
-  core's own per-pass service runs regardless of what the sketch asks it. Measured effect:
-  `hid_task_us` 1297 → **90 µs**, a 14× cut. It is worth knowing that this cost is invisible in the
-  sketch's own source: nothing in `hidTask` looks expensive, and nothing in it is.
+  724 → 357 Hz, with `hid_task_us` jumping 192 → 1297 µs — and nothing in `hidTask` is expensive. The
+  cause is a level down: every Bluefruit connection or security query begins with
+  `serviceBluefruitBeforePollingState()`, which runs `manager().idleService()` and dispatches deferred
+  callbacks, which is the same work the core already does once per pass in `main()`'s
+  `nrf54l15_clean_idle_service()` and `yield()`. Asking three or four times a pass, 350 passes a second,
+  was pure duplication. Both states change only on connect, disconnect, pairing or a parameter update, so
+  they are now polled and cached (`kLinkPollMs`, `kConnPollMs`). Measured: `hid_task_us` 1297 → **90 µs**.
 - **The connection interval is the host's decision.** This is the one delay that cannot be designed
-  away. The interval is published at 7.5–15 ms through the standard GAP characteristic `0x2A04`
-  (Peripheral Preferred Connection Parameters), and the core's HAL also queues its own update request
-  when a host connects outside that range, but both are only *requests* — the central decides, and a
-  peripheral cannot force it.
-
-  Android's own defaults, from its stack documentation:
-
-  | Priority | Interval |
-  | --- | --- |
-  | `CONNECTION_PRIORITY_BALANCED` | 30–50 ms |
-  | `CONNECTION_PRIORITY_HIGH` | 11.25–15 ms |
-
-  `BALANCED` is what a GATT client gets by default, which is where `ci_ms= 30.0` comes from. `HIGH` is
-  only applied when a phone *app* calls `requestConnectionPriority(CONNECTION_PRIORITY_HIGH)`; a HID
-  peripheral has no way to ask for it. That is why a BLE mouse on Android does not feel like a wired
-  one, on any firmware.
-- **The driver asks once.** The core's HAL sends the update request and clears its pending flag on any
-  response, rejection included, and never retries. So the sketch walks a retry ladder
-  (`kConnEscalation`) that starts at 7.5–15 ms and ends squarely inside Android's `HIGH` band, in case
-  a host only accepts a range it already supports.
-- **Pairing is not starved by a short interval.** The core's HID example advertises 30–50 ms so that
-  LE Secure Connections has CPU between connection events, but that reasoning does not hold here: the
-  software P-256 keypair generation runs in the deferred background service
-  (`BleRadio::ensureSecureConnectionsLocalKeypair`), outside the connection event. A 4 s grace period
-  still watches for a host that stalls, and backs the interval off if one does
-  (`kPairingGraceMs`, `hid=pairing-slow`).
-- **Trust but verify.** The periodic line reports `ci_ms=` (the interval the host actually settled on)
-  and `tx_s=` (the pointer update rate it produces). `tx_s=` should track `1000 / ci_ms`; if it is well
-  below that, something is dropping reports. `ci_ms= 30.0` with `tx_s= 33` means the host overruled the
-  request, and that is the floor this design can reach. `align=` and `loop_hz=` then say which side is
-  limiting: a low `align=` with `loop_hz` below `1000 / ci_ms` means the main loop, not the link.
-- **Every millisecond of filter tau is a millisecond of lag** added to the whole chain, which is why
-  the gyro filter is short. It is not free: lowering it further trades smoothness for response.
+  away. The interval is published at 7.5–15 ms through GAP characteristic `0x2A04`, and the core's HAL
+  queues its own update request too, but both are only *requests* — the central decides. Android's
+  defaults are `CONNECTION_PRIORITY_BALANCED` at 30–50 ms, which is what a GATT client gets, and
+  `CONNECTION_PRIORITY_HIGH` at 11.25–15 ms, which is only applied when a phone *app* asks for it. A HID
+  peripheral cannot, which is why a BLE mouse does not feel like a wired one, on any firmware.
+- **The driver asks once**, clearing its pending flag on any response, rejection included, so the sketch
+  walks a retry ladder (`kConnEscalation`) from 7.5–15 ms towards Android's `HIGH` band in case a host
+  only accepts a range it already supports.
+- **Pairing is not starved by a short interval.** The core's HID example advertises 30–50 ms so LE Secure
+  Connections has CPU between events, but the software P-256 keypair generation runs in the deferred
+  background service, outside the connection event. A 4 s grace period still watches for a host that
+  stalls and backs the interval off (`kPairingGraceMs`, `hid=pairing-slow`).
+- **Trust but verify.** `ci_ms=` is the interval the host actually settled on and `tx_s=` the update rate
+  it produces; `tx_s=` should track `1000 / ci_ms`. `align=` and `loop_hz=` then say which side is
+  limiting — a low `align=` with `loop_hz` below `1000 / ci_ms` means the main loop, not the link.
+- **Every millisecond of filter tau is a millisecond of lag**, which is why the gyro filter is short. It
+  is not free: lowering it further trades smoothness for response.
 
 What is left after this is not in the sketch: one connection interval of transmission delay is
 inherent to BLE, and the host's own input pipeline (Android's `InputReader` → `InputDispatcher` →
@@ -404,20 +372,37 @@ Gotcha: the LSM6DS3 family encodes `FS_XL` as `00`=±2 g, `01`=±16 g, `10`=±4 
 | `kBiasTrackingAlpha` | 0.005 | Continuous re-zero while still. Set to 0 to disable |
 | `kStillMinDot` / `kStillAccelTolG` | 0.999945 / 0.08 | How still the gravity direction and magnitude must be before re-zeroing |
 | `kPrintIntervalMs` | 100 | Display rate only. Printing is ring-buffered, so this is not a latency knob |
+| `kPrintAxisDiag` | false | Adds `accel_mg`, `plane_g` and `gyro` to the line — for identifying `kPointAxis`, see [Axis mapping](#axis-mapping--verified-on-hardware) |
 
-### Axis mapping — tune this on hardware
+### Axis mapping — verified on hardware
 
-The sensor axes are fixed by how the chip sits on the board, so the sketch exposes the mapping
-instead of guessing:
+The sensor axes are fixed by how the chip sits on the board, so the sketch exposes the mapping rather
+than guessing. Measured on this board, lying flat and aimed at a standing phone:
 
-- `kPointAxis` — which body axis points at the screen. **To find it:** re-enable `accel_mg`, point the
-  device at the screen in your normal grip, and pick the axis reading near 0 mg, because gravity is
-  perpendicular to it.
-- `kPointerHorizontalSign` / `kPointerVerticalSign` — flip if the pointer moves the wrong way. As
-  verified on the current board: horizontal is `-1.0f` (it was inverted), vertical is `1.0f`.
+| Reading | Value |
+| --- | --- |
+| `accel_mg` at rest | `(-84, -111, 1037)` — gravity is on **Z**, so Z is the board *normal*, not the aiming axis |
+| twist about the aiming axis, aim held fixed | ~65° of rotation about **Y**, X swinging 0 → −1 g and Z 1 g → 0.4 g |
+| therefore | `kPointAxis = kPointAxisY` |
+
+Both pointer signs are `-1.0f`, verified on hardware once the axes were corrected.
+
+**Redoing this for a different mounting.** Set `kPrintAxisDiag = true` and read two things: hold still
+and find the `accel_mg` axis near ±1000 (that axis is vertical, so it cannot be the aiming axis), then
+perform each gesture while watching `gyro` — the component that responds is the axis the gesture turns
+about. `plane_g` should read ≈ 1.00 once the aiming axis is right; near 0 means it is still wrong.
+
+**Why it was wrong for so long, and why it did not look like an axis bug.** With Z as the aiming axis, a
+device lying flat is *pointing at the floor* as far as the sketch is concerned — the singular pose.
+Gravity fell outside the assumed plane and `plane_g` sat at `0.13–0.14`, just under
+`kMinGravityInPlaneG`, so the roll reference flickered in and out of tracking instead of failing
+cleanly. The pointer axes degraded to an arbitrary fixed pair of body axes: yawing (about Z) went to the
+discarded channel and did nothing, while twisting (about Y) landed on an in-plane axis and appeared to
+work. The report *"rolling works much better than yawing"* was itself the proof — in a correct mapping
+that is impossible, because rotation about the aiming axis is discarded by construction.
 
 Everything downstream of the axis choice is orientation-independent: roll comes from gravity in the
-plane perpendicular to the pointing axis, so it works whatever the mounting.
+plane perpendicular to the aiming axis.
 
 ## Why there is no sensor fusion
 
@@ -449,13 +434,11 @@ rolls.
 - A gyro cannot separate a small bias from a very slow rotation. Motion below roughly 1 °/s is therefore
   partly absorbed by the bias tracker and the deadzone. That is the sensor's precision floor, not a
   tuning failure: getting below it needs a different sensor, not a different constant.
-- `kPointAxis` is still unverified on hardware; the pointer signs were verified on the current board.
 
 ## Next steps
 
-1. Verify `kPointAxis` on real hardware (re-enable `accel_mg`).
-2. Add a pointer-acceleration curve, per report rather than per sample, so slow movement stays precise
+1. Add a pointer-acceleration curve, per report rather than per sample, so slow movement stays precise
    while fast sweeps cover more ground without a bigger fixed gain. The per-sample soft deadzone is
    already in place (`kHidDeadzoneDps`).
-3. Move the sampling path to the sensor FIFO so the effective sample rate no longer depends on how
+2. Move the sampling path to the sensor FIFO so the effective sample rate no longer depends on how
    long the loop takes.

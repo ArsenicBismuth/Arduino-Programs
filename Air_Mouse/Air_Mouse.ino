@@ -1,65 +1,49 @@
 /*
- * Air_Mouse - Step 3: BLE HID mouse
+ * Air_Mouse - BLE HID air mouse
  *
  * Board : Seeed XIAO nRF54L15 / Sense
  * Core  : lolren/nrf54-arduino-core  (board "XIAO nRF54L15 / Sense", variant xiao_nrf54l15)
  * IMU   : ST LSM6DS3TR-C on the back-pad bus, exposed as Wire1 (SDA = D12, SCL = D11), addr 0x6A
  *
- * Step 3 adds BLE HID: the pointer rates now drive a real Bluetooth mouse that
- * Android sees as an ordinary input device. Press the onboard button for a left
- * click. The IMU pipeline is untouched, the HID layer only consumes its output.
+ * The gyro rate about world-vertical becomes horizontal pointer motion, the rate
+ * about the screen-horizontal axis becomes vertical motion, and rotation about
+ * the aiming axis is discarded. Roll compensation rotates the two in-plane rates
+ * by the roll angle gravity measures, so the pointer axes stay aligned with the
+ * screen however the device is banked. The onboard button is a left click.
  *
- * The transport rules that matter, and that the code below follows:
- *   - Reports are only accepted once the link is encrypted, so the device must
- *     pair first (Just Works, NoInputNoOutput - a mouse has no keypad).
- *   - Motion is accumulated in degrees at the full 416 Hz and converted to
- *     counts only when a report is actually sent. Sending at the IMU rate would
- *     just queue notifications and add latency.
- *   - HID relative X/Y are signed 8-bit, so a delta is clamped to +/-127.
- *     Only what was really sent is subtracted from the accumulator, so the
- *     sub-count remainder carries over and slow movement stays smooth.
- *   - If a report fails to go out, the motion behind it stays pending.
+ * What it deliberately does not do: there is no magnetometer on this part, so
+ * there is no absolute yaw, and no quaternion/Kalman fusion is used. Fusion is
+ * irrelevant to a relative pointer and would not fix yaw drift anyway.
+ *
+ * HID transport rules the code follows:
+ *   - Reports are only accepted on an encrypted link, so the device must pair
+ *     first (Just Works, NoInputNoOutput - a mouse has no keypad).
+ *   - Motion is accumulated in degrees and converted to counts only when a
+ *     report is actually sent. Sending at the IMU rate would just queue
+ *     notifications and add latency.
+ *   - HID relative X/Y are signed 8-bit, so a delta is clamped to +/-127. Only
+ *     what was really sent is subtracted, so the sub-count remainder carries
+ *     over and slow movement stays smooth.
+ *   - One report per connection event, handed over just before the event.
  *
  * I2C resilience, which is what the sensor side is built around:
  *   - A 12-byte burst is ~110 bit times, so a marginal bus drops the odd
- *     transaction. That is a bus property, not a bug, and it must not be
- *     treated as "the sensor is gone".
- *   - Reads are retried, and a failure that already cost milliseconds (the
- *     driver timeout) is not retried at all, because stacking more timeouts
- *     only stalls the sample loop.
+ *     transaction. That is a bus property, not a bug, and must not be treated
+ *     as "the sensor is gone".
+ *   - Reads are retried, except a failure that already cost milliseconds (the
+ *     driver timeout), because stacking more timeouts only stalls the loop.
  *   - A dropped sample is free: dt is measured, so the next good sample
  *     integrates over its own interval.
  *   - Only a sustained run of failures triggers anything, and even then it is
  *     bus recovery plus a configuration re-check. The gyro bias is never
- *     re-measured, because re-measuring it would mean asking the user to hold
- *     the board still again in the middle of a session.
+ *     re-measured: that would mean asking the user to hold still mid-session.
  *
- * Step 2 added:
- *   - wider full scales and a faster ODR for pointer work: +/-4 g, +/-500 dps, 416 Hz.
- *     A quick wrist flick clips +/-2 g / 245 dps, which feels like the cursor
- *     "sticking" at full speed.
- *   - gyro bias calibration at startup, so a still hand does not make the
- *     cursor creep. The dominant error source in an air mouse is not noise,
- *     it is bias.
- *   - a slow bias tracker that keeps re-zeroing while the device is held still.
- *   - roll compensation: the accelerometer's gravity vector gives the roll of
- *     the device about its pointing axis, which is used to rotate the gyro
- *     rates into screen-aligned horizontal/vertical pointer rates.
+ * Sensor: +/-4 g, +/-500 dps, 416 Hz. A quick wrist flick clips +/-2 g / 245 dps,
+ * which feels like the cursor sticking at full speed. The dominant error source
+ * in an air mouse is bias, not noise, hence startup calibration plus a slow
+ * tracker that keeps re-zeroing while the device is held still.
  *
- * What this deliberately does NOT do:
- *   - No magnetometer exists on this part, so there is no absolute yaw. The
- *     integrated pointer angles are relative and drift; that is fine, because a
- *     mouse is a relative device.
- *   - No quaternion/Kalman fusion. It is not needed for a relative pointer, and
- *     it would not fix yaw drift anyway.
- *
- * Serial output at 115200 is a debug view of the pipeline:
- *   accel_mg      instantaneous accel, body X,Y,Z in milli-g
- *   gyro_raw_dps  instantaneous bias-corrected gyro, body X,Y,Z in deg/s
- *   roll_deg      roll about the pointing axis, from gravity (drift free)
- *   ptr_dps       roll-compensated pointer rates, (horizontal, vertical) in deg/s
- *   ptr_deg       those rates integrated, wrapped to +/-180 deg (the pointer movement)
- *   read_err      failed I2C transactions / attempted, shown only once non-zero
+ * Serial output at 115200 is a debug view; the fields are documented in README.md.
  *
  * Before running: hold the board still, it measures the gyro bias first.
  * Then pair with "Air Mouse" from the host's Bluetooth settings.
@@ -165,21 +149,44 @@ static const uint16_t kImuConsecFaultLimit = 32;
 static const uint8_t  kImuRecoverLimit     = 8;
 
 // ---------------------------------------------------------------------------
-// Axis mapping - the part you verify on hardware
+// Axis mapping - measured on this board
 // ---------------------------------------------------------------------------
 
-// Which body axis points at the screen when the device is held naturally.
-// To find it: point the device at the screen and look at accel_mg. The pointing
-// axis is the one reading close to 0 mg (gravity is perpendicular to it).
+// Which body axis aims at the screen when the device is held naturally.
+//
+// Determined on hardware, not assumed. With the board lying flat and aimed at a
+// standing phone, a still reading is accel_mg= (-84, -111, 1037): gravity is on
+// Z, so Z is the board *normal*, not the aiming direction. The aiming axis is
+// horizontal and must read near 0 mg, which leaves X or Y. It is Y -- twisting
+// the device about its aiming axis, with the aim held fixed, shows up as a
+// ~65 degree rotation about Y, with X swinging 0 -> -1 g and Z 1 g -> 0.4 g,
+// while the aim itself does not move.
+//
+// This was Z for a long time and the failure was anything but obvious. With the
+// aiming axis on the board normal, a device lying flat is "pointing at the
+// floor" as far as the sketch is concerned, which is the singular pose: gravity
+// falls outside the assumed plane, plane_g sat at 0.13-0.14 -- just under
+// kMinGravityInPlaneG, so it flickered in and out of tracking -- and the roll
+// reference was mostly frozen. The pointer axes then became an arbitrary fixed
+// pair of body axes, which is exactly the reported symptom: yawing (about Z)
+// went to the discarded channel and did nothing, while twisting (about Y) landed
+// on an in-plane axis and appeared to work.
+//
+// plane_g is the tell. A correct aiming axis gives ~1.00 in any normal grip,
+// because aiming at a screen keeps gravity perpendicular to the aiming axis.
+// Near zero means this constant is wrong, or the device really is pointed at the
+// ceiling.
 enum PointAxis : uint8_t { kPointAxisX, kPointAxisY, kPointAxisZ };
-static const PointAxis kPointAxis = kPointAxisZ;
+static const PointAxis kPointAxis = kPointAxisY;
 
-// Flip these if the pointer moves the wrong way. Start here, then tune on hardware.
+// Pointer direction, verified on hardware against kPointAxisY. Both axes came out
+// inverted in the HID report convention, which is plausible a priori: the report's
+// X/Y are relative to the screen, while these rates are rotation of the device.
 static const float kPointerHorizontalSign = -1.0f;
-static const float kPointerVerticalSign   = 1.0f;
+static const float kPointerVerticalSign   = -1.0f;
 
 // The roll reference is only meaningful while gravity projects into the plane
-// around the pointing axis. Pointing steeply up or down makes it ill-defined,
+// around the aiming axis. Pointing steeply up or down makes it ill-defined,
 // so the last good value is held below this magnitude.
 static const float kMinGravityInPlaneG = 0.15f;
 
@@ -224,6 +231,13 @@ static const float kGravityFilterTauMs = 50.0f;  // ~3 Hz cutoff
 // core Serial writes block until the DMA transmit finishes, so every printed
 // line is time the pointer cannot report in.
 static const uint32_t kPrintIntervalMs = 100;  // 10 Hz
+
+// Adds accel_mg, plane_g and gyro to the periodic line: raw gravity, the gravity
+// that lands in the plane assumed perpendicular to kPointAxis, and raw rates. Off
+// because it is a per-board identification aid, not a runtime reading; turn it on
+// to work out or re-check kPointAxis, then turn it back off. Method is in the
+// README under "Axis mapping".
+static const bool kPrintAxisDiag = false;
 
 // ---------------------------------------------------------------------------
 // HID transport
@@ -394,7 +408,7 @@ static bool     g_filtersPrimed = false;
 
 // Filter state.
 static float g_gyroDps[3]      = {0.0f, 0.0f, 0.0f};  // bias-corrected, filtered, body axes
-static float g_planeAccelG[2]  = {0.0f, 1.0f};        // filtered gravity in the pointing plane
+static float g_planeAccelG[2]  = {0.0f, 1.0f};        // filtered gravity in the aiming plane
 static float g_accelMg[3]      = {0.0f, 0.0f, 0.0f};  // instantaneous, body axes
 
 // Outputs.
@@ -886,7 +900,7 @@ static bool calibrateGyroBias() {
 // ---------------------------------------------------------------------------
 
 // Pull the two rate axes and the two gravity axes that lie in the plane
-// perpendicular to the pointing axis. The pair is ordered so that
+// perpendicular to the aiming axis. The pair is ordered so that
 // (A, B, point) is right handed, which is what makes the signs below stable.
 static void extractPlane(const float vec3[3], float out2[2]) {
   switch (kPointAxis) {
@@ -990,7 +1004,7 @@ static void updateMotion(const int16_t gyroRaw[3], const int16_t accelRaw[3], fl
     g_stillCount = 0;
   }
 
-  // 4. Gravity in the pointing plane, low-passed hard. Accelerometer output
+  // 4. Gravity in the aiming plane, low-passed hard. Accelerometer output
   //    points along world-up when the device is not accelerating, so this is
   //    an absolute (drift-free) roll reference.
   float planeAccelRaw[2];
@@ -1004,7 +1018,7 @@ static void updateMotion(const int16_t gyroRaw[3], const int16_t accelRaw[3], fl
                                g_planeAccelG[1] * g_planeAccelG[1]);
   if (planeMag >= kMinGravityInPlaneG) {
     // psi is the angle of world-up inside the plane, i.e. the roll of the
-    // device about its pointing axis. g_rollDeg is reported relative to the
+    // device about its aiming axis. g_rollDeg is reported relative to the
     // pose where the plane's second axis points straight up.
     g_rollRad = atan2f(g_planeAccelG[1], g_planeAccelG[0]);
     g_rollDeg = wrap180(g_rollRad * kRadToDeg - 90.0f);
@@ -1063,19 +1077,27 @@ static void updateMotion(const int16_t gyroRaw[3], const int16_t accelRaw[3], fl
 static uint16_t hidConnIntervalUnits();
 
 static void printState() {
-  // Serial.print("accel_mg=");
-  // Serial.print(g_accelMg[0], 1);
-  // Serial.print(',');
-  // Serial.print(g_accelMg[1], 1);
-  // Serial.print(',');
-  // Serial.print(g_accelMg[2], 1);
+  if (kPrintAxisDiag) {
+    Serial.print("accel_mg= ");
+    Serial.print(g_accelMg[0], 0);
+    Serial.print(',');
+    Serial.print(g_accelMg[1], 0);
+    Serial.print(',');
+    Serial.print(g_accelMg[2], 0);
 
-  // Serial.print(" gyro_raw_dps=");
-  // Serial.print(g_gyroDps[0], 1);
-  // Serial.print(',');
-  // Serial.print(g_gyroDps[1], 1);
-  // Serial.print(',');
-  // Serial.print(g_gyroDps[2], 1);
+    Serial.print(" plane_g= ");
+    Serial.print(sqrtf(g_planeAccelG[0] * g_planeAccelG[0] +
+                       g_planeAccelG[1] * g_planeAccelG[1]),
+                 2);
+
+    Serial.print(" gyro= ");
+    Serial.print(g_gyroDps[0], 1);
+    Serial.print(',');
+    Serial.print(g_gyroDps[1], 1);
+    Serial.print(',');
+    Serial.print(g_gyroDps[2], 1);
+    Serial.print(' ');
+  }
 
   Serial.print(" roll_deg= ");
   Serial.print(g_rollDeg, 1);
@@ -1600,7 +1622,7 @@ void setup() {
   delay(300);
 
   Serial.println();
-  Serial.println("Air_Mouse - step 3: BLE HID mouse");
+  Serial.println("Air_Mouse - BLE HID air mouse");
   Serial.println("bus=Wire1 (SDA=D12, SCL=D11)  target=LSM6DS3TR-C @ 0x6A/0x6B");
 
   imuPowerRailOn();
