@@ -72,6 +72,11 @@
 #include <math.h>
 #include <bluefruit.h>
 
+// For Bluefruit.rawRadio().getConnectionTimingSnapshot(), which is how the
+// report gets aligned with the connection event. bluefruit.h only forward
+// declares the radio, so the definition has to be pulled in explicitly.
+#include <nrf54l15_hal.h>
+
 // ---------------------------------------------------------------------------
 // Board wiring
 // ---------------------------------------------------------------------------
@@ -152,7 +157,7 @@ enum PointAxis : uint8_t { kPointAxisX, kPointAxisY, kPointAxisZ };
 static const PointAxis kPointAxis = kPointAxisZ;
 
 // Flip these if the pointer moves the wrong way. Start here, then tune on hardware.
-static const float kPointerHorizontalSign = 1.0f;
+static const float kPointerHorizontalSign = -1.0f;
 static const float kPointerVerticalSign   = 1.0f;
 
 // The roll reference is only meaningful while gravity projects into the plane
@@ -181,7 +186,7 @@ static const float    kBiasTrackingAlpha = 0.02f;
 // corrupted by hand acceleration). Every millisecond of tau here is a
 // millisecond of pointer lag added to the whole chain, so the gyro filter is
 // kept short: at 416 Hz, 4 ms is still ~20 samples of averaging.
-static const float kGyroFilterTauMs    = 4.0f;   // ~40 Hz cutoff
+static const float kGyroFilterTauMs    = 3.0f;   // ~53 Hz cutoff
 static const float kGravityFilterTauMs = 50.0f;  // ~3 Hz cutoff
 
 // Display rate. This is not the sampling rate: the IMU is still read at its
@@ -196,36 +201,96 @@ static const uint32_t kPrintIntervalMs = 100;  // 10 Hz
 
 static const char kDeviceName[] = "Air Mouse";
 
-// Pointer gain: HID counts per degree of rotation. Sensible starting point;
-// hosts apply their own pointer acceleration on top of this.
-static const float kHidCountsPerDeg = 6.0f;
+// Pointer gain: HID counts per degree of rotation. Hosts apply their own
+// pointer acceleration on top of this, so it only sets the base sensitivity.
+//
+// It is bounded from above by the report format rather than by feel: one report
+// carries at most +/-127 counts (signed 8-bit), so the gain has to satisfy
+//
+//   gain <= 127 / (max_hand_rate_dps * report_period_s)
+//
+// for the fastest motion you actually use. A quick wrist flick is around
+// 500 deg/s, and the link's report period is at best ~15 ms, which gives
+//
+//   gain <= 127 / (500 * 0.015) = 16.9
+//
+// Above that the report saturates and the leftover motion has to drain over the
+// next few reports -- which is precisely the lag this sketch exists to remove.
+// Raising this trades fine control for speed, not resolution for resolution.
+static const float kHidCountsPerDeg = 16.0f;
 
-// Report cadence is derived from the link rather than fixed: one report per
+// Report cadence comes from the link, not from a timer: one report per
 // connection event. Sending faster does not reduce latency, it only stacks
 // notifications behind each other, and that queue *is* the latency. These
-// bounds only guard the arithmetic.
+// bounds only guard the arithmetic on the fallback path.
 static const uint32_t kHidReportFallbackMs = 15;  // before the interval is known
 static const uint32_t kHidReportFloorMs    = 5;
 static const uint32_t kHidReportCeilMs     = 50;
 
-// Connection interval, in 1.25 ms units. Two phases, because pairing and
-// pointing want opposite things:
-//   pairing - LE Secure Connections runs a software P-256 exchange and needs
-//             CPU between connection events. The core's own HID example uses
-//             30-50 ms here for exactly that reason, so start there.
-//   running - once the link is encrypted there is nothing left to carry but
-//             pointer data, and the interval is most of the end-to-end
-//             latency. 7.5-15 ms is the band the core's NUS transport asks
-//             for, so it is known to work with real centrals on this stack.
-static const uint16_t kConnIntervalPairMin = 24;  // 30 ms
-static const uint16_t kConnIntervalPairMax = 40;  // 50 ms
-static const uint16_t kConnIntervalRunMin  = 6;   // 7.5 ms
-static const uint16_t kConnIntervalRunMax  = 12;  // 15 ms
+// How long before the next connection event the report is handed to the radio.
+// It has to clear two things: the main loop's own polling granularity (~1 ms,
+// from the idle sleep in imuTask) and the radio's pre-roll, which starts
+// spinning kBleConnRxStartLeadUs (2.2 ms) plus kBleConnAnchorPrewaitUs before
+// the anchor and blocks the loop from then on. Miss the window and the report
+// waits a whole interval for the next event, so it is deliberately generous
+// against intervals of 7.5 ms and up.
+static const uint32_t kHidSendLeadUs = 5000;
+
+// Connection interval, in 1.25 ms units. A report cannot reach the host sooner
+// than the next connection event, so this sets the floor on latency and the
+// ceiling on the update rate. It is the single most valuable knob here.
+//
+// 7.5-15 ms is the band the core's own NUS transport asks for. The core's HID
+// example uses 30-50 ms so that secure pairing has CPU between connection
+// events, but that does not apply here: the P-256 keypair generation runs in
+// the deferred background service (BleRadio::ensureSecureConnectionsLocalKeypair),
+// not inside the connection event, so a short interval cannot starve it.
+//
+// It is published through the standard GAP characteristic 0x2A04, which hosts
+// read during service discovery, and the HAL also queues an update request by
+// itself if the host connects outside this range. Both are only requests: the
+// central decides. Android's own defaults, per its stack documentation, are
+//
+//   CONNECTION_PRIORITY_BALANCED  30-50 ms     <- what a generic client uses
+//   CONNECTION_PRIORITY_HIGH      11.25-15 ms  <- what a phone app must ask for
+//
+// and a HID peripheral has no say in which applies. So the retries below walk
+// towards the HIGH band rather than repeating one range, in case a host only
+// accepts a request that lands inside the band it actually supports.
+static const uint16_t kConnIntervalMin = 6;   // 7.5 ms
+static const uint16_t kConnIntervalMax = 12;  // 15 ms
+
+// If the link has not finished pairing within this long, hand the host a slower
+// interval to pair against and stop asking for a fast one. A link that comes up
+// at all matters more than its latency.
+static const uint32_t kPairingGraceMs          = 4000;
+static const uint16_t kConnIntervalFallbackMin = 24;  // 30 ms
+static const uint16_t kConnIntervalFallbackMax = 40;  // 50 ms
+
+// Retry ladder for the interval, tried in order, a couple of attempts each. The
+// core's HAL sends the update request once and clears its pending flag on any
+// response, rejection included, so a request that lands badly is final as far
+// as the driver is concerned.
+struct ConnIntervalAttempt { uint16_t minUnits; uint16_t maxUnits; };
+static const ConnIntervalAttempt kConnEscalation[] = {
+    {6, 12},   // 7.5-15 ms, the band the core's NUS transport uses
+    {9, 12},   // 11.25-15 ms, exactly Android's CONNECTION_PRIORITY_HIGH band
+    {12, 12},  // 15 ms, in case only a single value is accepted
+};
+static const uint8_t  kConnEscalationSteps = 3;
+static const uint8_t  kConnAttemptsPerStep = 2;   // 6 attempts in total
+static const uint32_t kConnRetryGapMs      = 1000;
+static const uint32_t kConnFastThresholdMs = 20;  // at or below this is "fast"
 
 // Cap on unreported motion. If the link stalls for a second, an uncapped
 // accumulator would keep the cursor moving after the hand has stopped. Past
 // this the backlog is dropped instead.
-static const float kHidPendingCapDeg = 45.0f;
+//
+// Kept close to one report's worth (127 counts / kHidCountsPerDeg ~= 8 deg) so
+// that even a full backlog drains in a report or two rather than sliding on for
+// several. A larger cap here costs nothing in normal use and adds tail lag
+// exactly when the link is already struggling.
+static const float kHidPendingCapDeg = 16.0f;
 
 // Onboard button, active low, as left click.
 static const uint8_t  kButtonPin        = PIN_BUTTON;
@@ -290,10 +355,27 @@ static uint32_t g_hidLastReportMs = 0;
 static uint32_t g_hidLastKeepaliveMs = 0;
 static uint8_t  g_hidLastButtons  = 0;
 
-// The fast connection interval is requested once per connection, after the
-// link is encrypted. Requesting it repeatedly would queue an update request
-// on every pass.
-static bool g_hidRunParamsRequested = false;
+// Connection-event alignment: the counter identifies which event is coming, so
+// one report can be sent per event regardless of how the main loop's timing
+// happens to line up with the radio's.
+static uint16_t g_hidEventCounter  = 0;
+static bool     g_hidSentThisEvent = false;
+
+// Reporting statistics, for the periodic line. The effective rate is the thing
+// that decides whether the pointer feels smooth, so it is worth being able to
+// read it back rather than inferring it from the interval.
+static uint32_t g_hidReportCount    = 0;  // successful reports, ever
+static uint32_t g_hidValveCount     = 0;  // times the safety valve had to fire
+static uint32_t g_hidRateWindowMs   = 0;
+static uint32_t g_hidRateWindowBase = 0;
+static uint32_t g_hidRatePerSec     = 0;
+
+// Connection-interval negotiation state, all reset per connection.
+static uint32_t g_hidConnectedMs   = 0;      // when the link came up
+static uint32_t g_hidConnRetryMs   = 0;      // last time we asked for a fast one
+static uint8_t  g_hidConnRetries   = 0;
+static bool     g_hidConnSlowdown  = false;  // pairing grace expired, gave up
+static bool     g_hidConnFastSeen  = false;  // logged that the host complied
 
 // Debounced button state (see hidPollButton).
 static bool     g_buttonRaw      = false;
@@ -847,11 +929,32 @@ static void printState() {
   }
 
   // The connection interval is the floor on pointer latency, so it is worth
-  // watching: 15 ms means the fast request was accepted, 30-50 ms means the
-  // host ignored it. Shown only once a connection exists.
-  if (g_hidRunParamsRequested) {
+  // watching: a few milliseconds means the host took the advertised fast
+  // interval, 30-50 ms means it overrode us. Shown only once a connection
+  // exists.
+  if (g_hidConnectedMs != 0U) {
     Serial.print(" ci_ms= ");
     Serial.print(static_cast<float>(hidConnIntervalUnits()) * 1.25f, 1);
+
+    // Effective reports per second, averaged over a second. It should track
+    // 1000 / ci_ms; well below that means reports are being missed somewhere.
+    const uint32_t rateNowMs = millis();
+    const uint32_t rateElapsedMs = rateNowMs - g_hidRateWindowMs;
+    if (rateElapsedMs >= 1000U) {
+      g_hidRatePerSec =
+          (g_hidReportCount - g_hidRateWindowBase) * 1000U / rateElapsedMs;
+      g_hidRateWindowBase = g_hidReportCount;
+      g_hidRateWindowMs = rateNowMs;
+    }
+    Serial.print(" tx_s= ");
+    Serial.print(g_hidRatePerSec);
+
+    // Only shown once it has happened: a rising count means the send window is
+    // being missed and the fallback is doing the work.
+    if (g_hidValveCount != 0U) {
+      Serial.print(" valve= ");
+      Serial.print(g_hidValveCount);
+    }
   }
 
   Serial.println();
@@ -864,8 +967,15 @@ static void printState() {
 static void hidConnectCallback(uint16_t connHandle) {
   (void)connHandle;
   Serial.println("ble=connected, pairing");
-  // A fresh connection starts at the pairing interval again.
-  g_hidRunParamsRequested = false;
+  g_hidConnectedMs  = millis();
+  g_hidConnRetries  = 0;
+  g_hidConnRetryMs  = 0;
+  g_hidConnSlowdown = false;
+  g_hidConnFastSeen = false;
+  g_hidSentThisEvent = false;
+  g_hidRateWindowMs = millis();
+  g_hidRateWindowBase = g_hidReportCount;
+  g_hidRatePerSec = 0;
   Bluefruit.Security.requestPairing();
 }
 
@@ -873,7 +983,9 @@ static void hidDisconnectCallback(uint16_t connHandle, uint8_t reason) {
   (void)connHandle;
   Serial.print("ble=disconnected reason=0x");
   Serial.println(reason, HEX);
-  g_hidRunParamsRequested = false;
+  g_hidConnectedMs = 0;
+  g_hidConnRetryMs = 0;
+  g_hidSentThisEvent = false;
 }
 
 static void hidStartAdvertising() {
@@ -901,9 +1013,10 @@ static void hidBegin() {
   // a passkey this device could never show or type.
   Bluefruit.Security.setIOCaps(false, false, false);
 
-  // Start conservative so secure pairing has CPU between connection events.
-  // hidTask() drops this to kConnIntervalRun* once the link is encrypted.
-  Bluefruit.Periph.setConnInterval(kConnIntervalPairMin, kConnIntervalPairMax);
+  // Advertised, because that is what the host actually honours (see the
+  // kConnInterval* comment). Advertised before begin(), so it applies to the
+  // first connection rather than needing a mid-session update.
+  Bluefruit.Periph.setConnInterval(kConnIntervalMin, kConnIntervalMax);
   Bluefruit.Periph.setConnectCallback(hidConnectCallback);
   Bluefruit.Periph.setDisconnectCallback(hidDisconnectCallback);
 
@@ -933,11 +1046,16 @@ static bool hidLinkReady() {
          blehid.mouseNotifyEnabled();
 }
 
-// Degrees to HID counts, truncated toward zero and clamped to the signed 8-bit
-// range the report uses.
+// Degrees to HID counts. The report field is signed 8-bit, so the result is
+// clamped to +/-127 and whatever is left over stays in the accumulator.
+//
+// Rounded rather than truncated. Truncation makes a slow rotation build up a
+// whole count before anything is sent, which halves the update rate exactly
+// where the eye notices it most -- fine positioning. Rounding sends that count
+// about half a count sooner, and the long-run average is unchanged because the
+// fractional part carries either way.
 static int8_t hidCountsFor(float deg) {
-  const float counts = deg * kHidCountsPerDeg;
-  int whole = static_cast<int>(counts);
+  long whole = lroundf(deg * kHidCountsPerDeg);
   if (whole > 127) {
     whole = 127;
   } else if (whole < -127) {
@@ -993,21 +1111,69 @@ static void hidRefreshReportPeriod() {
   g_hidReportPeriodMs = ms;
 }
 
-// Ask for the fast interval, once per connection, and only after the link is
-// encrypted: pairing is what needed the slow one. setConnInterval() pushes a
-// connection parameter update request while connected, so calling it on every
-// pass would queue a request each time.
-static void hidEnsureRunParams() {
-  if (g_hidRunParamsRequested) {
+// Connection-interval upkeep, run every pass while connected.
+//
+// Two jobs. Before the link is encrypted it is a stopwatch: if pairing has not
+// finished inside the grace period, back off to a slow interval so the host has
+// more room between events, because a link that pairs slowly still beats one
+// that never pairs. After that it is a nudge: walk the retry ladder, since the
+// host is the one that decides and the driver only asks once per call.
+static void hidMaintainConnInterval(uint32_t nowMs) {
+  if (!Bluefruit.connected()) {
     return;
   }
-  g_hidRunParamsRequested = true;
-  Bluefruit.Periph.setConnInterval(kConnIntervalRunMin, kConnIntervalRunMax);
-  Serial.println("hid=requested-fast-conn-interval");
+
+  const uint32_t ciMs =
+      (static_cast<uint32_t>(hidConnIntervalUnits()) * 125U) / 100U;
+
+  if (!Bluefruit.Security.isEncrypted(0)) {
+    if (!g_hidConnSlowdown && (nowMs - g_hidConnectedMs) >= kPairingGraceMs) {
+      g_hidConnSlowdown = true;
+      Bluefruit.Periph.setConnInterval(kConnIntervalFallbackMin,
+                                       kConnIntervalFallbackMax);
+      Serial.println("hid=pairing-slow, backing off conn interval");
+    }
+    return;
+  }
+
+  if (ciMs != 0U && ciMs <= kConnFastThresholdMs) {
+    if (!g_hidConnFastSeen) {
+      g_hidConnFastSeen = true;
+      Serial.print("hid=fast-conn-interval in use ci_ms=");
+      Serial.println(static_cast<float>(hidConnIntervalUnits()) * 1.25f, 1);
+    }
+    return;
+  }
+
+  if (g_hidConnSlowdown ||
+      g_hidConnRetries >= (kConnEscalationSteps * kConnAttemptsPerStep)) {
+    return;
+  }
+  if (g_hidConnRetries != 0U && (nowMs - g_hidConnRetryMs) < kConnRetryGapMs) {
+    return;
+  }
+
+  uint8_t step = g_hidConnRetries / kConnAttemptsPerStep;
+  if (step >= kConnEscalationSteps) {
+    step = kConnEscalationSteps - 1U;
+  }
+  const ConnIntervalAttempt& want = kConnEscalation[step];
+
+  g_hidConnRetryMs = nowMs;
+  ++g_hidConnRetries;
+  Bluefruit.Periph.setConnInterval(want.minUnits, want.maxUnits);
+  Serial.print("hid=asking for conn interval ");
+  Serial.print(static_cast<float>(want.minUnits) * 1.25f, 1);
+  Serial.print('-');
+  Serial.print(static_cast<float>(want.maxUnits) * 1.25f, 1);
+  Serial.print(" ms (attempt ");
+  Serial.print(g_hidConnRetries);
+  Serial.println(')');
 }
 
 static void hidTask(uint32_t nowMs) {
   hidPollButton(nowMs);
+  hidMaintainConnInterval(nowMs);
 
   if (!hidLinkReady()) {
     // Drop the backlog rather than firing it off in a burst the moment the
@@ -1017,19 +1183,9 @@ static void hidTask(uint32_t nowMs) {
     g_hidLastButtons = 0;
     g_hidLastReportMs = nowMs;
     g_hidLastKeepaliveMs = nowMs;
+    g_hidSentThisEvent = false;
     return;
   }
-
-  hidEnsureRunParams();
-
-  // Pace to the negotiated interval (see hidRefreshReportPeriod). A click
-  // therefore goes out on the next slot, and a send that fails waits for the
-  // next slot instead of spinning.
-  if ((nowMs - g_hidLastReportMs) < g_hidReportPeriodMs) {
-    return;
-  }
-  g_hidLastReportMs = nowMs;
-  hidRefreshReportPeriod();
 
   const uint8_t buttons = g_buttonStable ? MOUSE_BUTTON_LEFT : 0;
   const bool buttonChanged = (buttons != g_hidLastButtons);
@@ -1039,8 +1195,53 @@ static void hidTask(uint32_t nowMs) {
       kHidIdleReportEnabled && ((nowMs - g_hidLastKeepaliveMs) >= kHidIdleReportMs);
 
   if (dx == 0 && dy == 0 && !buttonChanged && !keepaliveDue) {
+    // Keep the safety-valve reference fresh while there is nothing to say, so it
+    // measures "motion has been waiting", not "the last send was long ago".
+    // Without this the first report after an idle spell would bypass the window.
+    g_hidLastReportMs = nowMs;
     return;  // nothing to say, and no keepalive wanted yet
   }
+
+  // Hand the report over shortly before the next connection event starts, so it
+  // leaves in that event. A free-running timer has an arbitrary phase against
+  // the radio's: a report that misses its event by a hair waits a whole
+  // interval for the next one, and at 30 ms that is up to 30 ms of latency with
+  // nothing to do with the link itself.
+  bool sendNow = false;
+  xiao_nrf54l15::BleConnectionTimingSnapshot timing;
+  if (Bluefruit.rawRadio().getConnectionTimingSnapshot(&timing)) {
+    if (timing.nextEventCounter != g_hidEventCounter) {
+      g_hidEventCounter  = timing.nextEventCounter;
+      g_hidSentThisEvent = false;
+    }
+    // One report per event: the link carries that cleanly, and a second one
+    // only stacks up in the notification queue, which is the latency itself.
+    // timeUntilNextEventUs of 0 means the anchor has already gone by, so this
+    // event cannot be caught any more.
+    if (!g_hidSentThisEvent && timing.timeUntilNextEventUs != 0U &&
+        timing.timeUntilNextEventUs <= kHidSendLeadUs) {
+      sendNow = true;
+    }
+  } else if ((nowMs - g_hidLastReportMs) >= g_hidReportPeriodMs) {
+    // No anchor to work from (not expected while connected): fall back to a
+    // plain interval-derived cadence.
+    sendNow = true;
+  }
+
+  // Safety valve. One report per event is the intent, not a hard rule: if the
+  // window keeps being missed (a long stall elsewhere in the loop, say), motion
+  // must still get out rather than pile up in the accumulator.
+  if (!sendNow &&
+      (nowMs - g_hidLastReportMs) >= (g_hidReportPeriodMs * 3U / 2U + 5U)) {
+    sendNow = true;
+    ++g_hidValveCount;
+  }
+  if (!sendNow) {
+    return;
+  }
+
+  g_hidLastReportMs = nowMs;
+  hidRefreshReportPeriod();
 
   if (blehid.mouseReport(buttons, dx, dy, 0, 0)) {
     // Subtract only what was actually sent. The remainder stays pending, which
@@ -1049,8 +1250,10 @@ static void hidTask(uint32_t nowMs) {
     g_pendingDeg[1] -= static_cast<float>(dy) / kHidCountsPerDeg;
     g_hidLastButtons = buttons;
     g_hidLastKeepaliveMs = nowMs;
+    g_hidSentThisEvent = true;
+    ++g_hidReportCount;
   }
-  // On failure the motion simply stays pending and goes out on the next slot.
+  // On failure the motion simply stays pending and goes out on the next event.
 }
 
 // ---------------------------------------------------------------------------

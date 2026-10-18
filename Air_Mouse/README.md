@@ -56,14 +56,30 @@ ble=advertising as "Air Mouse" (pair from the host, HID needs an encrypted link)
 Then pair from the host: **Settings → Bluetooth → "Air Mouse"**. The console logs
 `ble=connected, pairing`, and after pairing, motion and clicks start working.
 
-Once the link is encrypted the sketch asks for the fast connection interval and says so:
+The connection interval is published at 7.5–15 ms from the start, through the standard GAP
+characteristic `0x2A04` that hosts read during service discovery. **On Android that is only a
+request**, and a phone is entitled to overrule it — 30 ms is Android's own default band. The sketch
+therefore reports what it actually got, and if the host overruled it, walks a retry ladder towards the
+band Android itself reserves for high priority:
 
 ```
-hid=requested-fast-conn-interval
+hid=asking for conn interval 6.0-15.0 ms (attempt 1)
+hid=asking for conn interval 11.3-15.0 ms (attempt 3)
+hid=asking for conn interval 15.0-15.0 ms (attempt 5)
+hid=fast-conn-interval in use ci_ms=15.0
 ```
 
-The periodic line then carries `ci_ms=` showing what the host actually agreed to — see
-[Latency](#latency).
+If pairing itself has not finished within 4 s, it stops asking and falls back to a slow interval so
+the host has room to complete the exchange:
+
+```
+hid=pairing-slow, backing off conn interval
+```
+
+Either way the periodic line carries `ci_ms=` and `tx_s=`, showing the interval the host settled on
+and the pointer update rate it produces — see [Latency](#latency). A host that has already paired may
+hold the old value cached, so if `ci_ms=` stays high, forget the device in the host's Bluetooth
+settings and pair again.
 
 If motion does nothing while clicks work (or vice versa), check the link is actually encrypted —
 HID reports are dropped on an unencrypted link, which is why pairing is mandatory rather than
@@ -83,7 +99,9 @@ While idle-rate logging is on, the sketch prints a debug view:
 | `ptr_dps` | roll-compensated pointer rates, (horizontal, vertical), deg/s |
 | `ptr_deg` | those rates integrated — pointer movement so far, wrapped to ±180° |
 | `read_err` | failed I2C transactions / attempted. Hidden until it is non-zero |
-| `ci_ms` | negotiated BLE connection interval, the floor on pointer latency. Shown once connected |
+| `ci_ms` | negotiated BLE connection interval — the floor on pointer latency and the report rate. Shown once connected |
+| `tx_s` | reports actually sent per second, averaged over a second. Should track `1000 / ci_ms` |
+| `valve` | times the safety valve had to fire, i.e. the send window was missed. Hidden until it is non-zero |
 
 `accel_mg` and `gyro_raw_dps` are also implemented in `printState()` but are currently commented
 out; they are the fields to re-enable when working out `kPointAxis`. Printed at 10 Hz, which is a
@@ -131,62 +149,125 @@ The rules that shape the code, all of them from the core's own HID example:
 - **Sampling and reporting are decoupled.** Motion accumulates in degrees at 416 Hz and is converted
   to counts only when a report is actually sent. Reporting at the IMU rate would just queue
   notifications and add latency.
+- **Reports are aligned to the connection event.** The cadence belongs to the link, not to a timer:
+  the report is handed over just before the next event so it leaves in that event instead of waiting an
+  extra interval — see [Latency](#latency).
 - **Deltas are signed 8-bit**, so each report is clamped to ±127 counts. Only what was really sent is
   subtracted from the accumulator, so the sub-count remainder carries over and slow motion is not
   quantised away. If a report fails, the motion stays pending for the next slot.
-- **The backlog is capped** (`kHidPendingCapDeg`, 45°). If the link stalls, the cursor must not keep
+- **The backlog is capped** (`kHidPendingCapDeg`). If the link stalls, the cursor must not keep
   sliding after your hand has stopped; past the cap, motion is dropped.
+- **Counts are rounded, not truncated.** Truncation makes a slow rotation build a whole count before
+  anything is sent, which halves the update rate exactly where fine positioning happens. The
+  fractional part carries either way, so the long-run average is unchanged.
 - **Reports are only sent when there is something to say** (motion, a button edge, or an optional
   keepalive), never on a fixed drumbeat of zero-motion packets.
 
-One consequence worth knowing: HID counts are integers, so very slow steady rotation produces small
-occasional steps rather than perfectly smooth motion. That is inherent to the protocol, not a bug in
-the accumulator.
+One consequence worth knowing: HID counts are integers, so a very slow steady rotation still produces
+small occasional steps rather than perfectly smooth motion. That is inherent to the protocol. What the
+gain does is set how much hand motion one count is worth, so a higher gain reaches that step size
+sooner — see the derivation under [Configuration](#configuration).
 
 ## Latency
 
-Pointer lag is the sum of a few independent delays, and the two biggest ones are both in the radio
-link rather than the maths:
+Pointer lag is the sum of a few independent delays and, at the end of the chain, one that is simply
+not ours to remove:
 
 | Source | Before | Now |
 | --- | --- | --- |
 | IMU sample period (416 Hz) | 2.4 ms | 2.4 ms |
-| Gyro low-pass (`kGyroFilterTauMs`) | ~8 ms | ~4 ms |
-| Report throttle | 30 ms fixed | derived from the connection interval |
-| Connection interval | 30–50 ms | 7.5–15 ms |
-| Blocking `Serial.print` at 20 Hz | ~8 ms | ~4 ms |
-| **Worst case** | **~100 ms** | **~35 ms** |
+| Gyro low-pass (`kGyroFilterTauMs`) | ~8 ms | ~3 ms |
+| Report throttle | 30 ms fixed | aligned to the connection event, ≤ 5 ms |
+| Connection interval | 30–50 ms | the host decides; 30 ms on Android |
+| **Sketch-side total** | **~100 ms** | **~10–35 ms** |
+
+Printing is *not* on that list. `HardwareSerial::write()` copies into a TX ring buffer and only spins
+when the ring is full, so a 10 Hz debug line of ~70 bytes drains easily at 115200 baud and costs the
+pointer nothing.
 
 The rules that produce the "Now" column:
 
-- **One report per connection event.** Sending faster than the link does not get motion to the host
-  any sooner: the extra notifications queue behind each other in the stack, and that queue *is* the
-  latency. So the report period is read back from the link (`Bluefruit.Connection(0)
-  ->getConnectionInterval()`) instead of being fixed. `0`-length notifications are never sent.
-- **The link runs at two speeds.** Pairing runs a software P-256 exchange and needs CPU between
-  connection events, so the connection starts at the core example's conservative 30–50 ms
-  (`kConnIntervalPairMin`/`Max`). Once the link is encrypted — `hidTask()` checks that, and requests
-  the change exactly once per connection — it drops to 7.5–15 ms (`kConnIntervalRunMin`/`Max`), the
-  band the core's own NUS transport asks for. `setConnInterval()` pushes a connection parameter
-  update request while connected, so it must not be called every pass.
-- **Trust but verify.** The periodic line reports `ci_ms=`, the interval the host actually agreed to.
-  `15.0` means the fast request landed; `30.0`–`50.0` means the host ignored it and that is your
-  latency floor.
+- **Hand the report over just before the connection event.** A report queued on a free-running timer
+  has an arbitrary phase against the radio's: if it misses its event by a hair it waits a whole
+  interval for the next one, and at 30 ms that is up to 30 ms of latency with nothing to do with the
+  link. The radio publishes its own anchor through
+  `Bluefruit.rawRadio().getConnectionTimingSnapshot()`, so the sketch sends within `kHidSendLeadUs` of
+  the next anchor instead, and at most one report per event-counter value.
+- **The lead is 5 ms, not 1.** The radio pre-rolls: it starts spinning 2.2 ms before the anchor
+  (`kBleConnRxStartLeadUs`) and owns the loop from then on, so the window has to clear that plus the
+  main loop's own ~1 ms granularity. Miss the window and the report waits another interval, which is
+  why the lead is deliberately generous.
+- **One report per connection event, not more.** Sending faster than the link does not get motion to
+  the host any sooner: the extra notifications stack in the driver's notification queue behind each
+  other, and that queue *is* the latency.
+- **A safety valve covers a missed window.** If there is motion but nothing has gone out for over 1.5
+  intervals, the report is sent anyway. `valve=` counts how often that had to happen and should stay
+  at zero; a rising count means the window is being missed.
+- **The connection interval is the host's decision.** This is the one delay that cannot be designed
+  away. The interval is published at 7.5–15 ms through the standard GAP characteristic `0x2A04`
+  (Peripheral Preferred Connection Parameters), and the core's HAL also queues its own update request
+  when a host connects outside that range, but both are only *requests* — the central decides, and a
+  peripheral cannot force it.
+
+  Android's own defaults, from its stack documentation:
+
+  | Priority | Interval |
+  | --- | --- |
+  | `CONNECTION_PRIORITY_BALANCED` | 30–50 ms |
+  | `CONNECTION_PRIORITY_HIGH` | 11.25–15 ms |
+
+  `BALANCED` is what a GATT client gets by default, which is where `ci_ms= 30.0` comes from. `HIGH` is
+  only applied when a phone *app* calls `requestConnectionPriority(CONNECTION_PRIORITY_HIGH)`; a HID
+  peripheral has no way to ask for it. That is why a BLE mouse on Android does not feel like a wired
+  one, on any firmware.
+- **The driver asks once.** The core's HAL sends the update request and clears its pending flag on any
+  response, rejection included, and never retries. So the sketch walks a retry ladder
+  (`kConnEscalation`) that starts at 7.5–15 ms and ends squarely inside Android's `HIGH` band, in case
+  a host only accepts a range it already supports.
+- **Pairing is not starved by a short interval.** The core's HID example advertises 30–50 ms so that
+  LE Secure Connections has CPU between connection events, but that reasoning does not hold here: the
+  software P-256 keypair generation runs in the deferred background service
+  (`BleRadio::ensureSecureConnectionsLocalKeypair`), outside the connection event. A 4 s grace period
+  still watches for a host that stalls, and backs the interval off if one does
+  (`kPairingGraceMs`, `hid=pairing-slow`).
+- **Trust but verify.** The periodic line reports `ci_ms=` (the interval the host actually settled on)
+  and `tx_s=` (the pointer update rate it produces). `tx_s=` should track `1000 / ci_ms`; if it is well
+  below that, reports are being missed. `ci_ms= 30.0` with `tx_s= 33` means the host overruled the
+  request, and that is the floor this design can reach.
 - **Every millisecond of filter tau is a millisecond of lag** added to the whole chain, which is why
   the gyro filter is short. It is not free: lowering it further trades smoothness for response.
 
-If the stream prints `ci_ms= 50.0` and it still feels slow, the host is refusing the fast interval —
-that is outside the sketch's control.
+What is left after this is not in the sketch: one connection interval of transmission delay is
+inherent to BLE, and the host's own input pipeline (Android's `InputReader` → `InputDispatcher` →
+compositor) adds a frame or two on top. A gyro air pointer will not feel like a wired mouse.
 
 ## Configuration
 
 | Constant | Default | Effect |
 | --- | --- | --- |
-| `kHidCountsPerDeg` | 6.0 | Pointer gain. Hosts apply their own acceleration on top |
-| `kHidPendingCapDeg` | 45 | Ceiling on unreported motion |
-| `kHidReportFloorMs` / `CeilMs` | 5 / 50 | Clamp on the derived report period (see below) |
+| `kConnIntervalMin` / `Max` | 6 / 12 | Connection interval published to the host, in 1.25 ms units → 7.5–15 ms. This dominates latency and update rate; raise it if a host will not pair |
+| `kPairingGraceMs` | 4000 | Give up on fast if pairing has not finished by then |
+| `kConnEscalation` | 6–12, 9–12, 12–12 | Retry ladder for the interval, tried in order. Ends inside Android's `CONNECTION_PRIORITY_HIGH` band (11.25–15 ms) |
+| `kConnAttemptsPerStep` / `GapMs` | 2 / 1000 | Attempts per ladder step, and the gap between them |
+| `kHidSendLeadUs` | 5000 | How long before the next connection event the report is handed over. Must exceed the radio's 2.2 ms pre-roll plus the loop's ~1 ms granularity, but stay well under the interval |
+| `kHidCountsPerDeg` | 16.0 | Pointer gain, bounded by the report format — see below |
+| `kHidPendingCapDeg` | 16 | Ceiling on unreported motion, kept near one report's worth |
+| `kHidReportFloorMs` / `CeilMs` | 5 / 50 | Clamp on the derived report period |
 | `kHidIdleReportEnabled` / `Ms` | false / 100 | Optional zero-motion keepalive if the host sleeps the link |
 | `kButtonDebounceMs` | 20 | Button debounce window |
+
+`kHidCountsPerDeg` is bounded from above by the report format, not by feel. One report carries at most
+±127 counts (signed 8-bit), so the gain has to satisfy
+
+```
+gain <= 127 / (max_hand_rate_dps * report_period_s)
+```
+
+for the fastest motion you actually use. A quick wrist flick is around 500 deg/s and the report period
+is at best ~15 ms, giving `gain <= 127 / (500 * 0.015) = 16.9`. Above that the report saturates and
+the leftover motion has to drain over later reports, which is exactly the lag this sketch exists to
+remove. So raise it only if your motion is normally slower than that, and lower it if the cursor
+overshoots.
 
 Sensor configuration:
 
@@ -207,11 +288,11 @@ Gotcha: the LSM6DS3 family encodes `FS_XL` as `00`=±2 g, `01`=±16 g, `10`=±4 
 
 | Constant | Default | Effect |
 | --- | --- | --- |
-| `kGyroFilterTauMs` | 4 ms | LPF on the rate signal (~40 Hz). Lower = snappier, noisier |
+| `kGyroFilterTauMs` | 3 ms | LPF on the rate signal (~53 Hz). Lower = snappier, noisier |
 | `kGravityFilterTauMs` | 50 ms | LPF on the roll reference (~3 Hz). Higher = steadier roll, more lag |
 | `kBiasTrackingAlpha` | 0.02 | Slow re-zero while still. Set to 0 to disable |
 | `kStillThresholdDps` | 1.5 | How quiet "still" must be before re-zeroing |
-| `kPrintIntervalMs` | 100 | Display rate only. `Serial` writes block, so faster printing costs pointer time |
+| `kPrintIntervalMs` | 100 | Display rate only. Printing is ring-buffered, so this is not a latency knob |
 
 ### Axis mapping — tune this on hardware
 
@@ -221,7 +302,8 @@ instead of guessing:
 - `kPointAxis` — which body axis points at the screen. **To find it:** re-enable `accel_mg`, point the
   device at the screen in your normal grip, and pick the axis reading near 0 mg, because gravity is
   perpendicular to it.
-- `kPointerHorizontalSign` / `kPointerVerticalSign` — flip if the pointer moves the wrong way.
+- `kPointerHorizontalSign` / `kPointerVerticalSign` — flip if the pointer moves the wrong way. As
+  verified on the current board: horizontal is `-1.0f` (it was inverted), vertical is `1.0f`.
 
 Everything downstream of the axis choice is orientation-independent: roll comes from gravity in the
 plane perpendicular to the pointing axis, so it works whatever the mounting.
@@ -247,11 +329,15 @@ rolls.
   acceleration as well as gravity) and is held stale when the device points steeply up or down,
   where gravity stops defining a roll.
 - The embedded FIFO and the IMU interrupt pin (`IMU_INT`, D24) are unused.
-- `kPointAxis` and the two sign constants are still unverified on hardware.
+- One connection interval of transmission delay is unavoidable, and the host's input pipeline adds
+  more. `ci_ms=` in the log is the part of it this sketch can see. On Android the interval is 30 ms
+  because that is the platform's `CONNECTION_PRIORITY_BALANCED` band; the peripheral's published and
+  requested values are only ever requests.
+- `kPointAxis` is still unverified on hardware; the pointer signs were verified on the current board.
 
 ## Next steps
 
-1. Verify `kPointAxis` and the pointer signs on real hardware.
+1. Verify `kPointAxis` on real hardware (re-enable `accel_mg`).
 2. Add a pointer-acceleration curve and a deadzone, applied per report rather than per sample.
 3. Move the sampling path to the sensor FIFO so the effective sample rate no longer depends on how
    long the loop takes.
