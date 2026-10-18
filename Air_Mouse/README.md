@@ -56,6 +56,15 @@ ble=advertising as "Air Mouse" (pair from the host, HID needs an encrypted link)
 Then pair from the host: **Settings → Bluetooth → "Air Mouse"**. The console logs
 `ble=connected, pairing`, and after pairing, motion and clicks start working.
 
+Once the link is encrypted the sketch asks for the fast connection interval and says so:
+
+```
+hid=requested-fast-conn-interval
+```
+
+The periodic line then carries `ci_ms=` showing what the host actually agreed to — see
+[Latency](#latency).
+
 If motion does nothing while clicks work (or vice versa), check the link is actually encrypted —
 HID reports are dropped on an unencrypted link, which is why pairing is mandatory rather than
 optional.
@@ -74,9 +83,10 @@ While idle-rate logging is on, the sketch prints a debug view:
 | `ptr_dps` | roll-compensated pointer rates, (horizontal, vertical), deg/s |
 | `ptr_deg` | those rates integrated — pointer movement so far, wrapped to ±180° |
 | `read_err` | failed I2C transactions / attempted. Hidden until it is non-zero |
+| `ci_ms` | negotiated BLE connection interval, the floor on pointer latency. Shown once connected |
 
 `accel_mg` and `gyro_raw_dps` are also implemented in `printState()` but are currently commented
-out; they are the fields to re-enable when working out `kPointAxis`. Printed at 20 Hz, which is a
+out; they are the fields to re-enable when working out `kPointAxis`. Printed at 10 Hz, which is a
 display rate only — the IMU is still read at its full 416 Hz.
 
 ## I2C reliability
@@ -119,8 +129,8 @@ The rules that shape the code, all of them from the core's own HID example:
 - **Reports require an encrypted link.** `mouseReport()` returns `false` until the link is paired, so
   the sketch is a no-op until then.
 - **Sampling and reporting are decoupled.** Motion accumulates in degrees at 416 Hz and is converted
-  to counts only when a report is actually sent (`kHidReportIntervalMs`, 30 ms). Reporting at the IMU
-  rate would just queue notifications and add latency.
+  to counts only when a report is actually sent. Reporting at the IMU rate would just queue
+  notifications and add latency.
 - **Deltas are signed 8-bit**, so each report is clamped to ±127 counts. Only what was really sent is
   subtracted from the accumulator, so the sub-count remainder carries over and slow motion is not
   quantised away. If a report fails, the motion stays pending for the next slot.
@@ -133,14 +143,48 @@ One consequence worth knowing: HID counts are integers, so very slow steady rota
 occasional steps rather than perfectly smooth motion. That is inherent to the protocol, not a bug in
 the accumulator.
 
+## Latency
+
+Pointer lag is the sum of a few independent delays, and the two biggest ones are both in the radio
+link rather than the maths:
+
+| Source | Before | Now |
+| --- | --- | --- |
+| IMU sample period (416 Hz) | 2.4 ms | 2.4 ms |
+| Gyro low-pass (`kGyroFilterTauMs`) | ~8 ms | ~4 ms |
+| Report throttle | 30 ms fixed | derived from the connection interval |
+| Connection interval | 30–50 ms | 7.5–15 ms |
+| Blocking `Serial.print` at 20 Hz | ~8 ms | ~4 ms |
+| **Worst case** | **~100 ms** | **~35 ms** |
+
+The rules that produce the "Now" column:
+
+- **One report per connection event.** Sending faster than the link does not get motion to the host
+  any sooner: the extra notifications queue behind each other in the stack, and that queue *is* the
+  latency. So the report period is read back from the link (`Bluefruit.Connection(0)
+  ->getConnectionInterval()`) instead of being fixed. `0`-length notifications are never sent.
+- **The link runs at two speeds.** Pairing runs a software P-256 exchange and needs CPU between
+  connection events, so the connection starts at the core example's conservative 30–50 ms
+  (`kConnIntervalPairMin`/`Max`). Once the link is encrypted — `hidTask()` checks that, and requests
+  the change exactly once per connection — it drops to 7.5–15 ms (`kConnIntervalRunMin`/`Max`), the
+  band the core's own NUS transport asks for. `setConnInterval()` pushes a connection parameter
+  update request while connected, so it must not be called every pass.
+- **Trust but verify.** The periodic line reports `ci_ms=`, the interval the host actually agreed to.
+  `15.0` means the fast request landed; `30.0`–`50.0` means the host ignored it and that is your
+  latency floor.
+- **Every millisecond of filter tau is a millisecond of lag** added to the whole chain, which is why
+  the gyro filter is short. It is not free: lowering it further trades smoothness for response.
+
+If the stream prints `ci_ms= 50.0` and it still feels slow, the host is refusing the fast interval —
+that is outside the sketch's control.
+
 ## Configuration
 
 | Constant | Default | Effect |
 | --- | --- | --- |
 | `kHidCountsPerDeg` | 6.0 | Pointer gain. Hosts apply their own acceleration on top |
-| `kHidReportIntervalMs` | 30 | Report cadence; keep ≥ the connection interval |
-| `kConnIntervalMin` / `Max` | 24 / 40 | 30–50 ms. `8`/`16` = 10–20 ms feels snappier if the host pairs at that rate |
 | `kHidPendingCapDeg` | 45 | Ceiling on unreported motion |
+| `kHidReportFloorMs` / `CeilMs` | 5 / 50 | Clamp on the derived report period (see below) |
 | `kHidIdleReportEnabled` / `Ms` | false / 100 | Optional zero-motion keepalive if the host sleeps the link |
 | `kButtonDebounceMs` | 20 | Button debounce window |
 
@@ -163,11 +207,11 @@ Gotcha: the LSM6DS3 family encodes `FS_XL` as `00`=±2 g, `01`=±16 g, `10`=±4 
 
 | Constant | Default | Effect |
 | --- | --- | --- |
-| `kGyroFilterTauMs` | 8 ms | LPF on the rate signal (~20 Hz). Lower = snappier, noisier |
+| `kGyroFilterTauMs` | 4 ms | LPF on the rate signal (~40 Hz). Lower = snappier, noisier |
 | `kGravityFilterTauMs` | 50 ms | LPF on the roll reference (~3 Hz). Higher = steadier roll, more lag |
 | `kBiasTrackingAlpha` | 0.02 | Slow re-zero while still. Set to 0 to disable |
 | `kStillThresholdDps` | 1.5 | How quiet "still" must be before re-zeroing |
-| `kPrintIntervalMs` | 50 | Display rate only |
+| `kPrintIntervalMs` | 100 | Display rate only. `Serial` writes block, so faster printing costs pointer time |
 
 ### Axis mapping — tune this on hardware
 

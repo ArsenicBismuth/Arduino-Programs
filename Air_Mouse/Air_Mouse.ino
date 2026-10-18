@@ -178,13 +178,17 @@ static const float    kBiasTrackingAlpha = 0.02f;
 
 // Low-pass filters. The gyro branch is fast (it carries the motion), the
 // accel/gravity branch is slow (it only needs to track roll, and it is
-// corrupted by hand acceleration).
-static const float kGyroFilterTauMs    = 8.0f;   // ~20 Hz cutoff
+// corrupted by hand acceleration). Every millisecond of tau here is a
+// millisecond of pointer lag added to the whole chain, so the gyro filter is
+// kept short: at 416 Hz, 4 ms is still ~20 samples of averaging.
+static const float kGyroFilterTauMs    = 4.0f;   // ~40 Hz cutoff
 static const float kGravityFilterTauMs = 50.0f;  // ~3 Hz cutoff
 
 // Display rate. This is not the sampling rate: the IMU is still read at its
-// full 416 Hz, this only throttles what gets printed.
-static const uint32_t kPrintIntervalMs = 50;  // 20 Hz
+// full 416 Hz, this only throttles what gets printed. Keep it slow -- on this
+// core Serial writes block until the DMA transmit finishes, so every printed
+// line is time the pointer cannot report in.
+static const uint32_t kPrintIntervalMs = 100;  // 10 Hz
 
 // ---------------------------------------------------------------------------
 // HID transport
@@ -196,19 +200,27 @@ static const char kDeviceName[] = "Air Mouse";
 // hosts apply their own pointer acceleration on top of this.
 static const float kHidCountsPerDeg = 6.0f;
 
-// Report cadence. Never send faster than the connection interval: the extra
-// notifications just queue up and add latency without reaching the host
-// sooner. The core example asks for a 30-50 ms interval (see kConnInterval*),
-// so this matches it.
-static const uint32_t kHidReportIntervalMs = 30;
+// Report cadence is derived from the link rather than fixed: one report per
+// connection event. Sending faster does not reduce latency, it only stacks
+// notifications behind each other, and that queue *is* the latency. These
+// bounds only guard the arithmetic.
+static const uint32_t kHidReportFallbackMs = 15;  // before the interval is known
+static const uint32_t kHidReportFloorMs    = 5;
+static const uint32_t kHidReportCeilMs     = 50;
 
-// Connection interval, in 1.25 ms units (24 = 30 ms, 40 = 50 ms). The core's
-// own HID example uses this range because it leaves Android enough event
-// budget for LE Secure Connections on hosts with strict pairing timing.
-// Dropping to (8, 16) = 10-20 ms feels noticeably snappier, but only if your
-// host completes pairing at that rate.
-static const uint16_t kConnIntervalMin = 24;
-static const uint16_t kConnIntervalMax = 40;
+// Connection interval, in 1.25 ms units. Two phases, because pairing and
+// pointing want opposite things:
+//   pairing - LE Secure Connections runs a software P-256 exchange and needs
+//             CPU between connection events. The core's own HID example uses
+//             30-50 ms here for exactly that reason, so start there.
+//   running - once the link is encrypted there is nothing left to carry but
+//             pointer data, and the interval is most of the end-to-end
+//             latency. 7.5-15 ms is the band the core's NUS transport asks
+//             for, so it is known to work with real centrals on this stack.
+static const uint16_t kConnIntervalPairMin = 24;  // 30 ms
+static const uint16_t kConnIntervalPairMax = 40;  // 50 ms
+static const uint16_t kConnIntervalRunMin  = 6;   // 7.5 ms
+static const uint16_t kConnIntervalRunMax  = 12;  // 15 ms
 
 // Cap on unreported motion. If the link stalls for a second, an uncapped
 // accumulator would keep the cursor moving after the hand has stopped. Past
@@ -277,6 +289,11 @@ static float g_pendingDeg[2] = {0.0f, 0.0f};
 static uint32_t g_hidLastReportMs = 0;
 static uint32_t g_hidLastKeepaliveMs = 0;
 static uint8_t  g_hidLastButtons  = 0;
+
+// The fast connection interval is requested once per connection, after the
+// link is encrypted. Requesting it repeatedly would queue an update request
+// on every pass.
+static bool g_hidRunParamsRequested = false;
 
 // Debounced button state (see hidPollButton).
 static bool     g_buttonRaw      = false;
@@ -789,6 +806,9 @@ static void updateMotion(const int16_t gyroRaw[3], const int16_t accelRaw[3], fl
   }
 }
 
+// Defined with the HID transport below.
+static uint16_t hidConnIntervalUnits();
+
 static void printState() {
   // Serial.print("accel_mg=");
   // Serial.print(g_accelMg[0], 1);
@@ -825,6 +845,15 @@ static void printState() {
     Serial.print('/');
     Serial.print(g_imuReads);
   }
+
+  // The connection interval is the floor on pointer latency, so it is worth
+  // watching: 15 ms means the fast request was accepted, 30-50 ms means the
+  // host ignored it. Shown only once a connection exists.
+  if (g_hidRunParamsRequested) {
+    Serial.print(" ci_ms= ");
+    Serial.print(static_cast<float>(hidConnIntervalUnits()) * 1.25f, 1);
+  }
+
   Serial.println();
 }
 
@@ -835,6 +864,8 @@ static void printState() {
 static void hidConnectCallback(uint16_t connHandle) {
   (void)connHandle;
   Serial.println("ble=connected, pairing");
+  // A fresh connection starts at the pairing interval again.
+  g_hidRunParamsRequested = false;
   Bluefruit.Security.requestPairing();
 }
 
@@ -842,6 +873,7 @@ static void hidDisconnectCallback(uint16_t connHandle, uint8_t reason) {
   (void)connHandle;
   Serial.print("ble=disconnected reason=0x");
   Serial.println(reason, HEX);
+  g_hidRunParamsRequested = false;
 }
 
 static void hidStartAdvertising() {
@@ -869,7 +901,9 @@ static void hidBegin() {
   // a passkey this device could never show or type.
   Bluefruit.Security.setIOCaps(false, false, false);
 
-  Bluefruit.Periph.setConnInterval(kConnIntervalMin, kConnIntervalMax);
+  // Start conservative so secure pairing has CPU between connection events.
+  // hidTask() drops this to kConnIntervalRun* once the link is encrypted.
+  Bluefruit.Periph.setConnInterval(kConnIntervalPairMin, kConnIntervalPairMax);
   Bluefruit.Periph.setConnectCallback(hidConnectCallback);
   Bluefruit.Periph.setDisconnectCallback(hidDisconnectCallback);
 
@@ -929,6 +963,49 @@ static void hidPollButton(uint32_t nowMs) {
   }
 }
 
+// The interval the link actually settled on, in 1.25 ms units. 0 when unknown.
+static uint16_t hidConnIntervalUnits() {
+  const BLEConnection* conn = Bluefruit.Connection(0);
+  return (conn != nullptr) ? conn->getConnectionInterval() : 0U;
+}
+
+// One report per connection event. Sending faster does not get motion to the
+// host any sooner -- the extra notifications just queue behind each other, and
+// that queue is the latency people feel. So the cadence follows the link.
+// Cached, because reading it goes through a HAL critical section and the
+// interval only moves when the host accepts a parameter update.
+static uint32_t g_hidReportPeriodMs = kHidReportFallbackMs;
+
+static void hidRefreshReportPeriod() {
+  const uint16_t units = hidConnIntervalUnits();
+  if (units == 0U) {
+    g_hidReportPeriodMs = kHidReportFallbackMs;
+    return;
+  }
+  // units * 1.25 ms, rounded up: reporting a hair late is harmless, reporting a
+  // hair early means every report waits a whole extra event.
+  uint32_t ms = (static_cast<uint32_t>(units) * 125U + 99U) / 100U;
+  if (ms < kHidReportFloorMs) {
+    ms = kHidReportFloorMs;
+  } else if (ms > kHidReportCeilMs) {
+    ms = kHidReportCeilMs;
+  }
+  g_hidReportPeriodMs = ms;
+}
+
+// Ask for the fast interval, once per connection, and only after the link is
+// encrypted: pairing is what needed the slow one. setConnInterval() pushes a
+// connection parameter update request while connected, so calling it on every
+// pass would queue a request each time.
+static void hidEnsureRunParams() {
+  if (g_hidRunParamsRequested) {
+    return;
+  }
+  g_hidRunParamsRequested = true;
+  Bluefruit.Periph.setConnInterval(kConnIntervalRunMin, kConnIntervalRunMax);
+  Serial.println("hid=requested-fast-conn-interval");
+}
+
 static void hidTask(uint32_t nowMs) {
   hidPollButton(nowMs);
 
@@ -943,14 +1020,16 @@ static void hidTask(uint32_t nowMs) {
     return;
   }
 
-  // Never send faster than the connection interval: extra reports would only
-  // queue up in the stack, adding latency without reaching the host any sooner.
-  // A click therefore goes out on the next slot, and a send that fails waits
-  // for the next slot instead of spinning.
-  if ((nowMs - g_hidLastReportMs) < kHidReportIntervalMs) {
+  hidEnsureRunParams();
+
+  // Pace to the negotiated interval (see hidRefreshReportPeriod). A click
+  // therefore goes out on the next slot, and a send that fails waits for the
+  // next slot instead of spinning.
+  if ((nowMs - g_hidLastReportMs) < g_hidReportPeriodMs) {
     return;
   }
   g_hidLastReportMs = nowMs;
+  hidRefreshReportPeriod();
 
   const uint8_t buttons = g_buttonStable ? MOUSE_BUTTON_LEFT : 0;
   const bool buttonChanged = (buttons != g_hidLastButtons);
