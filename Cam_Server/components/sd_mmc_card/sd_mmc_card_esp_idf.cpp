@@ -152,22 +152,27 @@ std::vector<uint8_t> SdMmc::read_file(char const *path) {
   return res;
 }
 
-std::vector<FileInfo> &SdMmc::list_directory_file_info_rec(const char *path, uint8_t depth,
-                                                           std::vector<FileInfo> &list) {
+void SdMmc::list_directory_file_info_rec(const char *path, uint8_t depth,
+                                         const std::function<bool(const FileInfo &)> &callback) {
   ESP_LOGV(TAG, "Listing directory file info: %s\n", path);
   std::string absolut_path = build_path(path);
   DIR *dir = opendir(absolut_path.c_str());
   if (!dir) {
     ESP_LOGE(TAG, "Failed to open directory: %s", strerror(errno));
-    return list;
+    return;
   }
   char entry_absolut_path[FILE_PATH_MAX];
   char entry_path[FILE_PATH_MAX];
   const size_t dirpath_len = MOUNT_POINT.size();
-  size_t entry_path_len = strlen(path);
   strlcpy(entry_path, path, sizeof(entry_path));
-  strlcpy(entry_path + entry_path_len, "/", sizeof(entry_path) - entry_path_len);
-  entry_path_len = strlen(entry_path);
+  // Only insert a separator when the caller's path doesn't already end in one. A directory
+  // requested with a trailing slash (e.g. /file/snap/20261018/) would otherwise yield entries
+  // like "/snap/20261018//001744.jpg", and every generated link would contain a doubled slash.
+  size_t entry_path_len = strlen(entry_path);
+  if (entry_path_len == 0 || entry_path[entry_path_len - 1] != '/') {
+    strlcpy(entry_path + entry_path_len, "/", sizeof(entry_path) - entry_path_len);
+    entry_path_len++;
+  }
 
   strlcpy(entry_absolut_path, MOUNT_POINT.c_str(), sizeof(entry_absolut_path));
   struct dirent *entry;
@@ -183,12 +188,13 @@ std::vector<FileInfo> &SdMmc::list_directory_file_info_rec(const char *path, uin
         file_size = info.st_size;
       }
     }
-    list.emplace_back(entry_path, file_size, entry->d_type == DT_DIR);
+    FileInfo info(entry_path, file_size, entry->d_type == DT_DIR);
+    if (!callback(info))
+      break;
     if (entry->d_type == DT_DIR && depth)
-      list_directory_file_info_rec(entry_absolut_path, depth - 1, list);
+      list_directory_file_info_rec(entry_absolut_path, depth - 1, callback);
   }
   closedir(dir);
-  return list;
 }
 
 bool SdMmc::is_directory(const char *path) {
@@ -227,25 +233,31 @@ void SdMmc::update_sensors() {
   if (this->card_ == nullptr)
     return;
 
-  FATFS *fs;
-  DWORD fre_clust, fre_sect, tot_sect;
-  uint64_t total_bytes = -1, free_bytes = -1, used_bytes = -1;
-  auto res = f_getfree(MOUNT_POINT.c_str(), &fre_clust, &fs);
-  if (!res) {
-    tot_sect = (fs->n_fatent - 2) * fs->csize;
-    fre_sect = fre_clust * fs->csize;
+  // f_getfree() walks the whole FAT table (seconds on a large card) and is not guarded by
+  // the VFS volume lock, so it must not run unless a space sensor actually needs the value.
+  // Without this check it ran on every write/delete/mkdir for nothing.
+  if (this->used_space_sensor_ != nullptr || this->total_space_sensor_ != nullptr ||
+      this->free_space_sensor_ != nullptr) {
+    FATFS *fs;
+    DWORD fre_clust, fre_sect, tot_sect;
+    uint64_t total_bytes = -1, free_bytes = -1, used_bytes = -1;
+    auto res = f_getfree(MOUNT_POINT.c_str(), &fre_clust, &fs);
+    if (!res) {
+      tot_sect = (fs->n_fatent - 2) * fs->csize;
+      fre_sect = fre_clust * fs->csize;
 
-    total_bytes = static_cast<uint64_t>(tot_sect) * FF_SS_SDCARD;
-    free_bytes = static_cast<uint64_t>(fre_sect) * FF_SS_SDCARD;
-    used_bytes = total_bytes - free_bytes;
+      total_bytes = static_cast<uint64_t>(tot_sect) * FF_SS_SDCARD;
+      free_bytes = static_cast<uint64_t>(fre_sect) * FF_SS_SDCARD;
+      used_bytes = total_bytes - free_bytes;
+    }
+
+    if (this->used_space_sensor_ != nullptr)
+      this->used_space_sensor_->publish_state(used_bytes);
+    if (this->total_space_sensor_ != nullptr)
+      this->total_space_sensor_->publish_state(total_bytes);
+    if (this->free_space_sensor_ != nullptr)
+      this->free_space_sensor_->publish_state(free_bytes);
   }
-
-  if (this->used_space_sensor_ != nullptr)
-    this->used_space_sensor_->publish_state(used_bytes);
-  if (this->total_space_sensor_ != nullptr)
-    this->total_space_sensor_->publish_state(total_bytes);
-  if (this->free_space_sensor_ != nullptr)
-    this->free_space_sensor_->publish_state(free_bytes);
 
   for (auto &sensor : this->file_size_sensors_) {
     if (sensor.sensor != nullptr)

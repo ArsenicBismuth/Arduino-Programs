@@ -4,6 +4,9 @@
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 
 #include "esphome/core/log.h"
 
@@ -14,7 +17,17 @@ static const char *TAG = "latest_snapshot";
 
 // Chunk used to copy the file to the socket. Deliberately a small static buffer:
 // the handler must never allocate a whole-file buffer (see the header / README).
-static char STREAM_BUF[512];
+static char STREAM_BUF[2048];
+
+// Files are streamed in small chunks; with Nagle enabled the client can wait an extra
+// round-trip between them. Turn it off for this response.
+static void set_tcp_nodelay(httpd_req_t *req) {
+  int fd = httpd_req_to_sockfd(req);
+  int one = 1;
+  if (fd >= 0 && setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) < 0) {
+    ESP_LOGW(TAG, "setsockopt(TCP_NODELAY) failed: %s", strerror(errno));
+  }
+}
 
 void LatestSnapshot::setup() { this->base_->add_handler(this); }
 
@@ -41,8 +54,14 @@ std::string LatestSnapshot::find_latest_() const {
     return "";
   }
 
-  // Snapshot names are timestamped (snap_YYYYMMDD_HHMMSS.jpg), so the lexicographically
-  // largest matching name is also the newest.
+  // cam.yaml overwrites <root>/latest.jpg on every snapshot, so that file is the newest
+  // by construction. Prefer it explicitly: a lexicographic scan would otherwise pick a
+  // leftover snap_YYYYMMDD_HHMMSS.jpg from the old flat layout ('s' > 'l').
+  const std::string latest_name = "latest" + this->extension_;
+  bool has_latest = false;
+
+  // Fallback for cards without latest.jpg: names are timestamped
+  // (snap_YYYYMMDD_HHMMSS.jpg), so the lexicographically largest one is the newest.
   std::string best;
   struct dirent *entry;
   while ((entry = readdir(dir)) != nullptr) {
@@ -51,11 +70,17 @@ std::string LatestSnapshot::find_latest_() const {
       continue;
     if (name.compare(name.size() - this->extension_.size(), this->extension_.size(), this->extension_) != 0)
       continue;
+    if (name == latest_name) {
+      has_latest = true;
+      continue;
+    }
     if (name > best)
       best = name;
   }
   closedir(dir);
 
+  if (has_latest)
+    return this->root_ + "/" + latest_name;
   if (best.empty()) {
     ESP_LOGW(TAG, "No *%s file found in %s", this->extension_.c_str(), this->root_.c_str());
     return "";
@@ -82,6 +107,11 @@ void LatestSnapshot::handleRequest(AsyncWebServerRequest *request) {
   httpd_req_t *req = *request;
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=latest.jpg");
+  httpd_resp_set_hdr(req, "Accept-Ranges", "none");
+  // Close after the response: the web server only has a few client slots, and a browser that
+  // keeps the connection alive would hold one of them (see sd_file_server.cpp).
+  httpd_resp_set_hdr(req, "Connection", "close");
+  set_tcp_nodelay(req);
 
   size_t total = 0;
   size_t n;

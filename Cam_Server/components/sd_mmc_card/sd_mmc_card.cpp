@@ -75,8 +75,21 @@ std::vector<std::string> SdMmc::list_directory(std::string path, uint8_t depth) 
 
 std::vector<FileInfo> SdMmc::list_directory_file_info(const char *path, uint8_t depth) {
   std::vector<FileInfo> list;
-  list_directory_file_info_rec(path, depth, list);
+  this->list_directory_file_info(path, depth, [&list](FileInfo const &info) {
+    list.push_back(info);
+    return true;
+  });
   return list;
+}
+
+void SdMmc::list_directory_file_info(const char *path, uint8_t depth,
+                                     const std::function<bool(const FileInfo &)> &callback) {
+  list_directory_file_info_rec(path, depth, callback);
+}
+
+void SdMmc::list_directory_file_info(std::string path, uint8_t depth,
+                                     const std::function<bool(const FileInfo &)> &callback) {
+  this->list_directory_file_info(path.c_str(), depth, callback);
 }
 
 std::vector<FileInfo> SdMmc::list_directory_file_info(std::string path, uint8_t depth) {

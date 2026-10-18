@@ -84,3 +84,72 @@
   max-height: calc(100vh - 2.5rem);
   object-fit: contain;
 }
+
+/* ---------------------------------------------------------------------------
+   Help button - floating "?" at the bottom-left, opposite the camera panel.
+   A click opens a small popup listing the device's HTTP endpoints.
+   --------------------------------------------------------------------------- */
+#cam-help {
+  position: fixed;
+  left: 0.5rem;
+  bottom: 0.5rem;
+  z-index: 1000;
+  font: 14px system-ui, sans-serif;
+}
+
+#cam-help-toggle {
+  width: 2.2rem;
+  height: 2.2rem;
+  border: 0;
+  border-radius: 50%;
+  background: #1c1c1e;
+  color: #fff;
+  font: 700 1.1rem/1 system-ui, sans-serif;
+  cursor: pointer;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+}
+
+#cam-help-toggle:hover {
+  background: #3a3a3c;
+}
+
+#cam-help-panel {
+  display: none;
+  position: absolute;
+  left: 0;
+  bottom: 2.7rem;
+  min-width: 16rem;
+  padding: 0.5rem 0.7rem 0.7rem;
+  background: #1c1c1e;
+  color: #fff;
+  border-radius: 8px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+}
+
+#cam-help.open #cam-help-panel {
+  display: block;
+}
+
+#cam-help-title {
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+}
+
+#cam-help-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+#cam-help-list a {
+  color: #6cb6ff;
+  text-decoration: none;
+  word-break: break-all;
+}
+
+#cam-help-list a:hover {
+  text-decoration: underline;
+}
