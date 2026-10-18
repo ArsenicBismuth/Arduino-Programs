@@ -101,11 +101,22 @@ While idle-rate logging is on, the sketch prints a debug view:
 | `read_err` | failed I2C transactions / attempted. Hidden until it is non-zero |
 | `ci_ms` | negotiated BLE connection interval — the floor on pointer latency and the report rate. Shown once connected |
 | `tx_s` | reports actually sent per second, averaged over a second. Should track `1000 / ci_ms` |
-| `valve` | times the safety valve had to fire, i.e. the send window was missed. Hidden until it is non-zero |
+| `align` | share of those reports that went out in the aligned window rather than on the rate fallback. `100` means the loop places every report |
+| `loop_hz` | main loop passes per second — the ceiling on both the report rate and the sample rate |
+| `i2c_us` | average cost of one IMU transaction |
+| `wait_us` | average cost of the idle wait while the sensor has nothing ready |
+| `imu_task_us` | average cost of the whole `imuTask()` half of the loop (status poll, sample read, motion update) |
+| `hid_task_us` | average cost of the whole `hidTask()` half |
+| `ev_hz` | connection events per second as counted by the loop. Should equal `1000 / ci_ms`; much higher means `millis()` is running fast |
 
 `accel_mg` and `gyro_raw_dps` are also implemented in `printState()` but are currently commented
 out; they are the fields to re-enable when working out `kPointAxis`. Printed at 10 Hz, which is a
-display rate only — the IMU is still read at its full 416 Hz.
+display rate only.
+
+The sensor runs at 416 Hz, but the *effective* sample rate is one sample per main loop pass, so
+`loop_hz=` is the number that matters. A sample that is not read before the next one lands is simply
+overwritten in the sensor's output registers. `dt` is measured per sample, so the integration stays
+correct at any rate — a slower loop costs resolution, not angle.
 
 ## I2C reliability
 
@@ -139,6 +150,36 @@ static const uint32_t kImuI2cClockHz = 400000;  // try 100000 if read_err climbs
 
 400 kHz is the sensor's ceiling. A slower clock gives the lines time to settle, which is the first
 thing to try for a marginal bus — and, unlike everything else here, it costs nothing.
+
+## Gyro zero and creep
+
+The bias is measured once at startup and then re-zeroed continuously, because the sensor's zero-rate
+output drifts as the part warms up — a few degrees per second is normal for this part and it is the
+difference between a cursor that sits still and one that slides across the screen.
+
+The subtle part is deciding when the device is *still*. The rule this sketch used to use compared the
+gyro against a magnitude threshold, and that deadlocks:
+
+- a residual bias is a gyro reading with no rotation behind it;
+- if the residual grows past the threshold, the stillness test says "moving", so the tracker stays
+  off, so the residual is never removed, so the test keeps saying "moving".
+
+Measured on hardware: the startup calibration stored `bias_dps= -0.11, -2.57, 0.01`, and some time
+later the roll-compensation math put the residual corrected rate at about `(-0.21, -2.46) dps`. That
+is larger than the old `kStillThresholdDps` of 1.5, so the tracker had switched off permanently and
+the pointer crept at ~2.4 °/s — 38 HID counts every second, which is plainly visible.
+
+So stillness is now judged from **gravity**, which a bias cannot fool: a gyro can report a rate with
+nothing rotating, but world-up only moves if the device really rotates. The test is the angle between
+the current accelerometer direction and a slow low-pass of it (`kStillMinDot`, ~0.6°), plus a check
+that the magnitude is within `kStillAccelTolG` of 1 g so that translation does not pass as stillness.
+Because the reference lags while the device turns and catches up when it stops, the tracker re-engages
+automatically at whatever orientation the device is left in.
+
+The trade-off that remains is unavoidable: a gyro cannot distinguish a small bias from a genuinely
+slow rotation, so rotation slower than roughly a degree per second is partly absorbed. Making it
+purely a bias issue costs convergence time; the current `kBiasTrackingAlpha` settles the startup
+residual in a few seconds.
 
 ## HID transport
 
@@ -175,7 +216,7 @@ not ours to remove:
 
 | Source | Before | Now |
 | --- | --- | --- |
-| IMU sample period (416 Hz) | 2.4 ms | 2.4 ms |
+| IMU sample period | 2.4 ms (416 Hz) | one sample per loop pass — 2.4 ms once `loop_hz` ≥ 416 |
 | Gyro low-pass (`kGyroFilterTauMs`) | ~8 ms | ~3 ms |
 | Report throttle | 30 ms fixed | aligned to the connection event, ≤ 5 ms |
 | Connection interval | 30–50 ms | the host decides; 30 ms on Android |
@@ -192,17 +233,25 @@ The rules that produce the "Now" column:
   interval for the next one, and at 30 ms that is up to 30 ms of latency with nothing to do with the
   link. The radio publishes its own anchor through
   `Bluefruit.rawRadio().getConnectionTimingSnapshot()`, so the sketch sends within `kHidSendLeadUs` of
-  the next anchor instead, and at most one report per event-counter value.
+  the next anchor instead.
 - **The lead is 5 ms, not 1.** The radio pre-rolls: it starts spinning 2.2 ms before the anchor
   (`kBleConnRxStartLeadUs`) and owns the loop from then on, so the window has to clear that plus the
-  main loop's own ~1 ms granularity. Miss the window and the report waits another interval, which is
-  why the lead is deliberately generous.
+  main loop's own granularity. Miss the window and the report waits another interval, which is why the
+  lead is deliberately generous.
 - **One report per connection event, not more.** Sending faster than the link does not get motion to
   the host any sooner: the extra notifications stack in the driver's notification queue behind each
-  other, and that queue *is* the latency.
-- **A safety valve covers a missed window.** If there is motion but nothing has gone out for over 1.5
-  intervals, the report is sent anyway. `valve=` counts how often that had to happen and should stay
-  at zero; a rising count means the window is being missed.
+  other, and that queue *is* the latency. The window is spaced on the radio's own microsecond clock
+  rather than on the event counter, because only the clock is certain to advance; `ev_hz=` reports the
+  counter separately, so a disagreement between the two would be visible.
+- **A rate fallback covers a window the loop cannot reach.** Once a full interval has gone by with
+  nothing sent, the report goes out regardless of the window. That is the rate limit rather than the
+  phase, and it matters specifically when the main loop is slower than the connection interval: then
+  the window can only be hit by luck, and without the fallback the report rate would collapse to
+  whatever the luck catches. `align=` reports the share of sends that used the window; `100` means the
+  loop places every report, and a low number means the fallback is carrying the rate.
+- **The loop rate is the other limit.** `loop_hz=` is the real ceiling: a report cannot be composed
+  more often than the loop runs, and the IMU cannot be sampled more often either. If `loop_hz` is below
+  `1000 / ci_ms`, the loop, not the link, is setting the update rate.
 - **The connection interval is the host's decision.** This is the one delay that cannot be designed
   away. The interval is published at 7.5–15 ms through the standard GAP characteristic `0x2A04`
   (Peripheral Preferred Connection Parameters), and the core's HAL also queues its own update request
@@ -232,8 +281,9 @@ The rules that produce the "Now" column:
   (`kPairingGraceMs`, `hid=pairing-slow`).
 - **Trust but verify.** The periodic line reports `ci_ms=` (the interval the host actually settled on)
   and `tx_s=` (the pointer update rate it produces). `tx_s=` should track `1000 / ci_ms`; if it is well
-  below that, reports are being missed. `ci_ms= 30.0` with `tx_s= 33` means the host overruled the
-  request, and that is the floor this design can reach.
+  below that, something is dropping reports. `ci_ms= 30.0` with `tx_s= 33` means the host overruled the
+  request, and that is the floor this design can reach. `align=` and `loop_hz=` then say which side is
+  limiting: a low `align=` with `loop_hz` below `1000 / ci_ms` means the main loop, not the link.
 - **Every millisecond of filter tau is a millisecond of lag** added to the whole chain, which is why
   the gyro filter is short. It is not free: lowering it further trades smoothness for response.
 
@@ -290,8 +340,8 @@ Gotcha: the LSM6DS3 family encodes `FS_XL` as `00`=±2 g, `01`=±16 g, `10`=±4 
 | --- | --- | --- |
 | `kGyroFilterTauMs` | 3 ms | LPF on the rate signal (~53 Hz). Lower = snappier, noisier |
 | `kGravityFilterTauMs` | 50 ms | LPF on the roll reference (~3 Hz). Higher = steadier roll, more lag |
-| `kBiasTrackingAlpha` | 0.02 | Slow re-zero while still. Set to 0 to disable |
-| `kStillThresholdDps` | 1.5 | How quiet "still" must be before re-zeroing |
+| `kBiasTrackingAlpha` | 0.005 | Continuous re-zero while still. Set to 0 to disable |
+| `kStillMinDot` / `kStillAccelTolG` | 0.999945 / 0.08 | How still the gravity direction and magnitude must be before re-zeroing |
 | `kPrintIntervalMs` | 100 | Display rate only. Printing is ring-buffered, so this is not a latency knob |
 
 ### Axis mapping — tune this on hardware

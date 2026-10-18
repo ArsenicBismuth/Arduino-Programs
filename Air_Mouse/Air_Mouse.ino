@@ -176,10 +176,22 @@ static const uint8_t  kCalibrationMaxAttempts = 3;
 static const uint32_t kCalibrationTimeoutMs   = 2000;
 
 // Continuous re-zero while held still. Prevents slow creep between flicks.
-// Set kBiasTrackingAlpha to 0 to disable.
-static const float    kStillThresholdDps = 1.5f;
-static const uint16_t kStillSamples      = 150;   // ~0.36 s at 416 Hz
-static const float    kBiasTrackingAlpha = 0.02f;
+//
+// Stillness is judged from gravity, not from the gyro -- see the note in
+// updateMotion. There is deliberately no gyro-magnitude gate: a residual bias is
+// exactly a gyro reading that is not backed by any rotation, so a gate on the
+// residual means the tracker switches itself off precisely when the residual
+// grows large enough to be worth removing, and the cursor creeps instead.
+//
+// The reference is a slow low-pass of the direction of world-up. While the
+// device turns, the reference lags and the angle between the two grows; once it
+// stops, the reference catches up within a second or so and the tracker
+// re-engages wherever the device was left pointing.
+static const float    kStillDirectionTauMs = 500.0f;
+static const float    kStillMinDot         = 0.999945f;  // ~0.6 deg of lag
+static const float    kStillAccelTolG      = 0.08f;      // |a| within 8% of 1 g
+static const uint16_t kStillSamples      = 150;   // ~0.43 s of stillness first
+static const float    kBiasTrackingAlpha = 0.005f;
 
 // Low-pass filters. The gyro branch is fast (it carries the motion), the
 // accel/gravity branch is slow (it only needs to track roll, and it is
@@ -235,6 +247,12 @@ static const uint32_t kHidReportCeilMs     = 50;
 // waits a whole interval for the next event, so it is deliberately generous
 // against intervals of 7.5 ms and up.
 static const uint32_t kHidSendLeadUs = 5000;
+
+// Latitude on the rate fallback, in milliseconds. The fallback exists so the
+// report rate never drops below what the link can carry when the main loop is
+// too slow to hit the window above; a few milliseconds of slack keeps the link
+// from ever being queued two deep.
+static const uint32_t kHidSendSlackMs = 5;
 
 // Connection interval, in 1.25 ms units. A report cannot reach the host sooner
 // than the next connection event, so this sets the floor on latency and the
@@ -335,6 +353,10 @@ static float g_ptrRateDps[2]   = {0.0f, 0.0f};  // {horizontal, vertical}
 static float g_ptrDeg[2]       = {0.0f, 0.0f};  // integrated, wrapped
 
 static uint16_t g_stillCount = 0;
+// Reference direction of world-up for the stillness test, and whether it has
+// been seeded yet.
+static float g_stillDirG[3] = {0.0f, 0.0f, 0.0f};
+static bool  g_stillDirValid = false;
 
 // ---------------------------------------------------------------------------
 // HID state
@@ -355,20 +377,54 @@ static uint32_t g_hidLastReportMs = 0;
 static uint32_t g_hidLastKeepaliveMs = 0;
 static uint8_t  g_hidLastButtons  = 0;
 
-// Connection-event alignment: the counter identifies which event is coming, so
-// one report can be sent per event regardless of how the main loop's timing
-// happens to line up with the radio's.
+// Connection-event alignment. The counter identifies which event is coming, and
+// is reported as ev_hz; the window spacing itself is measured on the radio's own
+// microsecond clock, so a counter that fails to advance between snapshots cannot
+// hold the window shut.
 static uint16_t g_hidEventCounter  = 0;
-static bool     g_hidSentThisEvent = false;
+static uint32_t g_hidLastWindowUs  = 0;
 
 // Reporting statistics, for the periodic line. The effective rate is the thing
 // that decides whether the pointer feels smooth, so it is worth being able to
 // read it back rather than inferring it from the interval.
-static uint32_t g_hidReportCount    = 0;  // successful reports, ever
-static uint32_t g_hidValveCount     = 0;  // times the safety valve had to fire
-static uint32_t g_hidRateWindowMs   = 0;
-static uint32_t g_hidRateWindowBase = 0;
-static uint32_t g_hidRatePerSec     = 0;
+static uint32_t g_hidReportCount   = 0;  // successful reports, ever
+static uint32_t g_hidFallbackCount = 0;  // of those, sent on the rate fallback
+static uint32_t g_hidRatePerSec    = 0;
+
+// Loop diagnostics, all averaged over the same one-second window. The pointer
+// can only be as good as the rate the main loop runs at, and only as aligned as
+// that rate allows, so these say which side is the limit:
+//
+//   loop_hz  main loop passes per second. Below 1000/ci_ms the loop, not the
+//            link, is setting the report rate -- and the sample rate with it.
+//   i2c_us   average cost of one IMU transaction.
+//   wait_us  average cost of the idle wait when the sensor has nothing ready.
+//   ev_hz    connection events per second as counted by the loop. Compare with
+//            1000/ci_ms: if it is much higher, millis() is running fast and
+//            every timing decision in the sketch is skewed.
+//   imu_/hid_task_us  average cost of each half of the loop. Together with
+//            i2c_us and wait_us these account for the whole pass, so whichever
+//            number is out of line is the one to chase.
+static uint32_t g_loopCount    = 0;
+static uint32_t g_imuReadUs    = 0;
+static uint32_t g_imuReadCalls = 0;
+static uint32_t g_waitUs       = 0;
+static uint32_t g_waitCalls    = 0;
+static uint32_t g_imuTaskUs    = 0;
+static uint32_t g_hidTaskUs    = 0;
+static uint32_t g_evTotal      = 0;
+static uint32_t g_diagWindowMs = 0;
+static uint32_t g_diagLoopBase = 0;
+static uint32_t g_diagEvBase   = 0;
+static uint32_t g_diagReportBase = 0;
+static uint32_t g_diagFallbackBase = 0;
+static uint32_t g_diagLoopHz   = 0;
+static uint32_t g_diagI2cUs    = 0;
+static uint32_t g_diagWaitUs   = 0;
+static uint32_t g_diagEvHz     = 0;
+static uint32_t g_diagImuTaskUs = 0;
+static uint32_t g_diagHidTaskUs = 0;
+static uint32_t g_diagAlignedPct = 0;
 
 // Connection-interval negotiation state, all reset per connection.
 static uint32_t g_hidConnectedMs   = 0;      // when the link came up
@@ -520,6 +576,8 @@ static bool imuRead(uint8_t reg, uint8_t* buffer, size_t length) {
   for (uint8_t attempt = 0; attempt < kImuReadAttempts; ++attempt) {
     if (imuReadOnce(reg, buffer, length, &stage, &code)) {
       g_imuConsecErrors = 0;
+      ++g_imuReadCalls;
+      g_imuReadUs += micros() - startUs;
       return true;
     }
     if (micros() - startUs >= kImuRetryBudgetUs) {
@@ -528,6 +586,8 @@ static bool imuRead(uint8_t reg, uint8_t* buffer, size_t length) {
     delayMicroseconds(kImuRetryGapUs);
   }
 
+  ++g_imuReadCalls;
+  g_imuReadUs += micros() - startUs;
   ++g_imuReadErrors;
   if (g_imuConsecErrors < 0xFFFF) {
     ++g_imuConsecErrors;
@@ -788,11 +848,14 @@ static void extractPlane(const float vec3[3], float out2[2]) {
 }
 
 static void updateMotion(const int16_t gyroRaw[3], const int16_t accelRaw[3], float dtSec) {
-  // 1. Bias-correct the raw rates.
+  // 1. Bias-correct the raw rates, and scale the accelerometer once for both the
+  //    roll estimate and the stillness test below.
   float corrected[3];
+  float accelG[3];
   for (uint8_t i = 0; i < 3; ++i) {
     corrected[i] = static_cast<float>(gyroRaw[i]) * kGyroMdpsPerLsb / 1000.0f - g_gyroBiasDps[i];
     g_accelMg[i] = static_cast<float>(accelRaw[i]) * kAccelMgPerLsb;
+    accelG[i]    = static_cast<float>(accelRaw[i]) * kAccelGPerLsb;
   }
 
   // 2. Low-pass the rates. The bias tracker below uses this filtered value:
@@ -810,14 +873,52 @@ static void updateMotion(const int16_t gyroRaw[3], const int16_t accelRaw[3], fl
     }
   }
 
-  // 3. Track the bias while the device is demonstrably still. This is what
-  //    keeps a long-idle cursor from creeping as the sensor warms up.
-  bool still = true;
-  for (uint8_t i = 0; i < 3; ++i) {
-    if (fabsf(g_gyroDps[i]) > kStillThresholdDps) {
-      still = false;
+  // 3. Is the device still? Judge it from gravity, never from the gyro.
+  //
+  //    The gyro is the thing a bias fools, so gating on the gyro's own magnitude
+  //    deadlocks: a residual larger than the gate holds the tracker off
+  //    permanently, and that residual is the very creep the tracker exists to
+  //    remove. Gravity cannot be fooled that way -- a gyro bias is a rate with no
+  //    rotation behind it, so world-up stays where it is while the gyro claims
+  //    otherwise. A hand cannot produce a bias-shaped lie in the accelerometer:
+  //    to change the direction of world-up it has to actually rotate.
+  const float accelMag = sqrtf(accelG[0] * accelG[0] + accelG[1] * accelG[1] +
+                               accelG[2] * accelG[2]);
+  bool still = false;
+  if (accelMag > 0.5f) {
+    const float invMag = 1.0f / accelMag;
+    const float dirG[3] = {accelG[0] * invMag, accelG[1] * invMag, accelG[2] * invMag};
+
+    if (!g_stillDirValid) {
+      // No reference yet: adopt this direction and let the settle count run.
+      for (uint8_t i = 0; i < 3; ++i) {
+        g_stillDirG[i] = dirG[i];
+      }
+      g_stillDirValid = true;
+    } else {
+      const float dot = dirG[0] * g_stillDirG[0] + dirG[1] * g_stillDirG[1] +
+                        dirG[2] * g_stillDirG[2];
+      still = (dot >= kStillMinDot) && (fabsf(accelMag - 1.0f) <= kStillAccelTolG);
+
+      const float dirAlpha = alphaFor(kStillDirectionTauMs, dtSec);
+      for (uint8_t i = 0; i < 3; ++i) {
+        g_stillDirG[i] += dirAlpha * (dirG[i] - g_stillDirG[i]);
+      }
+      // Keep the reference a unit vector: while the device is turning it is
+      // averaging different directions and would otherwise shrink.
+      const float dirMag = sqrtf(g_stillDirG[0] * g_stillDirG[0] +
+                                 g_stillDirG[1] * g_stillDirG[1] +
+                                 g_stillDirG[2] * g_stillDirG[2]);
+      if (dirMag > 0.5f) {
+        for (uint8_t i = 0; i < 3; ++i) {
+          g_stillDirG[i] /= dirMag;
+        }
+      }
     }
   }
+
+  // Track the bias while the device is demonstrably still. This is what keeps a
+  // long-idle cursor from creeping as the sensor warms up.
   if (still) {
     if (g_stillCount < kStillSamples) {
       ++g_stillCount;
@@ -835,10 +936,6 @@ static void updateMotion(const int16_t gyroRaw[3], const int16_t accelRaw[3], fl
   //    points along world-up when the device is not accelerating, so this is
   //    an absolute (drift-free) roll reference.
   float planeAccelRaw[2];
-  float accelG[3];
-  for (uint8_t i = 0; i < 3; ++i) {
-    accelG[i] = static_cast<float>(accelRaw[i]) * kAccelGPerLsb;
-  }
   extractPlane(accelG, planeAccelRaw);
 
   const float gravityAlpha = alphaFor(kGravityFilterTauMs, dtSec);
@@ -928,6 +1025,36 @@ static void printState() {
     Serial.print(g_imuReads);
   }
 
+  // Everything below is measured over one shared one-second window.
+  const uint32_t rateNowMs = millis();
+  const uint32_t rateElapsedMs = rateNowMs - g_diagWindowMs;
+  if (rateElapsedMs >= 1000U) {
+    g_hidRatePerSec =
+        (g_hidReportCount - g_diagReportBase) * 1000U / rateElapsedMs;
+    const uint32_t fallbacks = g_hidFallbackCount - g_diagFallbackBase;
+    const uint32_t reports = g_hidReportCount - g_diagReportBase;
+    g_diagAlignedPct = (reports != 0U)
+                           ? ((reports - fallbacks) * 100U / reports)
+                           : 100U;
+    g_diagLoopHz = (g_loopCount - g_diagLoopBase) * 1000U / rateElapsedMs;
+    g_diagEvHz   = (g_evTotal - g_diagEvBase) * 1000U / rateElapsedMs;
+    g_diagI2cUs  = (g_imuReadCalls != 0U) ? (g_imuReadUs / g_imuReadCalls) : 0U;
+    g_diagWaitUs = (g_waitCalls != 0U) ? (g_waitUs / g_waitCalls) : 0U;
+
+    const uint32_t loops = g_loopCount - g_diagLoopBase;
+    g_diagImuTaskUs = (loops != 0U) ? (g_imuTaskUs / loops) : 0U;
+    g_diagHidTaskUs = (loops != 0U) ? (g_hidTaskUs / loops) : 0U;
+
+    g_diagReportBase    = g_hidReportCount;
+    g_diagFallbackBase  = g_hidFallbackCount;
+    g_diagLoopBase      = g_loopCount;
+    g_diagEvBase        = g_evTotal;
+    g_imuReadUs = 0; g_imuReadCalls = 0;
+    g_waitUs = 0;    g_waitCalls = 0;
+    g_imuTaskUs = 0; g_hidTaskUs = 0;
+    g_diagWindowMs = rateNowMs;
+  }
+
   // The connection interval is the floor on pointer latency, so it is worth
   // watching: a few milliseconds means the host took the advertised fast
   // interval, 30-50 ms means it overrode us. Shown only once a connection
@@ -935,27 +1062,27 @@ static void printState() {
   if (g_hidConnectedMs != 0U) {
     Serial.print(" ci_ms= ");
     Serial.print(static_cast<float>(hidConnIntervalUnits()) * 1.25f, 1);
-
-    // Effective reports per second, averaged over a second. It should track
-    // 1000 / ci_ms; well below that means reports are being missed somewhere.
-    const uint32_t rateNowMs = millis();
-    const uint32_t rateElapsedMs = rateNowMs - g_hidRateWindowMs;
-    if (rateElapsedMs >= 1000U) {
-      g_hidRatePerSec =
-          (g_hidReportCount - g_hidRateWindowBase) * 1000U / rateElapsedMs;
-      g_hidRateWindowBase = g_hidReportCount;
-      g_hidRateWindowMs = rateNowMs;
-    }
     Serial.print(" tx_s= ");
     Serial.print(g_hidRatePerSec);
-
-    // Only shown once it has happened: a rising count means the send window is
-    // being missed and the fallback is doing the work.
-    if (g_hidValveCount != 0U) {
-      Serial.print(" valve= ");
-      Serial.print(g_hidValveCount);
-    }
+    // Share of reports that went out in the aligned window rather than on the
+    // rate fallback. 100 means the loop is fast enough to place every report;
+    // low means it is not, and the fallback is carrying the rate.
+    Serial.print(" align= ");
+    Serial.print(g_diagAlignedPct);
   }
+
+  Serial.print(" loop_hz= ");
+  Serial.print(g_diagLoopHz);
+  Serial.print(" i2c_us= ");
+  Serial.print(g_diagI2cUs);
+  Serial.print(" wait_us= ");
+  Serial.print(g_diagWaitUs);
+  Serial.print(" imu_task_us= ");
+  Serial.print(g_diagImuTaskUs);
+  Serial.print(" hid_task_us= ");
+  Serial.print(g_diagHidTaskUs);
+  Serial.print(" ev_hz= ");
+  Serial.print(g_diagEvHz);
 
   Serial.println();
 }
@@ -972,9 +1099,10 @@ static void hidConnectCallback(uint16_t connHandle) {
   g_hidConnRetryMs  = 0;
   g_hidConnSlowdown = false;
   g_hidConnFastSeen = false;
-  g_hidSentThisEvent = false;
-  g_hidRateWindowMs = millis();
-  g_hidRateWindowBase = g_hidReportCount;
+  g_hidLastWindowUs = 0;
+  g_diagWindowMs = millis();
+  g_diagReportBase = g_hidReportCount;
+  g_diagFallbackBase = g_hidFallbackCount;
   g_hidRatePerSec = 0;
   Bluefruit.Security.requestPairing();
 }
@@ -985,7 +1113,7 @@ static void hidDisconnectCallback(uint16_t connHandle, uint8_t reason) {
   Serial.println(reason, HEX);
   g_hidConnectedMs = 0;
   g_hidConnRetryMs = 0;
-  g_hidSentThisEvent = false;
+  g_hidLastWindowUs = 0;
 }
 
 static void hidStartAdvertising() {
@@ -1183,8 +1311,38 @@ static void hidTask(uint32_t nowMs) {
     g_hidLastButtons = 0;
     g_hidLastReportMs = nowMs;
     g_hidLastKeepaliveMs = nowMs;
-    g_hidSentThisEvent = false;
+    g_hidLastWindowUs = 0;
     return;
+  }
+
+  // Read the radio's anchor before deciding anything: it paces the report, and
+  // the event counter it carries is what the loop-rate diagnostic counts.
+  bool windowOpen = false;
+  xiao_nrf54l15::BleConnectionTimingSnapshot timing;
+  if (Bluefruit.rawRadio().getConnectionTimingSnapshot(&timing)) {
+    if (timing.nextEventCounter != g_hidEventCounter) {
+      g_hidEventCounter = timing.nextEventCounter;
+      ++g_evTotal;
+    }
+    // The window is the good moment: the report is handed over just before the
+    // next connection event, so it leaves in that event and carries motion that
+    // is only kHidSendLeadUs old. timeUntilNextEventUs of 0 means the anchor has
+    // already gone by, so this event cannot be caught any more.
+    //
+    // One window send per event, spaced on the radio's own microsecond clock.
+    // The event counter would do the same job, but only if it is known to
+    // advance between snapshots; a clock cannot get stuck, and ev_hz reports the
+    // counter separately so a disagreement between the two is visible.
+    const uint32_t windowSpacingUs = (timing.intervalUs > kHidSendLeadUs)
+                                         ? (timing.intervalUs - kHidSendLeadUs)
+                                         : timing.intervalUs;
+    windowOpen = timing.connected && timing.timeUntilNextEventUs != 0U &&
+                 timing.timeUntilNextEventUs <= kHidSendLeadUs &&
+                 (g_hidLastWindowUs == 0U ||
+                  (uint32_t)(timing.nowUs - g_hidLastWindowUs) >= windowSpacingUs) &&
+                 // Half an interval since the last report, whatever sent it,
+                 // so a fallback send cannot be followed straight away.
+                 (nowMs - g_hidLastReportMs) >= (g_hidReportPeriodMs / 2U);
   }
 
   const uint8_t buttons = g_buttonStable ? MOUSE_BUTTON_LEFT : 0;
@@ -1195,46 +1353,28 @@ static void hidTask(uint32_t nowMs) {
       kHidIdleReportEnabled && ((nowMs - g_hidLastKeepaliveMs) >= kHidIdleReportMs);
 
   if (dx == 0 && dy == 0 && !buttonChanged && !keepaliveDue) {
-    // Keep the safety-valve reference fresh while there is nothing to say, so it
+    // Keep the fallback reference fresh while there is nothing to say, so it
     // measures "motion has been waiting", not "the last send was long ago".
     // Without this the first report after an idle spell would bypass the window.
     g_hidLastReportMs = nowMs;
     return;  // nothing to say, and no keepalive wanted yet
   }
 
-  // Hand the report over shortly before the next connection event starts, so it
-  // leaves in that event. A free-running timer has an arbitrary phase against
-  // the radio's: a report that misses its event by a hair waits a whole
-  // interval for the next one, and at 30 ms that is up to 30 ms of latency with
-  // nothing to do with the link itself.
-  bool sendNow = false;
-  xiao_nrf54l15::BleConnectionTimingSnapshot timing;
-  if (Bluefruit.rawRadio().getConnectionTimingSnapshot(&timing)) {
-    if (timing.nextEventCounter != g_hidEventCounter) {
-      g_hidEventCounter  = timing.nextEventCounter;
-      g_hidSentThisEvent = false;
-    }
-    // One report per event: the link carries that cleanly, and a second one
-    // only stacks up in the notification queue, which is the latency itself.
-    // timeUntilNextEventUs of 0 means the anchor has already gone by, so this
-    // event cannot be caught any more.
-    if (!g_hidSentThisEvent && timing.timeUntilNextEventUs != 0U &&
-        timing.timeUntilNextEventUs <= kHidSendLeadUs) {
-      sendNow = true;
-    }
-  } else if ((nowMs - g_hidLastReportMs) >= g_hidReportPeriodMs) {
-    // No anchor to work from (not expected while connected): fall back to a
-    // plain interval-derived cadence.
-    sendNow = true;
-  }
-
-  // Safety valve. One report per event is the intent, not a hard rule: if the
-  // window keeps being missed (a long stall elsewhere in the loop, say), motion
-  // must still get out rather than pile up in the accumulator.
+  // Two routes, and the second only exists for the case the first cannot cover.
+  //
+  // The window places the report for the event. One report per event is all the
+  // link will take cleanly: a second only stacks in the driver's notification
+  // queue, and that queue is the latency.
+  //
+  // The fallback is the rate limit, not the phase. Once a full interval has
+  // gone by with nothing sent, send regardless of the window. That matters when
+  // the main loop is slower than the connection interval -- then the window can
+  // only be hit by luck, and without the fallback the report rate would drop to
+  // whatever the luck happens to catch instead of holding at the loop's rate.
+  bool sendNow = windowOpen;
   if (!sendNow &&
-      (nowMs - g_hidLastReportMs) >= (g_hidReportPeriodMs * 3U / 2U + 5U)) {
+      (nowMs - g_hidLastReportMs) >= (g_hidReportPeriodMs + kHidSendSlackMs)) {
     sendNow = true;
-    ++g_hidValveCount;
   }
   if (!sendNow) {
     return;
@@ -1250,8 +1390,12 @@ static void hidTask(uint32_t nowMs) {
     g_pendingDeg[1] -= static_cast<float>(dy) / kHidCountsPerDeg;
     g_hidLastButtons = buttons;
     g_hidLastKeepaliveMs = nowMs;
-    g_hidSentThisEvent = true;
     ++g_hidReportCount;
+    if (windowOpen) {
+      g_hidLastWindowUs = timing.nowUs;
+    } else {
+      ++g_hidFallbackCount;
+    }
   }
   // On failure the motion simply stays pending and goes out on the next event.
 }
@@ -1295,7 +1439,10 @@ static void imuTask() {
 
   if (!imuDataReady()) {
     imuServiceFaults();
+    const uint32_t waitStartUs = micros();
     delay(1);
+    g_waitUs += micros() - waitStartUs;
+    ++g_waitCalls;
     return;
   }
 
@@ -1306,7 +1453,10 @@ static void imuTask() {
     // integrates over its own interval. Tearing the sensor down here is what
     // turned a routine bus glitch into an endless re-init-and-recalibrate loop.
     imuServiceFaults();
+    const uint32_t waitStartUs = micros();
     delay(1);
+    g_waitUs += micros() - waitStartUs;
+    ++g_waitCalls;
     return;
   }
 
@@ -1371,6 +1521,11 @@ void setup() {
 void loop() {
   // Both tasks run from one loop. The IMU side never blocks on the radio, and
   // the HID side is a no-op until a host pairs.
+  ++g_loopCount;
+  const uint32_t imuStartUs = micros();
   imuTask();
+  const uint32_t hidStartUs = micros();
   hidTask(millis());
+  g_imuTaskUs += hidStartUs - imuStartUs;
+  g_hidTaskUs += micros() - hidStartUs;
 }
