@@ -14,7 +14,8 @@
 //
 //   2. cam_store::prune()   - age-based retention. Walks the snapshot tree one
 //      directory entry at a time and deletes a bounded batch of old files per
-//      call, so it never builds a directory listing in RAM.
+//      call, so it never builds a directory listing in RAM. The daily caller
+//      (cam.yaml) loops it until the tree is drained.
 //
 // Path convention: the sd_mmc_card component's own methods take card-relative
 // paths ("/snap", it prepends "/sdcard"); cam_store works with absolute VFS
@@ -167,7 +168,8 @@ inline bool write_file(const char *abs_path, const uint8_t *data, size_t len) {
 // Delete up to `budget` files older than `retention_days` under `root`, then
 // drop any day folder that is now empty. Streams the tree entry by entry, so
 // the memory cost is a couple of path buffers, not a listing. Returns how many
-// files were removed.
+// files were removed. A return count equal to `budget` means the caller should
+// call it again to keep draining (cam.yaml loops it once a day).
 inline int prune(const char *root, int retention_days, int budget) {
   // NB: qualified as std::time because a `using namespace esphome;` in the
   // generated main.cpp makes the unqualified name ambiguous with esphome::time.

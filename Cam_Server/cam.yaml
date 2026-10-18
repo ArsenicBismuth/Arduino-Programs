@@ -323,16 +323,25 @@ sensor:
       sorting_weight: 40
 
 # --- Retention ---------------------------------------------------------------
-# Once a minute, delete a bounded batch of files older than the retention window
-# (age from the FAT mtime), then drop empty day folders. The batch limit keeps
-# each pass short so it can't stall the main loop.
+# Once a day, delete files older than the retention window (age from the FAT
+# mtime), then drop empty day folders. The pass drains in bounded 100-file
+# batches so a big backlog can't stall the main loop in one go, but gives up
+# after 2000 files so the worst case stays bounded. Note this runs regardless
+# of the "Auto Snapshot" switch, and (like any ESPHome interval) first fires
+# ~24 h after boot - a device rebooted more often than that never prunes.
 interval:
-  - interval: 60s
+  - interval: 24h
     then:
       - lambda: |-
-          int n = cam_store::prune("/sdcard/snap", (int) id(cam_retention_days)->state, 100);
-          if (n > 0)
-            ESP_LOGI("cam_snap", "Pruned %d old snapshot(s)", n);
+          const int days = (int) id(cam_retention_days)->state;
+          int total = 0;
+          int n;
+          do {
+            n = cam_store::prune("/sdcard/snap", days, 100);
+            total += n;
+          } while (n == 100 && total < 2000);
+          if (total > 0)
+            ESP_LOGI("cam_snap", "Pruned %d old snapshot(s)", total);
 
 # =============================================================================
 #  [6] CONTROLS

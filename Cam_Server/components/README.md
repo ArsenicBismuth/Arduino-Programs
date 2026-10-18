@@ -185,9 +185,11 @@ chunk, and with one httpd task that would wedge the whole web server for a close
   the `/latest` endpoint and `latest_snapshot` keep working unchanged. Day folders keep each
   FAT directory small - writing to one flat directory at a 10 s cadence would pass tens of
   thousands of entries in 7 days.
-- **Retention** (`cam_store::prune`): once a minute, delete a bounded batch (100) of files
-  older than `Retention Days` (age from the FAT mtime) and drop empty day folders. It streams
-  directory entries one at a time, so no listing is ever held in RAM.
+- **Retention** (`cam_store::prune`): once a day, drain the files older than `Retention Days`
+  (age from the FAT mtime) in bounded 100-file batches (up to 2000 per pass) and drop empty
+  day folders. It streams directory entries one at a time, so no listing is ever held in RAM,
+  and the batch cap keeps the single daily pass from stalling the main loop for long. Runs
+  regardless of the `Auto Snapshot` switch.
 
 Tuning: the `Change Score` sensor reports the current difference (0..255); watch it while
 something moves and set `Change Threshold` just below that. Turn off `Change Gate` to store
