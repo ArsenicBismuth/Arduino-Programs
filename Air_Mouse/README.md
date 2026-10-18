@@ -96,7 +96,7 @@ While idle-rate logging is on, the sketch prints a debug view:
 | Field | Meaning |
 | --- | --- |
 | `roll_deg` | roll about the pointing axis, from gravity — absolute and drift-free |
-| `ptr_dps` | roll-compensated pointer rates, (horizontal, vertical), deg/s |
+| `ptr_dps` | roll-compensated pointer rates, (horizontal, vertical), deg/s, after the deadzone — so `0.0` at rest is the confirmation that nothing is creeping |
 | `ptr_deg` | those rates integrated — pointer movement so far, wrapped to ±180° |
 | `read_err` | failed I2C transactions / attempted. Hidden until it is non-zero |
 | `ci_ms` | negotiated BLE connection interval — the floor on pointer latency and the report rate. Shown once connected |
@@ -142,14 +142,41 @@ Watch `read_err` in the log:
 | `read_err=0` before pairing, stays 0 | clean |
 | `read_err` climbs, `stage=1` | the register-address write was NACKed — bus/electrical |
 | `read_err` climbs, `stage=2` | the data phase failed — bus/electrical |
-| `read_err` well above 0 and `imu=bus recovery` appears | lower `kImuI2cClockHz` to `100000` first |
+| `read_err` well above 0 and `imu=bus recovery` appears | marginal bus — but **do not** slow the clock until you have checked the rate at both speeds, see below |
 
 ```cpp
-static const uint32_t kImuI2cClockHz = 400000;  // try 100000 if read_err climbs
+static const uint32_t kImuI2cClockHz = 400000;  // measured: slower is worse, not better
 ```
 
-400 kHz is the sensor's ceiling. A slower clock gives the lines time to settle, which is the first
-thing to try for a marginal bus — and, unlike everything else here, it costs nothing.
+The obvious fix for a marginal bus is to slow it down and give the lines time to settle. **That is
+measurably backwards on this hardware.** Same wiring, same firmware, connected, only the constant
+changed:
+
+| Clock | Dead transactions |
+| --- | --- |
+| 400 kHz | 0.53 % (4 of 756) |
+| 100 kHz | 3.47 % (23 of 662) |
+
+6.6× worse for 4× the clock period. That ratio is the whole diagnosis: the failures are **not** edges
+failing to settle, they are the radio's 2.4 GHz burst landing *during* a transaction. The error rate
+therefore tracks the length of the exposure window — a 13-byte burst is ~0.3 ms at 400 kHz and ~1.2 ms
+at 100 kHz, and it is exposed for all of it. Slower is worse because it is exposed for longer.
+
+The log says which case you have without any further measurement: `read_err` was **0 while unconnected**
+and non-zero while connected, at both clocks. Interference. A bus with genuinely bad edges would fail
+regardless of the radio.
+
+So a slower clock is only the right answer for a bus that fails *because of* edge rate, and the test is
+whether the rate improves when you slow down. Here it got worse. And it costs twice: the slower clock
+also eats loop time, which is the last thing a marginal bus needs.
+
+400 kHz is the part's specified ceiling, so there is no headroom above it to trade for a shorter window.
+If `read_err` must come down, the lever is physical — shorter or shielded wiring.
+
+One caveat that matters for what `read_err` means: the retry path makes a *failed* transaction free, but
+I2C has no checksum, so a burst corrupted *without* NACKing is accepted and lands in the output as a bad
+sample. That is why the error free rate is worth caring about beyond tidiness, and why 3.47 % is a much
+worse trade than it looks.
 
 ## Gyro zero and creep
 
@@ -180,6 +207,24 @@ The trade-off that remains is unavoidable: a gyro cannot distinguish a small bia
 slow rotation, so rotation slower than roughly a degree per second is partly absorbed. Making it
 purely a bias issue costs convergence time; the current `kBiasTrackingAlpha` settles the startup
 residual in a few seconds.
+
+The tracker removes the *mean* residual, which is what creep is. It does not remove the *instantaneous*
+noise around that mean, and the old magnitude-gated design hid that noise by accident: the same 1.5 °/s
+threshold that deadlocked also acted as a deadband, absorbing everything below it. With the gate gone,
+roughly ±0.5 °/s of rest noise reaches the pointer — about 8 counts/s, which the accumulator turns into
+a one-count shimmer at a few hertz.
+
+`kHidDeadzoneDps` puts a deliberate deadband back, sized to that noise. It is *soft*: below the
+threshold the axis is held at zero, above it the rate is reduced by exactly the threshold rather than
+truncated at it. Truncating would put a step at the boundary, so motion would have to cross the
+threshold before moving at all and would then start at full rate; subtracting keeps the response
+continuous and turns the cost into a constant rate offset instead of a lost band. The measured rest
+noise is the number to size it against, and `0.0f` disables it for the raw gyro straight through.
+
+The honest cost: a deliberate 1 °/s sweep loses 60 % of itself. That is still milder than the 1.5 °/s
+hard deadband the sketch used to have, but it is the setting to lower first if fine positioning feels
+heavy. Nothing here can give both a perfectly still cursor and full slow-motion gain — that is the
+gyro's precision floor, and the way out of it is a second sensor, not a constant.
 
 ## HID transport
 
@@ -252,6 +297,19 @@ The rules that produce the "Now" column:
 - **The loop rate is the other limit.** `loop_hz=` is the real ceiling: a report cannot be composed
   more often than the loop runs, and the IMU cannot be sampled more often either. If `loop_hz` is below
   `1000 / ci_ms`, the loop, not the link, is setting the update rate.
+- **The loop is worth watching, because the cost was not where it looked.** Connecting used to halve it,
+  724 → 357 Hz, with `hid_task_us` climbing 192 → 1297 µs. Nothing in `hidTask` is expensive enough to
+  explain that. The cause is one level down: every Bluefruit connection or security query
+  (`Bluefruit.connected()`, `Security.isEncrypted()`) begins with `serviceBluefruitBeforePollingState()`,
+  which runs `manager().idleService()` *and* dispatches deferred callbacks. That is the same work the
+  core already does once per pass, unconditionally, in `main()`'s `nrf54l15_clean_idle_service()` and
+  `yield()` — so asking three or four separate times a pass, at 350 passes a second, was pure
+  duplication of a live-link service routine. The link state and the connection interval change only on
+  connect, disconnect, pairing or a parameter update, so both are now polled on a timer and cached
+  (`kLinkPollMs`, `kConnPollMs`); the report path tests the cached value. Nothing starves, because the
+  core's own per-pass service runs regardless of what the sketch asks it. Measured effect:
+  `hid_task_us` 1297 → **90 µs**, a 14× cut. It is worth knowing that this cost is invisible in the
+  sketch's own source: nothing in `hidTask` looks expensive, and nothing in it is.
 - **The connection interval is the host's decision.** This is the one delay that cannot be designed
   away. The interval is published at 7.5–15 ms through the standard GAP characteristic `0x2A04`
   (Peripheral Preferred Connection Parameters), and the core's HAL also queues its own update request
@@ -301,10 +359,13 @@ compositor) adds a frame or two on top. A gyro air pointer will not feel like a 
 | `kConnAttemptsPerStep` / `GapMs` | 2 / 1000 | Attempts per ladder step, and the gap between them |
 | `kHidSendLeadUs` | 5000 | How long before the next connection event the report is handed over. Must exceed the radio's 2.2 ms pre-roll plus the loop's ~1 ms granularity, but stay well under the interval |
 | `kHidCountsPerDeg` | 16.0 | Pointer gain, bounded by the report format — see below |
+| `kHidDeadzoneDps` | 0.6 | Per-axis soft deadzone on the pointer rate, sized to the measured rest noise. `0.0f` passes the raw gyro |
 | `kHidPendingCapDeg` | 16 | Ceiling on unreported motion, kept near one report's worth |
 | `kHidReportFloorMs` / `CeilMs` | 5 / 50 | Clamp on the derived report period |
 | `kHidIdleReportEnabled` / `Ms` | false / 100 | Optional zero-motion keepalive if the host sleeps the link |
 | `kButtonDebounceMs` | 20 | Button debounce window |
+| `kImuI2cClockHz` | 400000 | IMU bus clock, at the part's ceiling. Slower is measurably *worse* here — see [I2C reliability](#i2c-reliability) |
+| `kLinkPollMs` / `kConnPollMs` | 50 / 100 | How often the cached link state and the connection interval are re-read. Both are polled rather than checked per pass, because each query services the whole stack |
 
 `kHidCountsPerDeg` is bounded from above by the report format, not by feel. One report carries at most
 ±127 counts (signed 8-bit), so the gain has to satisfy
@@ -380,14 +441,21 @@ rolls.
   where gravity stops defining a roll.
 - The embedded FIFO and the IMU interrupt pin (`IMU_INT`, D24) are unused.
 - One connection interval of transmission delay is unavoidable, and the host's input pipeline adds
-  more. `ci_ms=` in the log is the part of it this sketch can see. On Android the interval is 30 ms
-  because that is the platform's `CONNECTION_PRIORITY_BALANCED` band; the peripheral's published and
-  requested values are only ever requests.
+  more. `ci_ms=` in the log is the part of it this sketch can see. What the host settles on is its own
+  decision: Android's default for a GATT client is `CONNECTION_PRIORITY_BALANCED` (30–50 ms), and the
+  peripheral's published and requested values are only ever requests. In practice the request here was
+  accepted and the link came up at 15 ms, but the host grants or refuses that, so another phone or
+  Android version may well answer 30.
+- A gyro cannot separate a small bias from a very slow rotation. Motion below roughly 1 °/s is therefore
+  partly absorbed by the bias tracker and the deadzone. That is the sensor's precision floor, not a
+  tuning failure: getting below it needs a different sensor, not a different constant.
 - `kPointAxis` is still unverified on hardware; the pointer signs were verified on the current board.
 
 ## Next steps
 
 1. Verify `kPointAxis` on real hardware (re-enable `accel_mg`).
-2. Add a pointer-acceleration curve and a deadzone, applied per report rather than per sample.
+2. Add a pointer-acceleration curve, per report rather than per sample, so slow movement stays precise
+   while fast sweeps cover more ground without a bigger fixed gain. The per-sample soft deadzone is
+   already in place (`kHidDeadzoneDps`).
 3. Move the sampling path to the sensor FIFO so the effective sample rate no longer depends on how
    long the loop takes.

@@ -122,10 +122,28 @@ static const uint8_t kAccelDataReady = 0x01;
 // I2C reliability
 // ---------------------------------------------------------------------------
 
-// The sensor's I2C ceiling. This bus is short, but the failure mode of a
-// marginal one (edge rates, coupling from the BLE transmitter) is a single
-// NACK that kills a whole multi-byte burst. If the log shows read errors, drop
-// this to 100000 before suspecting anything else in the code.
+// The sensor's I2C clock. The part is rated to 400 kHz and that is where it
+// belongs, at the fast end of its spec.
+//
+// It is tempting to slow this down when read errors appear, on the theory that a
+// marginal bus wants longer edges. Measured on this hardware, that is backwards.
+// On the unshielded back-pad bus, while connected: 0.53 % dead transactions at
+// 400 kHz and 3.47 % at 100 kHz -- 6.6x worse for 4x the clock period.
+//
+// The mechanism is worth naming, because it decides which fix applies. These
+// failures are the radio's 2.4 GHz burst landing *during* a transaction, not bad
+// edges failing to settle. The error rate therefore tracks the length of the
+// exposure window: a 13-byte burst is ~0.3 ms at 400 kHz and ~1.2 ms at 100 kHz,
+// and it is exposed for all of it. The ratio above is that window ratio.
+//
+// Note also that read errors are zero while unconnected and non-zero while
+// connected at both clocks, which says interference rather than bus quality
+// without any further measurement.
+//
+// A slower clock costs twice, then: more corrupt reads, and a loop starved of
+// time. If read errors must come down, the lever is physical -- shorter or
+// shielded wiring. 400 kHz is the part's specified ceiling, so there is no
+// headroom above it to trade.
 static const uint32_t kImuI2cClockHz = 400000;
 
 // A burst of 12 bytes is ~110 bit times, so even a tiny per-bit error rate
@@ -300,6 +318,21 @@ static const uint8_t  kConnAttemptsPerStep = 2;   // 6 attempts in total
 static const uint32_t kConnRetryGapMs      = 1000;
 static const uint32_t kConnFastThresholdMs = 20;  // at or below this is "fast"
 
+// How often to re-ask the bleeding obvious.
+//
+// Every Bluefruit connection and security query runs the stack service routine
+// (serviceBluefruitBeforePollingState() -> manager().idleService()), which on a
+// live link costs a few hundred microseconds. Asking three separate times on
+// every pass at 350 passes/s was measurable: it accounted for most of the loop
+// time and capped the IMU sample rate well below its own 416 Hz ODR.
+//
+// None of these answers change often -- the interval at most a handful of times
+// a session, the link state only on connect, disconnect, pairing or subscribe --
+// so they are polled on a timer and cached in between. The core still services
+// the stack once per pass through delay()/yield(), so nothing starves here.
+static const uint32_t kConnPollMs = 100;  // connection interval / pairing grace
+static const uint32_t kLinkPollMs = 50;   // link ready (connected, encrypted, subscribed)
+
 // Cap on unreported motion. If the link stalls for a second, an uncapped
 // accumulator would keep the cursor moving after the hand has stopped. Past
 // this the backlog is dropped instead.
@@ -309,6 +342,24 @@ static const uint32_t kConnFastThresholdMs = 20;  // at or below this is "fast"
 // several. A larger cap here costs nothing in normal use and adds tail lag
 // exactly when the link is already struggling.
 static const float kHidPendingCapDeg = 16.0f;
+
+// Soft deadzone, in degrees per second, applied per pointer axis before
+// integration.
+//
+// A gyro cannot tell a slow rotation from a small zero-mean offset, so with no
+// deadzone the last fraction of a degree per second is always present: the
+// cursor shimmers by a count or so while the device sits still. Below this rate
+// the axis is held at zero; above it the rate is reduced by exactly this much
+// rather than truncated at it. That keeps the output continuous -- motion just
+// past the threshold fades in from zero instead of jumping -- and it means the
+// cost is a constant rate offset, not a lost band. A 2 dps sweep loses this much
+// off the top; a 0.5 dps drift is absorbed completely.
+//
+// Set to 0.0f to disable and get the raw gyro straight through. Note that this
+// deliberately clips a little deliberate slow motion, so raising it much past
+// this buys a steadier cursor at the price of fine positioning; the value here
+// is sized to the measured rest noise of about +/-0.5 dps.
+static const float kHidDeadzoneDps = 0.6f;
 
 // Onboard button, active low, as left click.
 static const uint8_t  kButtonPin        = PIN_BUTTON;
@@ -432,6 +483,13 @@ static uint32_t g_hidConnRetryMs   = 0;      // last time we asked for a fast on
 static uint8_t  g_hidConnRetries   = 0;
 static bool     g_hidConnSlowdown  = false;  // pairing grace expired, gave up
 static bool     g_hidConnFastSeen  = false;  // logged that the host complied
+
+// Cached link state, refreshed on a timer rather than per pass (see kLinkPollMs).
+// Kept fresh by name, because the expense being avoided is invisible at the call
+// site and the obvious "just check it" edit is exactly the one that regresses it.
+static bool     g_linkReady  = false;
+static uint32_t g_linkPollMs = 0;
+static uint32_t g_hidConnPollMs = 0;
 
 // Debounced button state (see hidPollButton).
 static bool     g_buttonRaw      = false;
@@ -968,6 +1026,22 @@ static void updateMotion(const int16_t gyroRaw[3], const int16_t accelRaw[3], fl
   g_ptrRateDps[0] = kPointerHorizontalSign * horizontal;
   g_ptrRateDps[1] = kPointerVerticalSign * vertical;
 
+  // 5b. Soft deadzone, per axis. Truncating at the threshold instead would leave
+  //     a step at the boundary: motion would have to exceed the threshold to
+  //     start moving and would then start at full rate. Subtracting the
+  //     threshold from the magnitude keeps the response continuous at the edge
+  //     and costs a constant rate offset rather than a lost band. See
+  //     kHidDeadzoneDps. Zero disables it and passes the raw rate through.
+  if (kHidDeadzoneDps > 0.0f) {
+    for (uint8_t i = 0; i < 2; ++i) {
+      const float rate = g_ptrRateDps[i];
+      const float mag  = fabsf(rate);
+      g_ptrRateDps[i]  = (mag <= kHidDeadzoneDps)
+                             ? 0.0f
+                             : rate * ((mag - kHidDeadzoneDps) / mag);
+    }
+  }
+
   // 6. Integrate into pointer movement.
   //    g_pendingDeg is the real accumulator that the HID layer drains; it is
   //    capped so a stalled link cannot leave a backlog of motion that keeps the
@@ -1104,6 +1178,9 @@ static void hidConnectCallback(uint16_t connHandle) {
   g_diagReportBase = g_hidReportCount;
   g_diagFallbackBase = g_hidFallbackCount;
   g_hidRatePerSec = 0;
+  // Ask for a fast interval on the next pass, not up to a poll interval later.
+  g_hidConnPollMs = millis() - kConnPollMs;
+  g_linkPollMs    = millis() - kLinkPollMs;
   Bluefruit.Security.requestPairing();
 }
 
@@ -1114,6 +1191,12 @@ static void hidDisconnectCallback(uint16_t connHandle, uint8_t reason) {
   g_hidConnectedMs = 0;
   g_hidConnRetryMs = 0;
   g_hidLastWindowUs = 0;
+  // Drop the cache now rather than at the next poll: the link is gone and
+  // mouseReport() on it would just fail. Any pending motion is kept, capped, and
+  // drains when the link comes back.
+  g_linkReady     = false;
+  g_linkPollMs    = millis() - kLinkPollMs;
+  g_hidConnPollMs = millis() - kConnPollMs;
 }
 
 static void hidStartAdvertising() {
@@ -1167,11 +1250,28 @@ static void hidBegin() {
   Serial.println("\" (pair from the host, HID needs an encrypted link)");
 }
 
+// Refreshes the cached link answer. Everything below goes through Bluefruit,
+// and every Bluefruit connection/security query first runs the stack service
+// routine, so this is far more expensive than the three predicate reads suggest
+// -- see kLinkPollMs. Called from hidTask; the cached value is what the report
+// path tests.
+//
+// A stale "not ready" only delays the first report by one poll interval, and the
+// disconnect callback clears the cache outright so a dead link is never used for
+// more than the remainder of the pass it died in.
+static void hidPollLink(uint32_t nowMs) {
+  if ((nowMs - g_linkPollMs) < kLinkPollMs) {
+    return;
+  }
+  g_linkPollMs = nowMs;
+  g_linkReady  = Bluefruit.connected() && Bluefruit.Security.isEncrypted(0) &&
+                 blehid.mouseNotifyEnabled();
+}
+
 // HID only accepts reports on an encrypted link. Before that, mouseReport()
 // silently returns false, so this is also the "is it worth trying" check.
 static bool hidLinkReady() {
-  return Bluefruit.connected() && Bluefruit.Security.isEncrypted(0) &&
-         blehid.mouseNotifyEnabled();
+  return g_linkReady;
 }
 
 // Degrees to HID counts. The report field is signed 8-bit, so the result is
@@ -1246,7 +1346,18 @@ static void hidRefreshReportPeriod() {
 // more room between events, because a link that pairs slowly still beats one
 // that never pairs. After that it is a nudge: walk the retry ladder, since the
 // host is the one that decides and the driver only asks once per call.
+//
+// Polled on kConnPollMs rather than run every pass. Its answers change a handful
+// of times a session and the slowest transition it guards is the pairing grace
+// period, four seconds, so a 100 ms poll is well inside the noise. The cost it
+// avoids is real: three Bluefruit queries, each of which services the whole
+// stack, on every pass at 350 passes/s.
 static void hidMaintainConnInterval(uint32_t nowMs) {
+  if ((nowMs - g_hidConnPollMs) < kConnPollMs) {
+    return;
+  }
+  g_hidConnPollMs = nowMs;
+
   if (!Bluefruit.connected()) {
     return;
   }
@@ -1301,6 +1412,7 @@ static void hidMaintainConnInterval(uint32_t nowMs) {
 
 static void hidTask(uint32_t nowMs) {
   hidPollButton(nowMs);
+  hidPollLink(nowMs);
   hidMaintainConnInterval(nowMs);
 
   if (!hidLinkReady()) {
