@@ -54,8 +54,14 @@ std::string LatestSnapshot::find_latest_() const {
     return "";
   }
 
-  // Snapshot names are timestamped (snap_YYYYMMDD_HHMMSS.jpg), so the lexicographically
-  // largest matching name is also the newest.
+  // cam.yaml overwrites <root>/latest.jpg on every snapshot, so that file is the newest
+  // by construction. Prefer it explicitly: a lexicographic scan would otherwise pick a
+  // leftover snap_YYYYMMDD_HHMMSS.jpg from the old flat layout ('s' > 'l').
+  const std::string latest_name = "latest" + this->extension_;
+  bool has_latest = false;
+
+  // Fallback for cards without latest.jpg: names are timestamped
+  // (snap_YYYYMMDD_HHMMSS.jpg), so the lexicographically largest one is the newest.
   std::string best;
   struct dirent *entry;
   while ((entry = readdir(dir)) != nullptr) {
@@ -64,11 +70,17 @@ std::string LatestSnapshot::find_latest_() const {
       continue;
     if (name.compare(name.size() - this->extension_.size(), this->extension_.size(), this->extension_) != 0)
       continue;
+    if (name == latest_name) {
+      has_latest = true;
+      continue;
+    }
     if (name > best)
       best = name;
   }
   closedir(dir);
 
+  if (has_latest)
+    return this->root_ + "/" + latest_name;
   if (best.empty()) {
     ESP_LOGW(TAG, "No *%s file found in %s", this->extension_.c_str(), this->root_.c_str());
     return "";
