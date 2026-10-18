@@ -92,6 +92,58 @@ card root, which `cam_store::prune()` (scoped to `/snap`) never removes. They en
 root directory and are what `/latest` used to pick up, so it is worth emptying the card
 root by hand once — the current firmware keeps everything under `/snap/`.
 
+### 2026-10-18 (b) — links from a directory opened with a trailing slash contained `//`
+
+**Symptom.** Opening a file from a folder browsed as `/file/snap/20261018/` loaded
+`/file/snap/20261018//001744.jpg` — a doubled slash.
+
+**Root cause.** `list_directory_file_info_rec()` copied the listing path and then always
+appended a separator before each entry name. When the path already ended in `/` (exactly what
+a browser sends for a directory URL), every entry came out as `/snap/20261018//x.jpg`, and
+the row link is built straight from it. FatFs tolerated the doubled slash, so the file still
+opened, but the URL was wrong.
+
+**Fix.** Only insert the separator when the path does not already end in one.
+
+### 2026-10-18 (c) — the board went unresponsive shortly after browsing a few files
+
+**Symptom.** After opening a couple of files the device stopped answering — the whole host
+went quiet, including the :8080/:8081 camera servers — and recovered after tens of seconds.
+The serial log sometimes showed `[E][json:111] JSON document overflow`.
+
+**What is going on.** Two independent limits are in play:
+
+- The esp-idf web server is built with `max_open_sockets = 7` and reserves three of those for
+  itself, so only about **four client connections** can be open at once. Neither `web_server`
+  nor the YAML exposes this, so it cannot be raised from the config. When the server is full
+  and a new connection arrives, `lru_purge_enable` (set by ESPHome) makes httpd close the
+  *least recently used* session — it drops a live request, which is exactly what "takes a
+  long time or does not respond" looks like from the browser. The :8080/:8081 camera servers
+  are tighter still: ESPHome configures them with a single socket.
+- esp-idf's web server sends no `Connection` header, so a browser applies HTTP/1.1
+  keep-alive and parks up to six connections per host — enough on its own to fill the server.
+  Measured on the device: holding keep-alive connections open to `/file` while issuing
+  another request pushed that request from ~0.1 s to ~8 s, and holding connections whose
+  responses were *not* read wedged the device entirely. That last part is because there is
+  only **one** httpd task and esp-idf sends with a 5 s timeout, so a client that stops
+  reading blocks every other request on the port.
+
+`JSON document overflow` is ArduinoJson 7 (7.4.2) failing to allocate its pool — a **heap
+exhaustion** message, not a "payload too big" one, and the step just before the failed
+allocation abort described in the 2026-10-17 entry.
+
+**Fix.** The file server and `/latest` now answer with `Connection: close`, so the browser
+drops its connection once the body is read instead of parking it, and the index page declares
+an inline favicon so loading it no longer costs an extra request. Browsing files therefore
+does not compete with the web UI (and its long-lived SSE connection) for the same few session
+slots.
+
+**If it still happens**, check, in order: whether the ESPHome web UI is open at the same time
+(its SSE connection plus its parked asset connections use most of the four slots), whether
+the camera stream on :8080 is open (that server has a single socket), and the serial log
+around the event — a reboot banner (`rst:0x…`, `Guru Meditation`, `abort()`) points at heap
+exhaustion rather than plain connection contention.
+
 ## Periodic snapshots + change gate (`cam_snapshot.h`)
 
 `cam.yaml` saves snapshots on a schedule and filters near-duplicates, using the helpers in
