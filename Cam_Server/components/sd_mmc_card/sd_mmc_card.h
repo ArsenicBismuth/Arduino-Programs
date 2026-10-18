@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include "esphome/core/gpio.h"
 #include "esphome/core/defines.h"
 #include "esphome/core/component.h"
@@ -70,6 +71,11 @@ class SdMmc : public Component {
   std::vector<std::string> list_directory(std::string path, uint8_t depth);
   std::vector<FileInfo> list_directory_file_info(const char *path, uint8_t depth);
   std::vector<FileInfo> list_directory_file_info(std::string path, uint8_t depth);
+  /// Streams directory entries to \p callback one at a time instead of materialising the
+  /// whole listing in a vector. The callback returns false to stop the walk early (used by
+  /// the file server to render a single page of entries without a full-listing allocation).
+  void list_directory_file_info(const char *path, uint8_t depth, const std::function<bool(const FileInfo &)> &callback);
+  void list_directory_file_info(std::string path, uint8_t depth, const std::function<bool(const FileInfo &)> &callback);
   size_t file_size(const char *path);
   size_t file_size(std::string const &path);
 #ifdef USE_SENSOR
@@ -111,7 +117,8 @@ class SdMmc : public Component {
 #ifdef USE_ESP_IDF
   std::string sd_card_type() const;
 #endif
-  std::vector<FileInfo> &list_directory_file_info_rec(const char *path, uint8_t depth, std::vector<FileInfo> &list);
+  void list_directory_file_info_rec(const char *path, uint8_t depth,
+                                    const std::function<bool(const FileInfo &)> &callback);
   static std::string error_code_to_string(ErrorCode);
 };
 

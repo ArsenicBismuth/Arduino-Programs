@@ -108,31 +108,32 @@ std::vector<uint8_t> SdMmc::read_file(char const *path) {
   return res;
 }
 
-std::vector<FileInfo> &SdMmc::list_directory_file_info_rec(const char *path, uint8_t depth,
-                                                           std::vector<FileInfo> &list) {
+void SdMmc::list_directory_file_info_rec(const char *path, uint8_t depth,
+                                         const std::function<bool(const FileInfo &)> &callback) {
   ESP_LOGV(TAG, "Listing directory file info: %s\n", path);
 
   File root = SD_MMC.open(path);
   if (!root) {
     ESP_LOGE(TAG, "Failed to open directory");
-    return list;
+    return;
   }
   if (!root.isDirectory()) {
     ESP_LOGE(TAG, "Not a directory");
-    return list;
+    return;
   }
 
   File file = root.openNextFile();
   while (file) {
-    list.emplace_back(file.path(), file.size(), file.isDirectory());
+    FileInfo info(file.path(), file.size(), file.isDirectory());
+    if (!callback(info))
+      break;
     if (file.isDirectory()) {
       if (depth) {
-        list_directory_file_info_rec(file.path(), depth - 1, list);
+        list_directory_file_info_rec(file.path(), depth - 1, callback);
       }
     }
     file = root.openNextFile();
   }
-  return list;
 }
 
 bool SdMmc::is_directory(const char *path) {

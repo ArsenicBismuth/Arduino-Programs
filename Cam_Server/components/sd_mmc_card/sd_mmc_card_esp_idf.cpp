@@ -152,14 +152,14 @@ std::vector<uint8_t> SdMmc::read_file(char const *path) {
   return res;
 }
 
-std::vector<FileInfo> &SdMmc::list_directory_file_info_rec(const char *path, uint8_t depth,
-                                                           std::vector<FileInfo> &list) {
+void SdMmc::list_directory_file_info_rec(const char *path, uint8_t depth,
+                                         const std::function<bool(const FileInfo &)> &callback) {
   ESP_LOGV(TAG, "Listing directory file info: %s\n", path);
   std::string absolut_path = build_path(path);
   DIR *dir = opendir(absolut_path.c_str());
   if (!dir) {
     ESP_LOGE(TAG, "Failed to open directory: %s", strerror(errno));
-    return list;
+    return;
   }
   char entry_absolut_path[FILE_PATH_MAX];
   char entry_path[FILE_PATH_MAX];
@@ -183,12 +183,13 @@ std::vector<FileInfo> &SdMmc::list_directory_file_info_rec(const char *path, uin
         file_size = info.st_size;
       }
     }
-    list.emplace_back(entry_path, file_size, entry->d_type == DT_DIR);
+    FileInfo info(entry_path, file_size, entry->d_type == DT_DIR);
+    if (!callback(info))
+      break;
     if (entry->d_type == DT_DIR && depth)
-      list_directory_file_info_rec(entry_absolut_path, depth - 1, list);
+      list_directory_file_info_rec(entry_absolut_path, depth - 1, callback);
   }
   closedir(dir);
-  return list;
 }
 
 bool SdMmc::is_directory(const char *path) {

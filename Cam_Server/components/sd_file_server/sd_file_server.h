@@ -37,7 +37,7 @@ class SDFileServer : public Component, public AsyncWebHandler {
   std::string build_prefix() const;
   std::string extract_path_from_url(std::string const &) const;
   std::string build_absolute_path(std::string) const;
-  void write_row(AsyncResponseStream *response, sd_mmc_card::FileInfo const &info) const;
+  void write_row(std::string &out, sd_mmc_card::FileInfo const &info) const;
   void handle_index(AsyncWebServerRequest *, std::string const &) const;
   void handle_get(AsyncWebServerRequest *) const;
   void handle_delete(AsyncWebServerRequest *);
