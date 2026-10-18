@@ -107,6 +107,10 @@ void LatestSnapshot::handleRequest(AsyncWebServerRequest *request) {
   httpd_req_t *req = *request;
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=latest.jpg");
+  httpd_resp_set_hdr(req, "Accept-Ranges", "none");
+  // Close after the response: the web server only has a few client slots, and a browser that
+  // keeps the connection alive would hold one of them (see sd_file_server.cpp).
+  httpd_resp_set_hdr(req, "Connection", "close");
   set_tcp_nodelay(req);
 
   size_t total = 0;

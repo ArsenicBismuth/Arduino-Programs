@@ -30,6 +30,14 @@ static void set_tcp_nodelay(httpd_req_t *req) {
     ESP_LOGW(TAG, "setsockopt(TCP_NODELAY) failed: %s", strerror(errno));
   }
 }
+
+// The esp-idf web server is configured for 7 sockets, 3 of which it reserves for itself, so
+// only ~4 client connections exist at a time. It sends no "Connection" header and esp-idf does
+// not add one, so a browser defaults to keep-alive and parks up to six connections per host -
+// which alone can fill the server. Declaring "Connection: close" makes the client drop the
+// connection once the body is read, so browsing files never holds a slot a later request needs
+// (a full server makes httpd evict the least recently used session, i.e. drop a live request).
+static void set_connection_close(httpd_req_t *req) { httpd_resp_set_hdr(req, "Connection", "close"); }
 #endif
 
 // Sends the index page in small pieces instead of accumulating the whole page in a
@@ -69,6 +77,7 @@ static const char INDEX_HEAD[] = R"(
     <meta name=viewport content="width=device-width, initial-scale=1,user-scalable=no">
     <meta name="color-scheme" content="dark">
     <title>SD Card Files</title>
+    <link rel="icon" href="data:,">
     <style>
     body {
       font-family: 'Segoe UI', system-ui, sans-serif;
@@ -257,6 +266,7 @@ void SDFileServer::handleRequest(AsyncWebServerRequest *request) {
   httpd_req_t *req = *request;
   httpd_resp_set_status(req, "405 Method Not Allowed");
   httpd_resp_set_type(req, "application/json");
+  set_connection_close(req);
   httpd_resp_send(req, "{ \"error\": \"method not allowed\" }", HTTPD_RESP_USE_STRLEN);
 #else
   request->send(405, "application/json", "{ \"error\": \"method not allowed\" }");
@@ -380,6 +390,7 @@ void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string cons
   httpd_req_t *req = *request;
   httpd_resp_set_type(req, "text/html");
   httpd_resp_set_hdr(req, "Accept-Ranges", "none");
+  set_connection_close(req);
   ChunkWriter out(req);
 #else
   AsyncResponseStream *response = request->beginResponseStream("text/html");
@@ -475,6 +486,8 @@ void SDFileServer::handle_download(AsyncWebServerRequest *request, std::string c
 
   httpd_req_t *req = *request;
   httpd_resp_set_type(req, mime.c_str());
+  httpd_resp_set_hdr(req, "Accept-Ranges", "none");
+  set_connection_close(req);
   set_tcp_nodelay(req);
 
   // 2 KB chunks keep the per-chunk framing and syscall overhead down while staying well
