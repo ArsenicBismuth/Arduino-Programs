@@ -235,7 +235,7 @@ static const float kHidPendingCapDeg = 16.0f;
 // reduced by exactly the threshold rather than truncated at it, so the response
 // stays continuous and the cost is a constant offset instead of a lost band.
 // Sized to the measured +/-0.5 dps of rest noise. 0.0f disables it.
-static const float kHidDeadzoneDps = 0.6f;
+static const float kHidDeadzoneDps = 3.0f;
 
 // Onboard button, active low, as left click.
 static const uint8_t  kButtonPin        = PIN_BUTTON;
