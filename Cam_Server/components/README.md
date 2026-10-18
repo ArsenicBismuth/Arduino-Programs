@@ -19,8 +19,10 @@ latest_snapshot:
   extension: .jpg
 ```
 
-"Newest" is the lexicographically largest matching name, which is correct here because
-files are timestamped (`snap_YYYYMMDD_HHMMSS.jpg`).
+`latest.jpg` (i.e. `latest` + `extension`) is preferred when present, because `cam.yaml`
+overwrites it on every save, so it is the newest by construction. Only if it is missing
+does the lookup fall back to the lexicographically largest matching name (correct for the
+old timestamped `snap_YYYYMMDD_HHMMSS.jpg` files, whose names sort by time).
 
 ## Troubleshooting log
 
@@ -50,9 +52,45 @@ static buffer — see `latest_snapshot.cpp`. Peak extra memory is ~0.5 KB instea
 `SdMmc::read_file()`, which resizes a vector to the whole file. It is now patched to
 stream the same way, so `GET /file/<name>.jpg` works.
 
-Known limitation: the `/file` index still builds its whole page in RAM first
-(`beginResponseStream`), so it will hit the same ceiling once the card holds a few dozen
-snapshots. Streaming the index would be a small follow-up patch.
+Update: the `/file` index no longer buffers the whole page in RAM. It is streamed in small
+chunks and paged (100 rows per request, `?start=N`) — see the 2026-10-18 entry below.
+
+### 2026-10-18 — `/file/<dir>` hung completely, root index was sluggish
+
+**Symptom.** `GET /file` (card root) usually loaded, but `GET /file/snap` and
+`GET /file/snap/<dir>/` hung every time and never returned a byte. It happened with a
+small card (fewer than a hundred files), so it was not a "too many files" problem.
+
+**Root cause.** The index served a *directory listing*, and built the whole page in RAM
+first: the full `std::vector<FileInfo>` plus the complete HTML as a `std::string` in
+`AsyncResponseStream`. Even ~90 rows is ~26 KB of HTML, and on this non-PSRAM board an
+allocation that size fails (see the 2026-10-17 entry) — the failed allocation aborts the
+device, so the request dies before a single byte is sent. The root listing stays small
+(a couple of folders plus `latest.jpg`) and so usually survived; a day folder full of
+snapshots did not.
+
+**Fix.** `sd_file_server` now streams the page in small chunks
+(`httpd_resp_send_chunk`, no full-page `std::string`) and renders at most 100 rows per
+request, chosen with `?start=N`, stopping the directory walk as soon as the page is full.
+The SD driver gained a callback-based listing walk so the listing vector is never built.
+`/file` and `/file/snap/<dir>/` now serve a bounded page regardless of card contents.
+
+**Related fixes in the same pass.**
+
+- `sd_mmc_card::update_sensors()` called `f_getfree()` — a full-FAT scan — on every
+  write/delete/mkdir even when no used/total/free sensor was configured, and outside the
+  FatFs volume lock. It now runs only when a space sensor exists. Together with the
+  per-write cost, this was why the device also felt slow and flaky.
+- Unsupported HTTP methods (anything but GET/DELETE) fell through `handleRequest()`
+  without a response, so the client hung until its own timeout. They now get a 405.
+- Streamed downloads and `/latest` used 512-byte chunks with Nagle enabled; they now use
+  2 KB chunks with `TCP_NODELAY` set on the session.
+- `/latest` preferred a stale `snap_*.jpg` over `latest.jpg` (see above).
+
+**Card housekeeping.** Older firmware wrote flat `snap_YYYYMMDD_HHMMSS.jpg` files into the
+card root, which `cam_store::prune()` (scoped to `/snap`) never removes. They enlarge the
+root directory and are what `/latest` used to pick up, so it is worth emptying the card
+root by hand once — the current firmware keeps everything under `/snap/`.
 
 ## Periodic snapshots + change gate (`cam_snapshot.h`)
 
