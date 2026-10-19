@@ -217,12 +217,14 @@ static const uint32_t kHidReportFloorMs    = 5;
 static const uint32_t kHidReportCeilMs     = 50;
 
 // Attempt-rate pacing. The radio takes a notification only every 2-3 events, so
-// offering one per event buys nothing and fills the radio's queue -- which then
-// drains at the radio's rate, i.e. after the hand has stopped. Refusals measure the
-// link directly: attempts/reports is the overshoot, so scaling the period by it lands
-// on the link's rate in one step. README, "HID transport".
+// offering one per event buys nothing and fills its 8-deep queue, which then drains
+// after the hand has stopped. A refusal means that queue was full, so 1000/tx_s is the
+// link's own period; the pacing parks a margin slower than that and stays there.
+// README, "HID transport".
 static const uint32_t kHidPaceWindowMs = 1000;  // measurement window
-static const uint8_t  kHidPaceProbePct = 95;    // nothing refused: try this much of the period
+static const uint32_t kHidPaceMarginMs = 2;     // added to the measured drain period
+static const uint32_t kHidPaceProbePct = 95;    // no drain measured yet: probe faster
+static const uint32_t kHidPaceHoldMs   = 5000;  // then re-probe this slowly
 static const uint32_t kHidPaceMinRate  = 8;     // below this reports/s, not a measurement
 
 // How long before the next connection event the report is handed to the radio.
@@ -352,6 +354,8 @@ static uint32_t g_hidAttemptPerSec = 0;
 // movement is measured, and 0 means "no pacing", which is the free-running state
 // the first measurement is taken in.
 static uint32_t g_hidPacePeriodMs    = 0;  // derived attempt period, 0 = unpaced
+static uint32_t g_hidPaceFloorMs     = 0;  // drain + margin, 0 = not measured yet
+static uint32_t g_hidPaceHoldMs      = 0;  // when the floor was last set or eased
 static uint32_t g_hidPacePollMs      = 0;
 static uint32_t g_hidPaceWindowMs    = 0;  // start of the current measurement window
 static uint32_t g_hidPaceBase        = 0;  // report count at that start
@@ -1009,7 +1013,8 @@ static void printState() {
     // win: how often the window was open, against 1000/ci_ms, the events the link
     // offers. try: reports handed over. tx_s: reports the radio took. pace: the
     // hand-over period in ms, so try ~= 1000/pace when paced. tx_s < try means the
-    // radio's queue was full, and what is sitting in it is cursor movement to come.
+    // radio's queue was full, and what is sitting in it is cursor movement to come;
+    // the pacing aims to keep the two equal.
     Serial.print(" win= ");
     Serial.print(g_hidWindowPerSec);
     Serial.print(" try= ");
@@ -1238,6 +1243,7 @@ static void hidMaintainPace(uint32_t nowMs) {
     // set against the old rate, so start from scratch instead of creeping to it.
     g_hidPaceIntervalUnits = units;
     g_hidPacePeriodMs      = 0;
+    g_hidPaceFloorMs       = 0;
     g_hidPaceWindowMs      = nowMs;
     g_hidPaceBase          = g_hidReportCount;
     g_hidPaceAttemptBase   = g_hidAttemptCount;
@@ -1269,16 +1275,26 @@ static void hidMaintainPace(uint32_t nowMs) {
     // unusable rather than dividing by it, and back right off.
     periodMs = kHidReportCeilMs;
   } else if (reports < attempts) {
-    // Refusals mean the radio's queue was full, i.e. the sketch was offering faster than
-    // the link drains. attempts/reports is that overshoot, so scaling by it lands the
-    // period on the link's rate in one step -- and, unlike a peak, in either direction.
-    const uint32_t scaled = (periodMs * attempts) / reports;
-    periodMs = (scaled > periodMs) ? scaled : periodMs;
-  } else {
-    // Nothing refused all second, so the queue had room and the period is at or under
-    // the link's rate. Nothing to correct towards, so probe faster -- the only direction
-    // that can recover a ceiling the pacing has parked under.
+    // Refusals mean the queue was full, so what left is exactly what the link drains.
+    // Park a margin slower: the queue then empties and stays empty, instead of holding
+    // a report per attempt period of motion the hand has already finished.
+    periodMs = (1000U / reports) + kHidPaceMarginMs;
+    g_hidPaceFloorMs = periodMs;
+    g_hidPaceHoldMs  = nowMs;
+  } else if (g_hidPaceFloorMs == 0U) {
+    // Nothing refused, and no drain measured yet to park on: probe faster.
     periodMs = (periodMs * kHidPaceProbePct) / 100U;
+  } else {
+    // Nothing refused, so the link kept up with the period in force. Hold it, and ease
+    // the floor down now and then: a probe is the only way to find a link that got
+    // faster, and it costs one second of refusals when the guess was wrong.
+    if ((nowMs - g_hidPaceHoldMs) >= kHidPaceHoldMs) {
+      if (g_hidPaceFloorMs > kHidReportFloorMs) {
+        --g_hidPaceFloorMs;
+      }
+      g_hidPaceHoldMs = nowMs;
+    }
+    periodMs = g_hidPaceFloorMs;
   }
 
   if (periodMs < kHidReportFloorMs) {

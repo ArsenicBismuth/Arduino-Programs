@@ -97,6 +97,9 @@ A debug view of the pipeline, at `kPrintIntervalMs`, with `kSerialLogEnabled = t
  win= 257 try= 55 pace= 16 align= 98 lat= 0 miss= 0 loop_hz= 413
 ```
 
+That capture predates the pacing margin: `try` above `tx_s` is the queue being filled, and `pace` now
+parks near `1000 / tx_s + 2` instead.
+
 | Field | Meaning |
 | --- | --- |
 | `roll_deg` | roll about the aiming axis, from gravity — absolute and drift-free |
@@ -107,8 +110,8 @@ A debug view of the pipeline, at `kPrintIntervalMs`, with `kSerialLogEnabled = t
 | `ci_ms` | negotiated BLE connection interval — the report period before the radio's own limits are applied. Shown once connected |
 | `tx_s` | reports the radio *accepted* per second: the pointer's real update rate. It tracks `(1000 / ci_ms) / 2.5`, **not** `1000 / ci_ms` — see [What actually sets the report rate](#what-actually-sets-the-report-rate). Measured 26–27/s at a 15 ms interval and 52/s at 7.5 ms, one report per 2.5 events at both |
 | `win` | how often the send window was available. A link-health number: roughly the loop passes that landed inside the window before an event |
-| `try` | reports handed to the radio per second. Should sit just above `tx_s`; the few refusals per second are the pacing's control signal, not a fault |
-| `pace` | the hand-over period in ms the pacing settled on. `try` is about `1000 / pace`, and `tx_s` is the rate the radio grants |
+| `try` | reports handed to the radio per second. Once the pacing has parked it sits level with `tx_s`; more means the radio's queue was full, i.e. the sketch offered faster than the link drains |
+| `pace` | the hand-over period in ms the pacing settled on. `try` is about `1000 / pace`, and `tx_s` is the rate the radio grants — the pacing aims just under it |
 | `align` | share of accepted reports that went out in the aligned window rather than on the rate fallback. `100` means the loop placed every report; a low number means the fallback carried the rate |
 | `lat` | slave latency in force. Only the host sets it and the sketch asks for 0, so a non-zero value is the host's doing and means it anchors less often than every event |
 | `miss` | consecutive connection events the link layer failed to receive. Persistent non-zero is the device side dropping them, not the host |
@@ -239,19 +242,21 @@ The rules that shape the code, all of them from the core's own HID example:
   notifications and add latency.
 - **Reports are aligned to the connection event.** The report is handed over just before the next event
   so it leaves in that event instead of waiting an extra interval — see [Latency](#latency).
-- **The hand-over rate is paced to what the radio accepts** (`hidMaintainPace`). The cadence belongs
-  to the link, not to a timer: the radio only lets a notification out every 2–3 connection events, so
-  offering one per event does not buy reports, it fills the radio's notification queue — see
+- **The hand-over rate is paced to just under what the radio drains** (`hidMaintainPace`). The cadence
+  belongs to the link, not to a timer: the radio only lets a notification out every 2–3 connection
+  events, so offering one per event does not buy reports, it fills the radio's notification queue — see
   [What actually sets the report rate](#what-actually-sets-the-report-rate) for why that is and what
-  measures it. That queue is the real problem — it drains at the radio's rate, so everything sitting
-  in it arrives *after* your hand has stopped, which is a cursor that keeps going. The rate is not
-  derived from the interval, because it is not a clean function of it: measured 26–27 reports/s at a
-  15 ms interval (2.6 events each) and 52/s at 7.5 ms (2.6 each). It is measured from the refusals
-  instead, which are the direct signal: a refusal means the queue was full, so `attempts / reports` for
-  that second is exactly how far above the link's rate the sketch is offering. Scaling the period by
-  that ratio lands on the link's rate in one step, and unlike a remembered peak it can move in both
-  directions when the link changes. When nothing is refused there is nothing to correct towards, so the
-  period is shortened 5 % to probe for a ceiling the pacing may have parked under.
+  measures it. That queue is the real problem — it is 8 reports deep, it drains at the radio's rate, so
+  everything sitting in it arrives *after* your hand has stopped, which is a cursor that keeps going.
+  Matching the rate is not enough, because a queue that is exactly full never empties: the pacing parks
+  a margin *slower* than the link (`kHidPaceMarginMs`), so the queue drains and the motion stays in the
+  sketch, where a stop is a stop. The rate is not derived from the interval, because it is not a clean
+  function of it: measured 26–27 reports/s at a 15 ms interval (2.6 events each) and 52/s at 7.5 ms
+  (2.6 each). It is measured from the refusals instead, which are the direct signal: a refusal means the
+  queue was full, so in that second the radio accepted exactly what it could drain, and `1000 / tx_s` is
+  the link's own period. With nothing refused there is nothing to measure, so the parked period is held
+  and eased down 1 ms every `kHidPaceHoldMs` — the only way to find a link that got faster, at the cost
+  of one second of refusals when the guess was wrong.
 - **Deltas are signed 8-bit**, so each report is clamped to ±127 counts. Only what was really sent is
   subtracted from the accumulator, so the sub-count remainder carries over and slow motion is not
   quantised away. If a report fails, the motion stays pending for the next slot.
@@ -277,9 +282,9 @@ not ours to remove:
 | --- | --- | --- |
 | IMU sample period | 2.4 ms (416 Hz) | one sample per loop pass — 2.4 ms once `loop_hz` ≥ 416 |
 | Gyro low-pass (`kGyroFilterTauMs`) | ~8 ms | ~3 ms |
-| Report cadence | 30 ms fixed | paced to what the radio accepts — 16 ms, i.e. 52 reports/s |
+| Report cadence | 30 ms fixed | paced to what the radio drains, just under it — ~20 ms, i.e. ~50 reports/s |
 | Connection interval | 30–50 ms | the host decides; 7.5 ms here, 30 ms is Android's default |
-| **Sketch-side total** | **~100 ms** | **~15–30 ms** |
+| **Sketch-side total** | **~100 ms** | **~20–35 ms** |
 
 Printing is *not* on that list, but it is not free either — see [Serial output](#serial-output). It is
 off by default precisely so it cannot become part of the pointer's timing.
@@ -383,8 +388,11 @@ encrypted, need not pay it, and nothing in this sketch can tell which case it is
 by measuring.
 
 Anything queued beyond the one packet in flight lands in the notification queue (depth 8,
-`kCustomGattNotificationQueueDepth`) and drains at that rate, one packet per turn — harmless while the
-pacing holds it nearly empty, and exactly the lag you feel when it does not.
+`kCustomGattNotificationQueueDepth`) and drains at that rate, one packet per turn. Eight reports at
+~19 ms each is ~150 ms of motion the hand has already made, so a full queue is a cursor that keeps
+going after you stop: harmless while the pacing holds it nearly empty, and exactly the lag you feel
+when it does not. That is not hypothetical — one capture at 7.5 ms showed `try= 64` against `tx_s= 53`,
+the queue being filled 11 times a second, which is what the pacing margin exists to stop.
 
 What is left after this is not in the sketch: one connection interval of transmission delay is
 inherent to BLE, and the host's own input pipeline (Android's `InputReader` → `InputDispatcher` →
@@ -400,7 +408,9 @@ compositor) adds a frame or two on top. A gyro air pointer will not feel like a 
 | `kHidSendLeadUs` | 5000 | How long before the next connection event the report is handed over. Must exceed the radio's 2.2 ms pre-roll plus the loop's ~1 ms granularity, but stay well under the interval |
 | `kHidSendSlackMs` | 5 | How long past the paced period the send window is abandoned for the rate fallback |
 | `kHidPaceWindowMs` | 1000 | Window over which the pacing counts attempts against accepted reports |
-| `kHidPaceProbePct` | 95 | With nothing refused, the period is scaled to this percent of itself to probe for headroom |
+| `kHidPaceMarginMs` | 2 | Added to the measured drain period, so the queue empties and stays empty |
+| `kHidPaceProbePct` | 95 | Only before a drain has been measured: the period is scaled to this percent of itself to look for headroom |
+| `kHidPaceHoldMs` | 5000 | Once parked, how long before the floor is eased down 1 ms to re-probe the link |
 | `kHidPaceMinRate` | 8 | Below this many reports/s a window is too quiet to pace from |
 | `kHidCountsPerDeg` | 16.0 | Pointer gain, bounded by the report format — see below |
 | `kHidDeadzoneDps` | 3.0 | Per-axis soft deadzone on the pointer rate, set above the measured rest noise. `0.0f` passes the raw gyro |
@@ -420,10 +430,10 @@ gain <= 127 / (max_hand_rate_dps * report_period_s)
 ```
 
 for the fastest motion you actually use. A quick wrist flick is around 500 deg/s and the paced period
-is ~16 ms, giving `gain <= 127 / (500 * 0.016) = 15.9`. At the shipped 16.0 the ceiling is 127 / 0.016
-= 7.9 kcounts/s, or **413 deg/s** — comfortably above ordinary aiming, but a 570 deg/s flick does clip,
+is ~20 ms, giving `gain <= 127 / (500 * 0.020) = 12.7`. At the shipped 16.0 the ceiling is 127 / 0.020
+= 6.4 kcounts/s, or **~400 deg/s** — comfortably above ordinary aiming, but a 570 deg/s flick does clip,
 and the clipped part is not lost: it drains over the following reports, which is a cursor that arrives
-slightly late rather than short. Lower the gain for a higher ceiling (`12` covers ~550 deg/s), and
+slightly late rather than short. Lower the gain for a higher ceiling (`12` covers ~530 deg/s), and
 raise it only if your motion is normally slower and you want the extra counts per degree.
 
 Sensor configuration:
@@ -506,7 +516,7 @@ rolls.
   where gravity stops defining a roll.
 - The embedded FIFO and the IMU interrupt pin (`IMU_INT`, D24) are unused.
 - A single HID report carries at most ±127 counts per axis, because the report fields are signed
-  8-bit. With the paced 16 ms period and the shipped gain that is a ~413 deg/s ceiling: the fastest
+  8-bit. With the paced ~20 ms period and the shipped gain that is a ~400 deg/s ceiling: the fastest
   flicks saturate and drain over the following reports, arriving a little late rather than short.
   Raising it means a 16-bit report, which is a change to the core's HID descriptor, not to this sketch.
 - One connection interval of transmission delay is unavoidable, and the host's input pipeline adds
