@@ -2,22 +2,17 @@
  * Air_Mouse - BLE HID air mouse
  *
  * Board : Seeed XIAO nRF54L15 / Sense
- * Core  : lolren/nrf54-arduino-core  (board "XIAO nRF54L15 / Sense", variant xiao_nrf54l15)
- * IMU   : ST LSM6DS3TR-C on the back-pad bus, exposed as Wire1 (SDA = D12, SCL = D11), addr 0x6A
+ * Core  : lolren/nrf54-arduino-core   (variant xiao_nrf54l15)
+ * IMU   : ST LSM6DS3TR-C, back-pad bus, Wire1 (SDA = D12, SCL = D11), addr 0x6A
  *
- * The gyro rate about world-vertical becomes horizontal pointer motion, the rate
- * about the screen-horizontal axis becomes vertical motion, and rotation about
- * the aiming axis is discarded. Roll compensation rotates the in-plane rates by
- * the roll angle gravity measures, so the pointer axes stay aligned with the
- * screen however the device is banked. The onboard button is a left click.
+ * Gyro about world-vertical drives horizontal motion, about the screen-horizontal
+ * axis drives vertical motion, and about the aiming axis is discarded; roll
+ * compensation keeps the pointer axes on screen when the device is banked.
+ * Onboard button = left click.
  *
- * No magnetometer on this part, so no absolute yaw, and no sensor fusion: both
- * are irrelevant to a relative pointer.
- *
- * Before running: hold the board still, it measures the gyro bias first, then
- * pair with "Air Mouse" from the host's Bluetooth settings.
- *
- * Details, wiring, diagnostics and tuning knobs: README.md.
+ * Hold the board still at power-up: it measures the gyro bias first, then pair with
+ * "Air Mouse" from the host's Bluetooth settings. Wiring, diagnostics, tuning and
+ * the reasoning behind all of it: README.md.
  */
 
 #include <Arduino.h>
@@ -34,23 +29,14 @@
 // Serial log
 // ---------------------------------------------------------------------------
 
-// Master switch for every print in this sketch. Off by default: nothing in the
-// pointer path then depends on a serial port, no print can stall the loop on a port
-// that no host is reading, and the periodic state line's two link queries (which
-// each service the whole stack) do not run at all. Set it to true and the log comes
-// back exactly as it was, including kPrintAxisDiag.
-//
-// Why it is worth a switch rather than just deleting the prints: the periodic line
-// is ~150 bytes, which is ~13 ms of wire time at 115200 baud, ten times a second --
-// and loop_hz has been measured at 413 with it on, which is below the sensor's own
-// 416 Hz. Whether that is the loop blocking or a ring buffer filling, the switch
-// settles it by measurement: flip it and compare loop_hz.
+// Master switch for every print in this sketch. Off by default, so the pointer path
+// touches no serial port and the periodic line's link queries do not run. Set true to
+// bring the whole log back. Cost and reasoning: README, "Serial output".
 static const bool kSerialLogEnabled = false;
 
-// Every call site below still reads `Serial.print(...)`. Pointing the identifier at
-// this instead of the port, rather than wrapping ~90 call sites in a macro, keeps
-// the diagnostics readable where they are and makes the switch a single line. The
-// bodies see the real Serial object, because the macro is defined after the class.
+// Prints are routed through this rather than the port itself, so every call site still
+// reads Serial.print(...) and the compiler removes the lot when the switch is off.
+// Defined before the #define below, so these bodies do see the real Serial object.
 class LogSerial {
  public:
   void begin(unsigned long baud) {
@@ -91,8 +77,7 @@ class LogSerial {
 
 static LogSerial g_logSerial;
 
-// The switch is a compile-time constant, so with the log off the compiler inlines
-// each of these to nothing and drops the arguments with them.
+// kSerialLogEnabled is a compile-time constant, so these inline away when off.
 #define Serial g_logSerial
 
 // ---------------------------------------------------------------------------
@@ -117,9 +102,8 @@ static const uint8_t kImuAddresses[] = {0x6A, 0x6B};
 // Sensor configuration
 // ---------------------------------------------------------------------------
 
-// Both registers pack ODR in bits 7:4 and full scale in bits 3:2. Watch out: the
-// LSM6DS3 family encodes FS_XL as 00=+/-2 g, 01=+/-16 g, 10=+/-4 g, 11=+/-8 g --
-// deliberately NOT ascending.
+// Both registers pack ODR in bits 7:4 and full scale in bits 3:2. Careful: FS_XL is
+// NOT ascending -- 00=+/-2 g, 01=+/-16 g, 10=+/-4 g, 11=+/-8 g.
 //   CTRL1_XL = 0x68 -> ODR 0110 = 416 Hz, FS 10 = +/-4 g
 //   CTRL2_G  = 0x64 -> ODR 0110 = 416 Hz, FS 01 = +/-500 dps
 static const uint8_t kCtrl1XlValue = 0x68;
@@ -139,17 +123,15 @@ static const uint8_t kAccelDataReady = 0x01;
 // I2C reliability
 // ---------------------------------------------------------------------------
 
-// At the part's specified ceiling. Slowing a marginal bus down does not help
-// here: measured 0.53 % dead transactions at 400 kHz against 3.47 % at 100 kHz,
-// because the failures are the radio landing during the transaction and a slower
-// burst is exposed for longer. If read errors must come down, the lever is
-// shorter or shielded wiring. Numbers and reasoning: README, "I2C reliability".
+// At the part's specified ceiling. Slower is measurably worse here -- 0.53 % dead
+// transactions at 400 kHz against 3.47 % at 100 kHz -- because the failures are the
+// radio landing during the transaction and a slow burst is exposed for longer.
+// README, "I2C reliability".
 static const uint32_t kImuI2cClockHz = 400000;
 
-// A 12-byte burst is ~110 bit times, so a marginal bus drops the odd transaction.
-// That is a bus property, not "the sensor is gone", so retry. Only quick failures
-// are worth retrying -- one that already burned milliseconds hit the driver
-// timeout, and stacking more of those just stalls the sample loop.
+// A 12-byte burst is ~110 bit times, so a marginal bus drops the odd transaction --
+// a bus property, not "the sensor is gone". Retry, but only quick failures: one that
+// already burned milliseconds hit the driver timeout, and stacking those stalls the loop.
 static const uint8_t  kImuReadAttempts  = 3;
 static const uint32_t kImuRetryGapUs    = 50;
 static const uint32_t kImuRetryBudgetUs = 3000;
@@ -164,16 +146,11 @@ static const uint8_t  kImuRecoverLimit     = 8;
 // Axis mapping - measured on this board
 // ---------------------------------------------------------------------------
 
-// Which body axis aims at the screen when the device is held naturally.
-//
-// Measured, not assumed: board flat and aimed at a standing phone reads
-// accel_mg= (-84, -111, 1037), so gravity is on Z and Z is the board normal --
-// the aiming axis is horizontal and must read near 0 mg. Twisting about it with
-// the aim held fixed gives ~65 deg of rotation about Y.
-//
-// plane_g is the check: ~1.00 in any normal grip. Near zero means the wrong
-// axis, or the device really is pointed at the ceiling, in which case the roll
-// reference freezes and the pointer axes go arbitrary.
+// Which body axis aims at the screen when the device is held naturally. Measured,
+// not assumed: board flat and aimed at a standing phone reads accel_mg= (-84, -111,
+// 1037), so gravity is on Z, the board normal, and the aiming axis must read near
+// 0 mg. plane_g is the check -- ~1.00 in any normal grip, near zero means the wrong
+// axis or a pose aimed at the ceiling. Method: README, "Axis mapping".
 enum PointAxis : uint8_t { kPointAxisX, kPointAxisY, kPointAxisZ };
 static const PointAxis kPointAxis = kPointAxisY;
 
@@ -197,12 +174,10 @@ static const float    kCalibrationMaxSpreadDps = 4.0f; // peak-to-peak, rejects 
 static const uint8_t  kCalibrationMaxAttempts = 3;
 static const uint32_t kCalibrationTimeoutMs   = 2000;
 
-// Continuous re-zero while held still, to stop slow creep between flicks.
-// Stillness is judged from gravity, never from the gyro: a residual bias is a
-// gyro reading with no rotation behind it, so a gyro-magnitude gate switches the
-// tracker off exactly when the residual is worth removing. The reference is a
-// slow low-pass of world-up, so it lags while the device turns and catches up
-// once it stops.
+// Continuous re-zero while held still, to stop slow creep between flicks. Stillness
+// is judged from gravity, never from the gyro: a residual bias is a gyro reading with
+// no rotation behind it, so a gyro-magnitude gate switches the tracker off exactly
+// when the residual is worth removing. README, "Gyro zero and creep".
 static const float    kStillDirectionTauMs = 500.0f;
 static const float    kStillMinDot         = 0.999945f;  // ~0.6 deg of lag
 static const float    kStillAccelTolG      = 0.08f;      // |a| within 8% of 1 g
@@ -214,16 +189,12 @@ static const float    kBiasTrackingAlpha = 0.005f;
 static const float kGyroFilterTauMs    = 3.0f;   // ~53 Hz cutoff
 static const float kGravityFilterTauMs = 50.0f;  // ~3 Hz cutoff
 
-// Display rate only, not the sample rate. With the log on this is the sketch's
-// largest optional cost -- a ~150 byte line is ~13 ms of wire time at 115200 baud,
-// and loop_hz has been measured at 413 with it on, below the sensor's own 416 Hz.
-// See kSerialLogEnabled: the switch settles whether that is the write blocking or a
-// TX ring buffer filling, and the periodic line is skipped entirely when it is off.
+// Display rate only, not the sample rate. The line is the sketch's largest optional
+// cost; kSerialLogEnabled explains it and switches it off.
 static const uint32_t kPrintIntervalMs = 100;  // 10 Hz
 
-// Adds accel_mg, plane_g and gyro to the periodic line. Off because it is a
-// per-board identification aid; turn it on to work out or re-check kPointAxis.
-// Method: README, "Axis mapping".
+// Adds accel_mg, plane_g and gyro to the periodic line, for working out or re-checking
+// kPointAxis. Method: README, "Axis mapping".
 static const bool kPrintAxisDiag = false;
 
 // ---------------------------------------------------------------------------
@@ -232,24 +203,10 @@ static const bool kPrintAxisDiag = false;
 
 static const char kDeviceName[] = "Air Mouse";
 
-// Base pointer sensitivity, in HID counts per degree. Hosts apply their own
-// acceleration on top, so this is the device's own scale, not the feel.
-//
-// Deliberately not lowered to duck the report ceiling. The ceiling is
-//
-//     reports/s * 127 / kHidCountsPerDeg   dps
-//
-// and the reports/s factor is the one that is wrong: measured 26-27 reports/s
-// against 65-66 connection events/s, because the encrypted notification path
-// spends 2-3 events per report. Buying headroom by cutting this instead only
-// makes the pointer slow, which is how 8.0f felt. The rate is fixed at the link
-// (see kConnIntervalMin), so this stays where the feel wants it.
-//
-// Consequence to keep in sight: at 26 reports/s this setting saturates above
-// ~206 dps, and a real flick measures 200-570 dps, so the excess is dropped
-// rather than delayed. Raising the rate is the cure; a wider report field than
-// the 8-bit one here removes the ceiling outright if 16.0 is wanted AND a fast
-// flick must survive undistorted.
+// Base pointer sensitivity, in HID counts per degree. Hosts add their own acceleration
+// on top, so this is the device's scale, not the feel. Never lowered to duck the 8-bit
+// report ceiling -- that only made the pointer slow (8.0f felt bad). See README,
+// "Configuration" for that arithmetic.
 static const float kHidCountsPerDeg = 16.0f;
 
 // Cadence: one hand-over per attempt period (see hidMaintainPace), which follows
@@ -259,22 +216,11 @@ static const uint32_t kHidReportFallbackMs = 15;  // before the interval is know
 static const uint32_t kHidReportFloorMs    = 5;
 static const uint32_t kHidReportCeilMs     = 50;
 
-// Attempt-rate pacing. The radio accepts a notification only every 2-3 connection
-// events, so offering one per event does not buy reports -- it fills the radio's
-// notification queue. That queue is the problem: it drains at the radio's rate, so
-// every report sitting in it arrives after the hand has already stopped, which is
-// the cursor that keeps going. Holding the hand-over rate at what the radio
-// accepts keeps one or two reports outstanding instead of eight, which is why the
-// pointer now stops when the hand does.
-//
-// The rate is not derived from the interval, because it is not a clean function of
-// it: measured 26-27 reports/s at 15 ms (2.6 events each) and ~37/s at 7.5 ms (3.6
-// each). It comes from the refusals instead, which measure it directly: a refusal
-// means the radio's queue was full, so attempts/reports for that second is exactly
-// how far above the link's rate the sketch currently is. Correct by that ratio and
-// the period lands on the link's rate in one step. When nothing is refused there is
-// nothing to correct towards, so step the rate up and keep looking -- that is the
-// only direction that can find a ceiling the sketch has previously been paced below.
+// Attempt-rate pacing. The radio takes a notification only every 2-3 events, so
+// offering one per event buys nothing and fills the radio's queue -- which then
+// drains at the radio's rate, i.e. after the hand has stopped. Refusals measure the
+// link directly: attempts/reports is the overshoot, so scaling the period by it lands
+// on the link's rate in one step. README, "HID transport".
 static const uint32_t kHidPaceWindowMs = 1000;  // measurement window
 static const uint8_t  kHidPaceProbePct = 95;    // nothing refused: try this much of the period
 static const uint32_t kHidPaceMinRate  = 8;     // below this reports/s, not a measurement
@@ -287,16 +233,11 @@ static const uint32_t kHidSendLeadUs = 5000;
 // Slack on the rate fallback, so the link is never queued two deep.
 static const uint32_t kHidSendSlackMs = 5;
 
-// Connection interval, in 1.25 ms units. The central decides, and it takes the
-// TOP of whatever range is offered -- measured: offering 6-12 (7.5-15 ms) settles
-// at exactly 15 ms. So a range is a way of asking for the slower end, and the
-// floor has to be asked for on its own.
-//
-// This is the report rate, and the report rate is the whole problem. The radio
-// spends 2-3 connection events per notification (see kHidCountsPerDeg), so
-// events/s / 2.5 is reports/s: 15 ms gives the measured 26-27, and halving the
-// interval is the only thing in this sketch that can double the pointer's
-// maximum rate without costing sensitivity.
+// Connection interval, in 1.25 ms units. The central decides, and it takes the TOP of
+// whatever range is offered -- measured: 6-12 (7.5-15 ms) settles at exactly 15 ms --
+// so the floor has to be asked for alone. This is the report rate, and the report rate
+// is the whole problem: the radio spends 2-3 events per notification, so events/s / 2.5
+// is reports/s, and halving the interval doubles the pointer's maximum rate.
 static const uint16_t kConnIntervalMin = 6;   // 7.5 ms
 static const uint16_t kConnIntervalMax = 6;   // 7.5 ms -- no room to pick the top
 
@@ -306,11 +247,10 @@ static const uint32_t kPairingGraceMs          = 4000;
 static const uint16_t kConnIntervalFallbackMin = 24;  // 30 ms
 static const uint16_t kConnIntervalFallbackMax = 40;  // 50 ms
 
-// The HAL asks once and clears its pending flag on any response, rejection
-// included, so a badly placed request is final. Hence a ladder -- and it now
-// walks towards the shortest interval the host will take, not merely a fast one.
-// Step 0 is the ask that matters; the rest are what to fall back to if the host
-// clamps 7.5 ms away.
+// The HAL asks once and clears its pending flag on any response, rejection included,
+// so a badly placed request is final. Hence a ladder, walking towards the shortest
+// interval the host will take. Step 0 is the ask that matters; the rest are what to
+// fall back to if the host clamps 7.5 ms away.
 struct ConnIntervalAttempt { uint16_t minUnits; uint16_t maxUnits; };
 static const ConnIntervalAttempt kConnEscalation[] = {
     {6, 6},    // 7.5 ms, asked outright -- the target
@@ -323,11 +263,10 @@ static const uint8_t  kConnAttemptsPerStep = 2;   // 8 attempts in total
 static const uint32_t kConnRetryGapMs      = 1000;
 static const uint32_t kConnFastThresholdMs = 8;   // only 7.5 ms counts as settled
 
-// Every Bluefruit connection or security query starts by running the stack
-// service routine, which on a live link costs a few hundred microseconds. Done
-// per pass at 350 passes/s that was most of the loop. None of these answers
-// change often, so they are polled and cached. The core still services the stack
-// once per pass in main(), so nothing starves.
+// Every Bluefruit connection or security query starts by running the stack service
+// routine, a few hundred microseconds on a live link. Per pass at 350 passes/s that
+// was most of the loop. The core still services the stack once per pass in main(),
+// so polling these instead starves nothing.
 static const uint32_t kConnPollMs = 100;  // connection interval / pairing grace
 static const uint32_t kLinkPollMs = 50;   // link ready (connected, encrypted, subscribed)
 
@@ -335,18 +274,10 @@ static const uint32_t kLinkPollMs = 50;   // link ready (connected, encrypted, s
 // leave the cursor sliding after the hand has stopped.
 static const float kHidPendingCapDeg = 16.0f;
 
-// Soft deadzone in dps, per axis, before integration. A gyro cannot tell a slow
-// rotation from a small offset, so without this the cursor shimmers by a count
-// or so at rest. Below the threshold the axis is zero; above it the rate is
-// reduced by exactly the threshold rather than truncated at it, so the response
-// stays continuous and the cost is a constant offset instead of a lost band.
-//
-// Set well above the measured +/-0.5 dps of rest noise rather than at it: the bias
-// tracker removes the mean residual, not the sample-to-sample noise on top of it, so
-// a threshold at the noise level still passes its peaks and the cursor still
-// shimmers. The price is explicit: rotation slower than this much produces nothing,
-// and faster than it is reduced by exactly this much. First knob to lower if slow
-// aiming feels heavy. 0.0f disables it.
+// Soft deadzone, per axis, before integration: a gyro cannot tell a slow rotation from a
+// small offset, so without it the cursor shimmers at rest. Below the threshold the axis is
+// zero; above it the rate is reduced by exactly the threshold, which stays continuous at
+// the cost of a constant offset. Sized well above the +/-0.5 dps of rest noise; 0.0f disables.
 static const float kHidDeadzoneDps = 3.0f;
 
 // Onboard button, active low, as left click.
@@ -422,10 +353,9 @@ static uint32_t g_hidReportCount   = 0;  // successful reports, ever
 static uint32_t g_hidFallbackCount = 0;  // of those, sent on the rate fallback
 static uint32_t g_hidRatePerSec    = 0;
 
-// How often the send gate was satisfiable at all, and how often a send followed.
-// tx_s alone cannot separate the three ways a report can go missing: the link
-// never offering an event (win low), the gate refusing one it did offer, or the
-// radio declining the report we handed it (try high, tx low).
+// How often the send gate was satisfiable at all, and how often a send followed. tx_s
+// alone cannot separate the three ways a report goes missing: no event offered (win
+// low), the gate refusing one, or the radio declining it (try high, tx low).
 static uint32_t g_hidWindowCount   = 0;  // times windowOpen came out true
 static uint32_t g_hidAttemptCount  = 0;  // times mouseReport was called
 static uint32_t g_hidWindowPerSec  = 0;
@@ -441,8 +371,8 @@ static uint32_t g_hidPaceBase        = 0;  // report count at that start
 static uint32_t g_hidPaceAttemptBase = 0;
 static uint16_t g_hidPaceIntervalUnits = 0;  // interval the period was measured on
 
-// Averaged over one shared one-second window. loop_hz below 1000/ci_ms means the
-// loop, not the link, is setting the report rate and the sample rate.
+// Averaged over one shared one-second window. loop_hz below the link's own rate means
+// the loop, not the link, is setting the report rate and the sample rate.
 static uint32_t g_loopCount    = 0;
 static uint32_t g_diagWindowMs = 0;
 static uint32_t g_diagLoopBase = 0;
@@ -1090,13 +1020,10 @@ static void printState() {
     Serial.print(static_cast<float>(hidConnIntervalUnits()) * 1.25f, 1);
     Serial.print(" tx_s= ");
     Serial.print(g_hidRatePerSec);
-    // win is how often the window was open, try is how often a report was handed
-    // over, tx_s is how often the radio accepted it, pace is the hand-over period
-    // the pacing settled on in ms. Read together: win ~1000/ci_ms means the link
-    // is offering every event; try == tx_s means the radio took everything it was
-    // offered, and therefore that the queue is shallow; tx_s < try means the radio
-    // refused because its queue is full, and the reports sitting in that queue are
-    // cursor movement still to come. In the paced state try is ~1000/pace.
+    // win: how often the window was open, against 1000/ci_ms, the events the link
+    // offers. try: reports handed over. tx_s: reports the radio took. pace: the
+    // hand-over period in ms, so try ~= 1000/pace when paced. tx_s < try means the
+    // radio's queue was full, and what is sitting in it is cursor movement to come.
     Serial.print(" win= ");
     Serial.print(g_hidWindowPerSec);
     Serial.print(" try= ");
@@ -1108,24 +1035,11 @@ static void printState() {
     Serial.print(" align= ");
     Serial.print(g_diagAlignedPct);
 
-    // tx_s against the interval is the tell, and the two numbers below say why
-    // they disagree. ci_ms sets the ceiling -- 1000/ci_ms reports per second are
-    // available -- and tx_s is what actually left. A peripheral cannot transmit
-    // except in a connection event the central starts, so a large gap means the
-    // radio is being handed far fewer events than the interval implies.
-    //
-    //   lat  the slave latency in force. Only the host sets it and the sketch
-    //        asks for zero, so a non-zero value is the host's doing. The host
-    //        may then anchor only once every (lat + 1) events, which throttles
-    //        a peripheral to that fraction of the interval rate.
-    //   miss consecutive events the LL failed to receive. Large and persistent
-    //        means the device side, not the host, is dropping them.
-    //
-    // The pointer rate is tx_s * 127 / kHidCountsPerDeg dps, and that product is
-    // the binding constraint: ~206 dps at the 26 reports/s a 15 ms interval
-    // yielded, ~262 at the 33/s the pace settles on, against a gyro that reads
-    // 200-570. lat and miss say whether the link is being generous; they cannot
-    // make the radio accept more than it does.
+    // ci_ms sets the ceiling, tx_s is what actually left: a gap means the radio is being
+    // handed fewer events than the interval implies.   lat: the host's slave latency (the
+    // sketch asks for zero), so it may anchor only every (lat + 1) events.   miss: events
+    // the LL failed to receive, i.e. the device dropping them.
+    // Pointer dps is tx_s * 127 / kHidCountsPerDeg, and neither raises what the radio takes.
     xiao_nrf54l15::BleConnectionInfo linkInfo;
     if (Bluefruit.rawRadio().getConnectionInfo(&linkInfo)) {
       Serial.print(" lat= ");
@@ -1370,17 +1284,15 @@ static void hidMaintainPace(uint32_t nowMs) {
     // unusable rather than dividing by it, and back right off.
     periodMs = kHidReportCeilMs;
   } else if (reports < attempts) {
-    // Refusals mean the radio's queue was full, so the sketch was offering faster
-    // than the link drains. attempts/reports is exactly that overshoot, so scaling
-    // by it lands the period on the link's rate in one step -- and, unlike a peak,
-    // it is free to move in either direction when the link changes.
+    // Refusals mean the radio's queue was full, i.e. the sketch was offering faster than
+    // the link drains. attempts/reports is that overshoot, so scaling by it lands the
+    // period on the link's rate in one step -- and, unlike a peak, in either direction.
     const uint32_t scaled = (periodMs * attempts) / reports;
     periodMs = (scaled > periodMs) ? scaled : periodMs;
   } else {
-    // Nothing was refused all second, so the queue had room and the sketch is at or
-    // under the link's rate. There is nothing to correct towards, so probe faster:
-    // this is the only direction that can recover a ceiling the pacing has been
-    // sitting under, which is what left it stuck at 21 reports/s.
+    // Nothing refused all second, so the queue had room and the period is at or under
+    // the link's rate. Nothing to correct towards, so probe faster -- the only direction
+    // that can recover a ceiling the pacing has parked under.
     periodMs = (periodMs * kHidPaceProbePct) / 100U;
   }
 
@@ -1475,10 +1387,9 @@ static void hidTask(uint32_t nowMs) {
   bool windowOpen = false;
   xiao_nrf54l15::BleConnectionTimingSnapshot timing;
   if (Bluefruit.rawRadio().getConnectionTimingSnapshot(&timing)) {
-    // Hand over just before the next event so it leaves in that event. This is a
-    // placement aid now, not the rate limit -- the attempt period is -- and
-    // timeUntilNextEventUs of 0 means the anchor has gone by, so this event cannot
-    // be caught and there is no window to aim at.
+    // Hand over just before the next event so it leaves in that event: a placement aid
+    // now, not the rate limit. A timeUntilNextEventUs of 0 means the anchor has gone by,
+    // so this event cannot be caught and there is no window to aim at.
     const uint32_t windowSpacingUs = (timing.intervalUs > kHidSendLeadUs)
                                          ? (timing.intervalUs - kHidSendLeadUs)
                                          : timing.intervalUs;
@@ -1505,11 +1416,9 @@ static void hidTask(uint32_t nowMs) {
     return;  // nothing to say, and no keepalive wanted yet
   }
 
-  // Two routes, both limited to one hand-over per attempt period so the radio's
-  // queue cannot build up behind us. The window places the report for the event,
-  // which keeps the phase right when the period spans several events; the fallback
-  // covers a loop that keeps missing the window, so reporting does not depend on
-  // catching it.
+  // Two routes, both capped at one hand-over per attempt period so the radio's queue
+  // cannot build up behind us. The window places the report for the event; the fallback
+  // covers a loop that keeps missing it.
   const uint32_t attemptPeriodMs = hidAttemptPeriodMs();
   const uint32_t sinceReportMs   = nowMs - g_hidLastReportMs;
   const bool sendNow =
@@ -1607,10 +1516,9 @@ static void imuTask() {
   updateMotion(gyroRaw, accelRaw, dtSec);
 
   const uint32_t nowMs = millis();
-  // Gated on the log switch, not just on the interval. printState ends with two
-  // Bluefruit link queries and each of those services the whole stack (see
-  // kLinkPollMs), so with the log off there is no reason to pay for them ten times
-  // a second to assemble a line nobody reads.
+  // Gated on the switch, not just the interval: printState ends with two stack-servicing
+  // link queries, and there is no point paying for those ten times a second when nobody
+  // is reading the line.
   if (kSerialLogEnabled && (nowMs - g_lastPrintMs >= kPrintIntervalMs)) {
     g_lastPrintMs = nowMs;
     printState();
