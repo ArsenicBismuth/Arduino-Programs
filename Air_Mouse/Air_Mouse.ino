@@ -241,25 +241,12 @@ static const uint32_t kHidSendSlackMs = 5;
 static const uint16_t kConnIntervalMin = 6;   // 7.5 ms
 static const uint16_t kConnIntervalMax = 6;   // 7.5 ms -- no room to pick the top
 
-// If pairing has not finished by then, hand the host a slower interval and stop
-// asking. A link that comes up at all beats a fast one that does not.
-static const uint32_t kPairingGraceMs          = 4000;
-static const uint16_t kConnIntervalFallbackMin = 24;  // 30 ms
-static const uint16_t kConnIntervalFallbackMax = 40;  // 50 ms
-
 // The HAL asks once and clears its pending flag on any response, rejection included,
-// so a badly placed request is final. Hence a ladder, walking towards the shortest
-// interval the host will take. Step 0 is the ask that matters; the rest are what to
-// fall back to if the host clamps 7.5 ms away.
-struct ConnIntervalAttempt { uint16_t minUnits; uint16_t maxUnits; };
-static const ConnIntervalAttempt kConnEscalation[] = {
-    {6, 6},    // 7.5 ms, asked outright -- the target
-    {6, 12},   // 7.5-15 ms, if it will only accept a range
-    {9, 12},   // 11.25-15 ms, Android's CONNECTION_PRIORITY_HIGH band
-    {12, 12},  // 15 ms, the last interval measured working
-};
-static const uint8_t  kConnEscalationSteps = 4;
-static const uint8_t  kConnAttemptsPerStep = 2;   // 8 attempts in total
+// so a badly placed request is final. Re-ask the same 7.5 ms a few times, in case the
+// first one lands during pairing, but never offer a slower interval: a host that
+// refuses 7.5 ms leaves the link where it is, to be reconnected rather than lived
+// with. Android's own default, 30 ms, is exactly the outcome this avoids.
+static const uint8_t  kConnAttempts        = 8;
 static const uint32_t kConnRetryGapMs      = 1000;
 static const uint32_t kConnFastThresholdMs = 8;   // only 7.5 ms counts as settled
 
@@ -267,7 +254,7 @@ static const uint32_t kConnFastThresholdMs = 8;   // only 7.5 ms counts as settl
 // routine, a few hundred microseconds on a live link. Per pass at 350 passes/s that
 // was most of the loop. The core still services the stack once per pass in main(),
 // so polling these instead starves nothing.
-static const uint32_t kConnPollMs = 100;  // connection interval / pairing grace
+static const uint32_t kConnPollMs = 100;  // connection interval / retry gap
 static const uint32_t kLinkPollMs = 50;   // link ready (connected, encrypted, subscribed)
 
 // Cap on unreported motion, near one report's worth, so a stalled link cannot
@@ -387,7 +374,6 @@ static uint32_t g_diagAlignedPct = 0;
 static uint32_t g_hidConnectedMs   = 0;      // when the link came up
 static uint32_t g_hidConnRetryMs   = 0;      // last time we asked for a fast one
 static uint8_t  g_hidConnRetries   = 0;
-static bool     g_hidConnSlowdown  = false;  // pairing grace expired, gave up
 static bool     g_hidConnFastSeen  = false;  // logged that the host complied
 
 // Cached link state, refreshed on a timer rather than per pass (see kLinkPollMs).
@@ -1068,7 +1054,6 @@ static void hidConnectCallback(uint16_t connHandle) {
   g_hidConnectedMs  = millis();
   g_hidConnRetries  = 0;
   g_hidConnRetryMs  = 0;
-  g_hidConnSlowdown = false;
   g_hidConnFastSeen = false;
   g_hidLastWindowUs = 0;
   // Force the pacing to relearn: the ceiling belongs to the link, not the sketch.
@@ -1304,8 +1289,8 @@ static void hidMaintainPace(uint32_t nowMs) {
   g_hidPacePeriodMs = periodMs;
 }
 
-// Connection-interval upkeep. Once encrypted it walks the retry ladder; before
-// that it is a stopwatch that backs off if pairing has not finished. Polled on
+// Connection-interval upkeep. Once encrypted it re-asks for 7.5 ms; before that
+// it does nothing, because an update request would only be rejected. Polled on
 // kConnPollMs -- see there for why not per pass.
 static void hidMaintainConnInterval(uint32_t nowMs) {
   if ((nowMs - g_hidConnPollMs) < kConnPollMs) {
@@ -1321,12 +1306,6 @@ static void hidMaintainConnInterval(uint32_t nowMs) {
       (static_cast<uint32_t>(hidConnIntervalUnits()) * 125U) / 100U;
 
   if (!Bluefruit.Security.isEncrypted(0)) {
-    if (!g_hidConnSlowdown && (nowMs - g_hidConnectedMs) >= kPairingGraceMs) {
-      g_hidConnSlowdown = true;
-      Bluefruit.Periph.setConnInterval(kConnIntervalFallbackMin,
-                                       kConnIntervalFallbackMax);
-      Serial.println("hid=pairing-slow, backing off conn interval");
-    }
     return;
   }
 
@@ -1339,27 +1318,20 @@ static void hidMaintainConnInterval(uint32_t nowMs) {
     return;
   }
 
-  if (g_hidConnSlowdown ||
-      g_hidConnRetries >= (kConnEscalationSteps * kConnAttemptsPerStep)) {
+  if (g_hidConnRetries >= kConnAttempts) {
     return;
   }
   if (g_hidConnRetries != 0U && (nowMs - g_hidConnRetryMs) < kConnRetryGapMs) {
     return;
   }
 
-  uint8_t step = g_hidConnRetries / kConnAttemptsPerStep;
-  if (step >= kConnEscalationSteps) {
-    step = kConnEscalationSteps - 1U;
-  }
-  const ConnIntervalAttempt& want = kConnEscalation[step];
-
   g_hidConnRetryMs = nowMs;
   ++g_hidConnRetries;
-  Bluefruit.Periph.setConnInterval(want.minUnits, want.maxUnits);
+  Bluefruit.Periph.setConnInterval(kConnIntervalMin, kConnIntervalMax);
   Serial.print("hid=asking for conn interval ");
-  Serial.print(static_cast<float>(want.minUnits) * 1.25f, 1);
+  Serial.print(static_cast<float>(kConnIntervalMin) * 1.25f, 1);
   Serial.print('-');
-  Serial.print(static_cast<float>(want.maxUnits) * 1.25f, 1);
+  Serial.print(static_cast<float>(kConnIntervalMax) * 1.25f, 1);
   Serial.print(" ms (attempt ");
   Serial.print(g_hidConnRetries);
   Serial.println(')');

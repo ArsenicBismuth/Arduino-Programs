@@ -69,26 +69,17 @@ characteristic `0x2A04` that hosts read during service discovery. **On Android t
 request**, and a phone is entitled to overrule it — 30 ms is Android's own default band.
 
 The range is deliberately tight, because a central takes the *top* of whatever range it is offered:
-this sketch used to ask for 7.5–15 ms and settled at exactly 15 ms. If a host does not comply with
-7.5 ms, the sketch walks a retry ladder towards the shortest interval it will accept, because the
-interval is the pointer's update rate — see [Latency](#latency):
+this sketch used to ask for 7.5–15 ms and settled at exactly 15 ms. It now asks for 7.5 ms alone, and
+re-asks it a few times after encryption in case the first request landed during pairing. It never
+offers a slower interval: a host that refuses 7.5 ms is left at its own choice (often 30 ms) rather
+than talked down to 15 ms; reconnecting is the way out:
 
 ```
 hid=asking for conn interval 7.5-7.5 ms (attempt 1)
-hid=asking for conn interval 7.5-15.0 ms (attempt 3)
-hid=asking for conn interval 11.3-15.0 ms (attempt 5)
-hid=asking for conn interval 15.0-15.0 ms (attempt 7)
 hid=fast-conn-interval in use ci_ms=7.5
 ```
 
-If pairing itself has not finished within 4 s, it stops asking and falls back to a slow interval so
-the host has room to complete the exchange:
-
-```
-hid=pairing-slow, backing off conn interval
-```
-
-Either way the periodic line carries `ci_ms=` and `tx_s=`, showing the interval the host settled on
+The periodic line carries `ci_ms=` and `tx_s=`, showing the interval the host settled on
 and the pointer update rate it produces — see [Latency](#latency). A host that has already paired may
 hold the old value cached, so if `ci_ms=` stays high, forget the device in the host's Bluetooth
 settings and pair again.
@@ -334,13 +325,14 @@ The rules that produce the "Now" column:
   applied when a phone *app* asks for it. A HID peripheral cannot, which is why a BLE mouse does not
   feel like a wired one, on any firmware.
 - **The driver asks once**, clearing its pending flag on any response, rejection included, so the sketch
-  walks a retry ladder (`kConnEscalation`) from 7.5 ms towards the shortest interval the host will take.
-  Only 7.5 ms is treated as settled (`kConnFastThresholdMs`), so a host sitting on 15 ms keeps being
-  asked.
+  re-asks 7.5 ms (`kConnAttempts`, `kConnRetryGapMs`) in case the first request was rejected during
+  pairing. Only 7.5 ms is treated as settled (`kConnFastThresholdMs`); a host that refuses it stays at
+  its own interval, and no slower interval is ever offered. `ci_ms=` above 8 means the request did not
+  stick, and a reconnect is the remedy.
 - **Pairing is not starved by a short interval.** The core's HID example advertises 30–50 ms so LE Secure
   Connections has CPU between events, but the software P-256 keypair generation runs in the deferred
-  background service, outside the connection event. A 4 s grace period still watches for a host that
-  stalls and backs the interval off (`kPairingGraceMs`, `hid=pairing-slow`).
+  background service, outside the connection event. This sketch therefore keeps 7.5 ms through pairing
+  instead of backing off on a timer.
 - **Trust but verify.** `ci_ms=` is the interval the host actually settled on and `tx_s=` the update rate
   it produces; `tx_s=` should track `(1000 / ci_ms) / 2.5`, because the radio only lets a notification
   out every 2–3 events. `align=` and `loop_hz=` then say which side is limiting — a low `align=` with
@@ -357,10 +349,8 @@ compositor) adds a frame or two on top. A gyro air pointer will not feel like a 
 | Constant | Default | Effect |
 | --- | --- | --- |
 | `kConnIntervalMin` / `Max` | 6 / 6 | Connection interval published to the host, in 1.25 ms units → 7.5 ms. This dominates latency and update rate; raise it if a host will not pair |
-| `kPairingGraceMs` | 4000 | Give up on fast if pairing has not finished by then |
-| `kConnEscalation` | 6–6, 6–12, 9–12, 12–12 | Retry ladder for the interval, tried in order, towards the shortest interval the host will take. The last step ends inside Android's `CONNECTION_PRIORITY_HIGH` band (11.25–15 ms) |
-| `kConnAttemptsPerStep` / `RetryGapMs` | 2 / 1000 | Attempts per ladder step, and the gap between them |
-| `kConnFastThresholdMs` | 8 | Intervals at or above this are not treated as settled, so the ladder keeps walking |
+| `kConnAttempts` / `kConnRetryGapMs` | 8 / 1000 | Times 7.5 ms is re-asked after encryption, and the gap between asks |
+| `kConnFastThresholdMs` | 8 | Intervals at or above this are not treated as settled, so the 7.5 ms request keeps being made |
 | `kHidSendLeadUs` | 5000 | How long before the next connection event the report is handed over. Must exceed the radio's 2.2 ms pre-roll plus the loop's ~1 ms granularity, but stay well under the interval |
 | `kHidSendSlackMs` | 5 | How long past the paced period the send window is abandoned for the rate fallback |
 | `kHidPaceWindowMs` | 1000 | Window over which the pacing counts attempts against accepted reports |
