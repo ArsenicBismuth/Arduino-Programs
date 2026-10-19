@@ -166,11 +166,23 @@ static const bool kPrintAxisDiag = false;
 static const char kDeviceName[] = "Air Mouse";
 
 // Base pointer sensitivity, in HID counts per degree. Hosts apply their own
-// acceleration on top. Bounded by the report format, not by feel: one report
-// carries at most +/-127 signed 8-bit counts, so a 500 dps flick over a 15 ms
-// report period caps this at 127/(500*0.015) = 16.9. Above that a report
-// saturates and the leftover drains over later reports, which is the lag this
-// sketch exists to remove.
+// acceleration on top, so this is the device's own scale, not the feel.
+//
+// Deliberately not lowered to duck the report ceiling. The ceiling is
+//
+//     reports/s * 127 / kHidCountsPerDeg   dps
+//
+// and the reports/s factor is the one that is wrong: measured 26-27 reports/s
+// against 65-66 connection events/s, because the encrypted notification path
+// spends 2-3 events per report. Buying headroom by cutting this instead only
+// makes the pointer slow, which is how 8.0f felt. The rate is fixed at the link
+// (see kConnIntervalMin), so this stays where the feel wants it.
+//
+// Consequence to keep in sight: at 26 reports/s this setting saturates above
+// ~206 dps, and a real flick measures 200-570 dps, so the excess is dropped
+// rather than delayed. Raising the rate is the cure; a wider report field than
+// the 8-bit one here removes the ceiling outright if 16.0 is wanted AND a fast
+// flick must survive undistorted.
 static const float kHidCountsPerDeg = 16.0f;
 
 // Cadence comes from the link: one report per connection event. Sending faster
@@ -188,15 +200,18 @@ static const uint32_t kHidSendLeadUs = 5000;
 // Slack on the rate fallback, so the link is never queued two deep.
 static const uint32_t kHidSendSlackMs = 5;
 
-// Connection interval, in 1.25 ms units: the floor on latency and the ceiling on
-// update rate, so the most valuable knob here. Published through GAP
-// characteristic 0x2A04 and requested by the HAL, but both are only requests --
-// the central decides. Android defaults to CONNECTION_PRIORITY_BALANCED
-// (30-50 ms); the HIGH band (11.25-15 ms) needs a phone app to ask, which is why
-// the ladder below walks towards it. A short interval cannot starve pairing: the
-// P-256 keypair runs in the deferred background service, not inside the event.
+// Connection interval, in 1.25 ms units. The central decides, and it takes the
+// TOP of whatever range is offered -- measured: offering 6-12 (7.5-15 ms) settles
+// at exactly 15 ms. So a range is a way of asking for the slower end, and the
+// floor has to be asked for on its own.
+//
+// This is the report rate, and the report rate is the whole problem. The radio
+// spends 2-3 connection events per notification (see kHidCountsPerDeg), so
+// events/s / 2.5 is reports/s: 15 ms gives the measured 26-27, and halving the
+// interval is the only thing in this sketch that can double the pointer's
+// maximum rate without costing sensitivity.
 static const uint16_t kConnIntervalMin = 6;   // 7.5 ms
-static const uint16_t kConnIntervalMax = 12;  // 15 ms
+static const uint16_t kConnIntervalMax = 6;   // 7.5 ms -- no room to pick the top
 
 // If pairing has not finished by then, hand the host a slower interval and stop
 // asking. A link that comes up at all beats a fast one that does not.
@@ -205,17 +220,21 @@ static const uint16_t kConnIntervalFallbackMin = 24;  // 30 ms
 static const uint16_t kConnIntervalFallbackMax = 40;  // 50 ms
 
 // The HAL asks once and clears its pending flag on any response, rejection
-// included, so a badly placed request is final. Hence a ladder.
+// included, so a badly placed request is final. Hence a ladder -- and it now
+// walks towards the shortest interval the host will take, not merely a fast one.
+// Step 0 is the ask that matters; the rest are what to fall back to if the host
+// clamps 7.5 ms away.
 struct ConnIntervalAttempt { uint16_t minUnits; uint16_t maxUnits; };
 static const ConnIntervalAttempt kConnEscalation[] = {
-    {6, 12},   // 7.5-15 ms, the band the core's NUS transport uses
-    {9, 12},   // 11.25-15 ms, exactly Android's CONNECTION_PRIORITY_HIGH band
-    {12, 12},  // 15 ms, in case only a single value is accepted
+    {6, 6},    // 7.5 ms, asked outright -- the target
+    {6, 12},   // 7.5-15 ms, if it will only accept a range
+    {9, 12},   // 11.25-15 ms, Android's CONNECTION_PRIORITY_HIGH band
+    {12, 12},  // 15 ms, the last interval measured working
 };
-static const uint8_t  kConnEscalationSteps = 3;
-static const uint8_t  kConnAttemptsPerStep = 2;   // 6 attempts in total
+static const uint8_t  kConnEscalationSteps = 4;
+static const uint8_t  kConnAttemptsPerStep = 2;   // 8 attempts in total
 static const uint32_t kConnRetryGapMs      = 1000;
-static const uint32_t kConnFastThresholdMs = 20;  // at or below this is "fast"
+static const uint32_t kConnFastThresholdMs = 8;   // only 7.5 ms counts as settled
 
 // Every Bluefruit connection or security query starts by running the stack
 // service routine, which on a live link costs a few hundred microseconds. Done
@@ -310,6 +329,15 @@ static uint32_t g_hidReportCount   = 0;  // successful reports, ever
 static uint32_t g_hidFallbackCount = 0;  // of those, sent on the rate fallback
 static uint32_t g_hidRatePerSec    = 0;
 
+// How often the send gate was satisfiable at all, and how often a send followed.
+// tx_s alone cannot separate the three ways a report can go missing: the link
+// never offering an event (win low), the gate refusing one it did offer, or the
+// radio declining the report we handed it (try high, tx low).
+static uint32_t g_hidWindowCount   = 0;  // times windowOpen came out true
+static uint32_t g_hidAttemptCount  = 0;  // times mouseReport was called
+static uint32_t g_hidWindowPerSec  = 0;
+static uint32_t g_hidAttemptPerSec = 0;
+
 // Averaged over one shared one-second window. loop_hz below 1000/ci_ms means the
 // loop, not the link, is setting the report rate and the sample rate.
 static uint32_t g_loopCount    = 0;
@@ -317,6 +345,8 @@ static uint32_t g_diagWindowMs = 0;
 static uint32_t g_diagLoopBase = 0;
 static uint32_t g_diagReportBase = 0;
 static uint32_t g_diagFallbackBase = 0;
+static uint32_t g_diagWindowBase = 0;
+static uint32_t g_diagAttemptBase = 0;
 static uint32_t g_diagLoopHz   = 0;
 static uint32_t g_diagAlignedPct = 0;
 
@@ -939,9 +969,15 @@ static void printState() {
                            ? ((reports - fallbacks) * 100U / reports)
                            : 100U;
     g_diagLoopHz = (g_loopCount - g_diagLoopBase) * 1000U / rateElapsedMs;
+    g_hidWindowPerSec =
+        (g_hidWindowCount - g_diagWindowBase) * 1000U / rateElapsedMs;
+    g_hidAttemptPerSec =
+        (g_hidAttemptCount - g_diagAttemptBase) * 1000U / rateElapsedMs;
 
     g_diagReportBase    = g_hidReportCount;
     g_diagFallbackBase  = g_hidFallbackCount;
+    g_diagWindowBase    = g_hidWindowCount;
+    g_diagAttemptBase   = g_hidAttemptCount;
     g_diagLoopBase      = g_loopCount;
     g_diagWindowMs = rateNowMs;
   }
@@ -951,10 +987,46 @@ static void printState() {
     Serial.print(static_cast<float>(hidConnIntervalUnits()) * 1.25f, 1);
     Serial.print(" tx_s= ");
     Serial.print(g_hidRatePerSec);
+    // win is how often the gate was satisfied, try is how often a report was
+    // handed over, tx_s is how often the radio accepted it. Read together:
+    //   win ~66          the link is offering every event
+    //   try < win        the loop rarely catches the window it is offered
+    //   tx_s < try       the radio refused (queue full / payload did not fit)
+    Serial.print(" win= ");
+    Serial.print(g_hidWindowPerSec);
+    Serial.print(" try= ");
+    Serial.print(g_hidAttemptPerSec);
     // Share of reports that went out in the aligned window rather than on the
     // rate fallback. 100 means the loop places every report.
     Serial.print(" align= ");
     Serial.print(g_diagAlignedPct);
+
+    // tx_s against the interval is the tell, and the two numbers below say why
+    // they disagree. ci_ms sets the ceiling -- 1000/ci_ms reports per second are
+    // available -- and tx_s is what actually left. A peripheral cannot transmit
+    // except in a connection event the central starts, so a large gap means the
+    // radio is being handed far fewer events than the interval implies.
+    //
+    //   lat  the slave latency in force. Only the host sets it and the sketch
+    //        asks for zero, so a non-zero value is the host's doing. The host
+    //        may then anchor only once every (lat + 1) events, which throttles
+    //        a peripheral to that fraction of the interval rate.
+    //   miss consecutive events the LL failed to receive. Large and persistent
+    //        means the device side, not the host, is dropping them.
+    //
+    // Either way the pointer is capped at tx_s reports/s: at 11 that is
+    // 11 * 127 / kHidCountsPerDeg = 87 deg/s of pointer rate, against a gyro
+    // that reads 300-500 dps, so most of a fast motion can only be discarded.
+    xiao_nrf54l15::BleConnectionInfo linkInfo;
+    if (Bluefruit.rawRadio().getConnectionInfo(&linkInfo)) {
+      Serial.print(" lat= ");
+      Serial.print(linkInfo.latency);
+    }
+    xiao_nrf54l15::BleConnectionTimingSnapshot linkSnap;
+    if (Bluefruit.rawRadio().getConnectionTimingSnapshot(&linkSnap)) {
+      Serial.print(" miss= ");
+      Serial.print(linkSnap.missedEventCount);
+    }
   }
 
   Serial.print(" loop_hz= ");
@@ -980,6 +1052,8 @@ static void hidConnectCallback(uint16_t connHandle) {
   g_diagLoopBase = g_loopCount;
   g_diagReportBase = g_hidReportCount;
   g_diagFallbackBase = g_hidFallbackCount;
+  g_diagWindowBase = g_hidWindowCount;
+  g_diagAttemptBase = g_hidAttemptCount;
   g_hidRatePerSec = 0;
   // Ask for a fast interval on the next pass, not up to a poll interval later.
   g_hidConnPollMs = millis() - kConnPollMs;
@@ -1226,6 +1300,9 @@ static void hidTask(uint32_t nowMs) {
 
   const uint8_t buttons = g_buttonStable ? MOUSE_BUTTON_LEFT : 0;
   const bool buttonChanged = (buttons != g_hidLastButtons);
+  if (windowOpen) {
+    ++g_hidWindowCount;
+  }
   const int8_t dx = hidCountsFor(g_pendingDeg[0]);
   const int8_t dy = hidCountsFor(g_pendingDeg[1]);
   const bool keepaliveDue =
@@ -1252,6 +1329,7 @@ static void hidTask(uint32_t nowMs) {
 
   g_hidLastReportMs = nowMs;
   hidRefreshReportPeriod();
+  ++g_hidAttemptCount;
 
   if (blehid.mouseReport(buttons, dx, dy, 0, 0)) {
     // Subtract only what was actually sent. The remainder stays pending, which
