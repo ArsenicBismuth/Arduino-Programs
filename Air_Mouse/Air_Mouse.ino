@@ -43,7 +43,7 @@ class LogSerial {
     if (kSerialLogEnabled) {
       Serial.begin(baud);
     }
-  }
+  } 
   void println() {
     if (kSerialLogEnabled) {
       Serial.println();
@@ -236,8 +236,8 @@ static const uint32_t kHidSendSlackMs = 5;
 // Connection interval, in 1.25 ms units. The central decides, and it takes the TOP of
 // whatever range is offered -- measured: 6-12 (7.5-15 ms) settles at exactly 15 ms --
 // so the floor has to be asked for alone. This is the report rate, and the report rate
-// is the whole problem: the radio spends 2-3 events per notification, so events/s / 2.5
-// is reports/s, and halving the interval doubles the pointer's maximum rate.
+// is measured, not derived: one report per 2-3 connection events, not one per event.
+// README, "What actually sets the report rate".
 static const uint16_t kConnIntervalMin = 6;   // 7.5 ms
 static const uint16_t kConnIntervalMax = 6;   // 7.5 ms -- no room to pick the top
 

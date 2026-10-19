@@ -105,7 +105,7 @@ A debug view of the pipeline, at `kPrintIntervalMs`, with `kSerialLogEnabled = t
 | `ptr_deg` | those rates integrated — pointer movement so far, wrapped to ±180° |
 | `read_err` | failed I2C transactions / attempted. Hidden until it is non-zero |
 | `ci_ms` | negotiated BLE connection interval — the report period before the radio's own limits are applied. Shown once connected |
-| `tx_s` | reports the radio *accepted* per second: the pointer's real update rate. It tracks `(1000 / ci_ms) / 2.5`, **not** `1000 / ci_ms` — the radio only lets a notification out every 2–3 connection events. Measured 26–27/s at a 15 ms interval and 52/s at 7.5 ms, which is one report per 2.5 events at both |
+| `tx_s` | reports the radio *accepted* per second: the pointer's real update rate. It tracks `(1000 / ci_ms) / 2.5`, **not** `1000 / ci_ms` — see [What actually sets the report rate](#what-actually-sets-the-report-rate). Measured 26–27/s at a 15 ms interval and 52/s at 7.5 ms, one report per 2.5 events at both |
 | `win` | how often the send window was available. A link-health number: roughly the loop passes that landed inside the window before an event |
 | `try` | reports handed to the radio per second. Should sit just above `tx_s`; the few refusals per second are the pacing's control signal, not a fault |
 | `pace` | the hand-over period in ms the pacing settled on. `try` is about `1000 / pace`, and `tx_s` is the rate the radio grants |
@@ -241,16 +241,17 @@ The rules that shape the code, all of them from the core's own HID example:
   so it leaves in that event instead of waiting an extra interval — see [Latency](#latency).
 - **The hand-over rate is paced to what the radio accepts** (`hidMaintainPace`). The cadence belongs
   to the link, not to a timer: the radio only lets a notification out every 2–3 connection events, so
-  offering one per event does not buy reports, it fills the radio's notification queue. That queue is
-  the real problem — it drains at the radio's rate, so everything sitting in it arrives *after* your
-  hand has stopped, which is a cursor that keeps going. The rate is not derived from the interval,
-  because it is not a clean function of it: measured 26–27 reports/s at a 15 ms interval (2.6 events
-  each) and 52/s at 7.5 ms (2.6 each). It is measured from the refusals instead, which are the direct
-  signal: a refusal means the queue was full, so `attempts / reports` for that second is exactly how
-  far above the link's rate the sketch is offering. Scaling the period by that ratio lands on the
-  link's rate in one step, and unlike a remembered peak it can move in both directions when the link
-  changes. When nothing is refused there is nothing to correct towards, so the period is shortened 5 %
-  to probe for a ceiling the pacing may have parked under.
+  offering one per event does not buy reports, it fills the radio's notification queue — see
+  [What actually sets the report rate](#what-actually-sets-the-report-rate) for why that is and what
+  measures it. That queue is the real problem — it drains at the radio's rate, so everything sitting
+  in it arrives *after* your hand has stopped, which is a cursor that keeps going. The rate is not
+  derived from the interval, because it is not a clean function of it: measured 26–27 reports/s at a
+  15 ms interval (2.6 events each) and 52/s at 7.5 ms (2.6 each). It is measured from the refusals
+  instead, which are the direct signal: a refusal means the queue was full, so `attempts / reports` for
+  that second is exactly how far above the link's rate the sketch is offering. Scaling the period by
+  that ratio lands on the link's rate in one step, and unlike a remembered peak it can move in both
+  directions when the link changes. When nothing is refused there is nothing to correct towards, so the
+  period is shortened 5 % to probe for a ceiling the pacing may have parked under.
 - **Deltas are signed 8-bit**, so each report is clamped to ±127 counts. Only what was really sent is
   subtracted from the accumulator, so the sub-count remainder carries over and slow motion is not
   quantised away. If a report fails, the motion stays pending for the next slot.
@@ -339,6 +340,51 @@ The rules that produce the "Now" column:
   `loop_hz` below that rate means the main loop, not the link.
 - **Every millisecond of filter tau is a millisecond of lag**, which is why the gyro filter is short. It
   is not free: lowering it further trades smoothness for response.
+
+### What actually sets the report rate
+
+Four things are worth separating here, because only one of them is Android's:
+
+1. **Android picks the connection interval.** This is the only part the phone decides — the sketch can
+   ask (7.5 ms here; 30 ms is Android's default for a GATT client). Events per second is `1000 / ci_ms`.
+2. **A peripheral only transmits inside an event the central starts**, one packet at a time. So
+   events/s is the ceiling on reports/s — if every event could carry one.
+3. **In this core the notification path is one packet deep, and an encrypted link cannot share an
+   event.** Both read from the HAL, not inferred:
+   - A notification is built into a single pending PDU slot (`connectionPendingTxValid_`), and the TX
+     site says how that slot behaves: *"Replace the previous PDU only after the peer's NESN
+     acknowledges it. Until then the Link Layer requires the exact same SN, ciphertext and CCM counter
+     to be retransmitted."* One notification in flight at a time; the rest wait in the queue.
+   - The same-event followup turnaround — the mechanism that would let a second packet share an event —
+     is gated on the link **not** being encrypted (`allowPlainFollowupTurnaround`,
+     `!connectionEncSessionValid_`, `nrf54l15_hal_ble_peripheral_event_tx.inc`). HID requires an
+     encrypted link, so that path is always off for this sketch.
+
+4. **What the whole chain costs is measured, not derived.** From arrival timestamps on the phone
+   (`adb shell getevent -lt` — the serial counters give the rate but not its shape), the gaps between
+   reports are **2 or 3 connection events**, averaging 2.5:
+
+| Interval | Events/s | Reports/s | Events per report |
+| --- | --- | --- | --- |
+| 15 ms | 66.7 | 26.9 | 2.48 |
+| 7.5 ms | 133 | 52 | 2.56 |
+
+To be straight about which is which: the 2.5 is measured, twice, at two different intervals. The code
+above establishes a one-packet-deep path, which explains why the rate cannot exceed one report per
+event — it does **not** explain why the measured figure is 2.5 rather than 1. That residual is not
+accounted for line by line anywhere here, and it is the reason the sketch measures the rate rather
+than computing it.
+
+That is why the sketch cannot simply be told `1000 / ci_ms`: on this path the honest number is
+`(1000 / ci_ms) / 2.5`, and why the pacing watches refusals instead — see
+[HID transport](#hid-transport). It is also why the rate is a property of the *link* rather than a
+firmware constant: a core that keeps the encrypted followup turnaround, or a link that is not
+encrypted, need not pay it, and nothing in this sketch can tell which case it is looking at other than
+by measuring.
+
+Anything queued beyond the one packet in flight lands in the notification queue (depth 8,
+`kCustomGattNotificationQueueDepth`) and drains at that rate, one packet per turn — harmless while the
+pacing holds it nearly empty, and exactly the lag you feel when it does not.
 
 What is left after this is not in the sketch: one connection interval of transmission delay is
 inherent to BLE, and the host's own input pipeline (Android's `InputReader` → `InputDispatcher` →
