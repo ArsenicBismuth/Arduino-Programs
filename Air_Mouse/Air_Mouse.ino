@@ -31,6 +31,71 @@
 #include <nrf54l15_hal.h>
 
 // ---------------------------------------------------------------------------
+// Serial log
+// ---------------------------------------------------------------------------
+
+// Master switch for every print in this sketch. Off by default: nothing in the
+// pointer path then depends on a serial port, no print can stall the loop on a port
+// that no host is reading, and the periodic state line's two link queries (which
+// each service the whole stack) do not run at all. Set it to true and the log comes
+// back exactly as it was, including kPrintAxisDiag.
+//
+// Why it is worth a switch rather than just deleting the prints: the periodic line
+// is ~150 bytes, which is ~13 ms of wire time at 115200 baud, ten times a second --
+// and loop_hz has been measured at 413 with it on, which is below the sensor's own
+// 416 Hz. Whether that is the loop blocking or a ring buffer filling, the switch
+// settles it by measurement: flip it and compare loop_hz.
+static const bool kSerialLogEnabled = false;
+
+// Every call site below still reads `Serial.print(...)`. Pointing the identifier at
+// this instead of the port, rather than wrapping ~90 call sites in a macro, keeps
+// the diagnostics readable where they are and makes the switch a single line. The
+// bodies see the real Serial object, because the macro is defined after the class.
+class LogSerial {
+ public:
+  void begin(unsigned long baud) {
+    if (kSerialLogEnabled) {
+      Serial.begin(baud);
+    }
+  }
+  void println() {
+    if (kSerialLogEnabled) {
+      Serial.println();
+    }
+  }
+  template <typename A>
+  void print(A a) {
+    if (kSerialLogEnabled) {
+      Serial.print(a);
+    }
+  }
+  template <typename A>
+  void println(A a) {
+    if (kSerialLogEnabled) {
+      Serial.println(a);
+    }
+  }
+  template <typename A, typename B>
+  void print(A a, B b) {
+    if (kSerialLogEnabled) {
+      Serial.print(a, b);
+    }
+  }
+  template <typename A, typename B>
+  void println(A a, B b) {
+    if (kSerialLogEnabled) {
+      Serial.println(a, b);
+    }
+  }
+};
+
+static LogSerial g_logSerial;
+
+// The switch is a compile-time constant, so with the log off the compiler inlines
+// each of these to nothing and drops the arguments with them.
+#define Serial g_logSerial
+
+// ---------------------------------------------------------------------------
 // Board wiring
 // ---------------------------------------------------------------------------
 
@@ -149,9 +214,11 @@ static const float    kBiasTrackingAlpha = 0.005f;
 static const float kGyroFilterTauMs    = 3.0f;   // ~53 Hz cutoff
 static const float kGravityFilterTauMs = 50.0f;  // ~3 Hz cutoff
 
-// Display rate only, not the sample rate. Keep it slow: Serial writes block until
-// the DMA transmit finishes here, so every printed line is time the pointer
-// cannot report in.
+// Display rate only, not the sample rate. With the log on this is the sketch's
+// largest optional cost -- a ~150 byte line is ~13 ms of wire time at 115200 baud,
+// and loop_hz has been measured at 413 with it on, below the sensor's own 416 Hz.
+// See kSerialLogEnabled: the switch settles whether that is the write blocking or a
+// TX ring buffer filling, and the periodic line is skipped entirely when it is off.
 static const uint32_t kPrintIntervalMs = 100;  // 10 Hz
 
 // Adds accel_mg, plane_g and gyro to the periodic line. Off because it is a
@@ -273,7 +340,13 @@ static const float kHidPendingCapDeg = 16.0f;
 // or so at rest. Below the threshold the axis is zero; above it the rate is
 // reduced by exactly the threshold rather than truncated at it, so the response
 // stays continuous and the cost is a constant offset instead of a lost band.
-// Sized to the measured +/-0.5 dps of rest noise. 0.0f disables it.
+//
+// Set well above the measured +/-0.5 dps of rest noise rather than at it: the bias
+// tracker removes the mean residual, not the sample-to-sample noise on top of it, so
+// a threshold at the noise level still passes its peaks and the cursor still
+// shimmers. The price is explicit: rotation slower than this much produces nothing,
+// and faster than it is reduced by exactly this much. First knob to lower if slow
+// aiming feels heavy. 0.0f disables it.
 static const float kHidDeadzoneDps = 3.0f;
 
 // Onboard button, active low, as left click.
@@ -1534,7 +1607,11 @@ static void imuTask() {
   updateMotion(gyroRaw, accelRaw, dtSec);
 
   const uint32_t nowMs = millis();
-  if (nowMs - g_lastPrintMs >= kPrintIntervalMs) {
+  // Gated on the log switch, not just on the interval. printState ends with two
+  // Bluefruit link queries and each of those services the whole stack (see
+  // kLinkPollMs), so with the log off there is no reason to pay for them ten times
+  // a second to assemble a line nobody reads.
+  if (kSerialLogEnabled && (nowMs - g_lastPrintMs >= kPrintIntervalMs)) {
     g_lastPrintMs = nowMs;
     printState();
   }
