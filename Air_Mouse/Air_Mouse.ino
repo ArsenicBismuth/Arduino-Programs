@@ -185,12 +185,32 @@ static const char kDeviceName[] = "Air Mouse";
 // flick must survive undistorted.
 static const float kHidCountsPerDeg = 16.0f;
 
-// Cadence comes from the link: one report per connection event. Sending faster
-// only stacks notifications in a queue, and that queue is the latency. These
-// bounds just guard the fallback arithmetic.
+// Cadence: one hand-over per attempt period (see hidMaintainPace), which follows
+// what the radio actually accepts rather than the event rate. These bounds guard
+// the arithmetic; the ceiling has to clear the slowest link worth following.
 static const uint32_t kHidReportFallbackMs = 15;  // before the interval is known
 static const uint32_t kHidReportFloorMs    = 5;
 static const uint32_t kHidReportCeilMs     = 50;
+
+// Attempt-rate pacing. The radio accepts a notification only every 2-3 connection
+// events, so offering one per event does not buy reports -- it fills the radio's
+// notification queue. That queue is the problem: it drains at the radio's rate, so
+// every report sitting in it arrives after the hand has already stopped, which is
+// the cursor that keeps going. Holding the hand-over rate at what the radio
+// accepts keeps one or two reports outstanding instead of eight, which is why the
+// pointer now stops when the hand does.
+//
+// The rate is not derived from the interval, because it is not a clean function of
+// it: measured 26-27 reports/s at 15 ms (2.6 events each) and ~37/s at 7.5 ms (3.6
+// each). It comes from the refusals instead, which measure it directly: a refusal
+// means the radio's queue was full, so attempts/reports for that second is exactly
+// how far above the link's rate the sketch currently is. Correct by that ratio and
+// the period lands on the link's rate in one step. When nothing is refused there is
+// nothing to correct towards, so step the rate up and keep looking -- that is the
+// only direction that can find a ceiling the sketch has previously been paced below.
+static const uint32_t kHidPaceWindowMs = 1000;  // measurement window
+static const uint8_t  kHidPaceProbePct = 95;    // nothing refused: try this much of the period
+static const uint32_t kHidPaceMinRate  = 8;     // below this reports/s, not a measurement
 
 // How long before the next connection event the report is handed to the radio.
 // Must clear the loop's own ~1 ms granularity plus the radio's 2.2 ms pre-roll;
@@ -337,6 +357,16 @@ static uint32_t g_hidWindowCount   = 0;  // times windowOpen came out true
 static uint32_t g_hidAttemptCount  = 0;  // times mouseReport was called
 static uint32_t g_hidWindowPerSec  = 0;
 static uint32_t g_hidAttemptPerSec = 0;
+
+// Pacing state (see hidMaintainPace). The period stays 0 until the first second of
+// movement is measured, and 0 means "no pacing", which is the free-running state
+// the first measurement is taken in.
+static uint32_t g_hidPacePeriodMs    = 0;  // derived attempt period, 0 = unpaced
+static uint32_t g_hidPacePollMs      = 0;
+static uint32_t g_hidPaceWindowMs    = 0;  // start of the current measurement window
+static uint32_t g_hidPaceBase        = 0;  // report count at that start
+static uint32_t g_hidPaceAttemptBase = 0;
+static uint16_t g_hidPaceIntervalUnits = 0;  // interval the period was measured on
 
 // Averaged over one shared one-second window. loop_hz below 1000/ci_ms means the
 // loop, not the link, is setting the report rate and the sample rate.
@@ -987,15 +1017,19 @@ static void printState() {
     Serial.print(static_cast<float>(hidConnIntervalUnits()) * 1.25f, 1);
     Serial.print(" tx_s= ");
     Serial.print(g_hidRatePerSec);
-    // win is how often the gate was satisfied, try is how often a report was
-    // handed over, tx_s is how often the radio accepted it. Read together:
-    //   win ~66          the link is offering every event
-    //   try < win        the loop rarely catches the window it is offered
-    //   tx_s < try       the radio refused (queue full / payload did not fit)
+    // win is how often the window was open, try is how often a report was handed
+    // over, tx_s is how often the radio accepted it, pace is the hand-over period
+    // the pacing settled on in ms. Read together: win ~1000/ci_ms means the link
+    // is offering every event; try == tx_s means the radio took everything it was
+    // offered, and therefore that the queue is shallow; tx_s < try means the radio
+    // refused because its queue is full, and the reports sitting in that queue are
+    // cursor movement still to come. In the paced state try is ~1000/pace.
     Serial.print(" win= ");
     Serial.print(g_hidWindowPerSec);
     Serial.print(" try= ");
     Serial.print(g_hidAttemptPerSec);
+    Serial.print(" pace= ");
+    Serial.print(g_hidPacePeriodMs);
     // Share of reports that went out in the aligned window rather than on the
     // rate fallback. 100 means the loop places every report.
     Serial.print(" align= ");
@@ -1014,9 +1048,11 @@ static void printState() {
     //   miss consecutive events the LL failed to receive. Large and persistent
     //        means the device side, not the host, is dropping them.
     //
-    // Either way the pointer is capped at tx_s reports/s: at 11 that is
-    // 11 * 127 / kHidCountsPerDeg = 87 deg/s of pointer rate, against a gyro
-    // that reads 300-500 dps, so most of a fast motion can only be discarded.
+    // The pointer rate is tx_s * 127 / kHidCountsPerDeg dps, and that product is
+    // the binding constraint: ~206 dps at the 26 reports/s a 15 ms interval
+    // yielded, ~262 at the 33/s the pace settles on, against a gyro that reads
+    // 200-570. lat and miss say whether the link is being generous; they cannot
+    // make the radio accept more than it does.
     xiao_nrf54l15::BleConnectionInfo linkInfo;
     if (Bluefruit.rawRadio().getConnectionInfo(&linkInfo)) {
       Serial.print(" lat= ");
@@ -1048,6 +1084,9 @@ static void hidConnectCallback(uint16_t connHandle) {
   g_hidConnSlowdown = false;
   g_hidConnFastSeen = false;
   g_hidLastWindowUs = 0;
+  // Force the pacing to relearn: the ceiling belongs to the link, not the sketch.
+  // Left alone it would carry the previous connection's rate into this one.
+  g_hidPaceIntervalUnits = 0;
   g_diagWindowMs = millis();
   g_diagLoopBase = g_loopCount;
   g_diagReportBase = g_hidReportCount;
@@ -1201,6 +1240,85 @@ static void hidRefreshReportPeriod() {
   g_hidReportPeriodMs = ms;
 }
 
+// The hand-over period actually in force: the link's own event period, or the
+// paced period once one has been measured, whichever is longer. Never shorter than
+// the event period, which would just queue reports the link cannot carry.
+static uint32_t hidAttemptPeriodMs() {
+  return (g_hidPacePeriodMs > g_hidReportPeriodMs) ? g_hidPacePeriodMs
+                                                   : g_hidReportPeriodMs;
+}
+
+// Tracks the hand-over rate the radio actually accepts and derives the period from
+// it. Polled rather than per pass: it reads the connection interval, and that query
+// is not free (see kLinkPollMs).
+static void hidMaintainPace(uint32_t nowMs) {
+  if ((nowMs - g_hidPacePollMs) < kConnPollMs) {
+    return;
+  }
+  g_hidPacePollMs = nowMs;
+
+  const uint16_t units = hidConnIntervalUnits();
+  if (units == 0U) {
+    return;  // no link, nothing to measure
+  }
+  if (units != g_hidPaceIntervalUnits) {
+    // A new link, or the host moved the interval. Whatever period was in force was
+    // set against the old rate, so start from scratch instead of creeping to it.
+    g_hidPaceIntervalUnits = units;
+    g_hidPacePeriodMs      = 0;
+    g_hidPaceWindowMs      = nowMs;
+    g_hidPaceBase          = g_hidReportCount;
+    g_hidPaceAttemptBase   = g_hidAttemptCount;
+    return;
+  }
+
+  const uint32_t elapsedMs = nowMs - g_hidPaceWindowMs;
+  if (elapsedMs < kHidPaceWindowMs) {
+    return;
+  }
+  const uint32_t reports  = g_hidReportCount - g_hidPaceBase;
+  const uint32_t attempts = g_hidAttemptCount - g_hidPaceAttemptBase;
+  g_hidPaceBase        = g_hidReportCount;
+  g_hidPaceAttemptBase = g_hidAttemptCount;
+  g_hidPaceWindowMs    = nowMs;
+
+  // A second with almost nothing handed over says nothing about the link: the hand
+  // was still. Leave the period where it is rather than adapting to silence.
+  if (attempts < kHidPaceMinRate) {
+    return;
+  }
+
+  // The period in force. 0 means unpaced, which is the link's own event period.
+  uint32_t periodMs = (g_hidPacePeriodMs != 0U) ? g_hidPacePeriodMs
+                                                : hidAttemptPeriodMs();
+
+  if (reports == 0U) {
+    // Nothing got through at all while reports were on offer. Treat the link as
+    // unusable rather than dividing by it, and back right off.
+    periodMs = kHidReportCeilMs;
+  } else if (reports < attempts) {
+    // Refusals mean the radio's queue was full, so the sketch was offering faster
+    // than the link drains. attempts/reports is exactly that overshoot, so scaling
+    // by it lands the period on the link's rate in one step -- and, unlike a peak,
+    // it is free to move in either direction when the link changes.
+    const uint32_t scaled = (periodMs * attempts) / reports;
+    periodMs = (scaled > periodMs) ? scaled : periodMs;
+  } else {
+    // Nothing was refused all second, so the queue had room and the sketch is at or
+    // under the link's rate. There is nothing to correct towards, so probe faster:
+    // this is the only direction that can recover a ceiling the pacing has been
+    // sitting under, which is what left it stuck at 21 reports/s.
+    periodMs = (periodMs * kHidPaceProbePct) / 100U;
+  }
+
+  if (periodMs < kHidReportFloorMs) {
+    periodMs = kHidReportFloorMs;
+  } else if (periodMs > kHidReportCeilMs) {
+    periodMs = kHidReportCeilMs;
+  }
+  g_hidPacePeriodMs = periodMs;
+}
+
 // Connection-interval upkeep. Once encrypted it walks the retry ladder; before
 // that it is a stopwatch that backs off if pairing has not finished. Polled on
 // kConnPollMs -- see there for why not per pass.
@@ -1266,6 +1384,7 @@ static void hidTask(uint32_t nowMs) {
   hidPollButton(nowMs);
   hidPollLink(nowMs);
   hidMaintainConnInterval(nowMs);
+  hidMaintainPace(nowMs);
 
   if (!hidLinkReady()) {
     // Drop the backlog rather than firing it off in a burst the moment the
@@ -1283,19 +1402,17 @@ static void hidTask(uint32_t nowMs) {
   bool windowOpen = false;
   xiao_nrf54l15::BleConnectionTimingSnapshot timing;
   if (Bluefruit.rawRadio().getConnectionTimingSnapshot(&timing)) {
-    // Hand over just before the next event so it leaves in that event. One send
-    // per event, spaced on the radio's clock: timeUntilNextEventUs of 0 means the
-    // anchor has gone by and this event cannot be caught.
+    // Hand over just before the next event so it leaves in that event. This is a
+    // placement aid now, not the rate limit -- the attempt period is -- and
+    // timeUntilNextEventUs of 0 means the anchor has gone by, so this event cannot
+    // be caught and there is no window to aim at.
     const uint32_t windowSpacingUs = (timing.intervalUs > kHidSendLeadUs)
                                          ? (timing.intervalUs - kHidSendLeadUs)
                                          : timing.intervalUs;
     windowOpen = timing.connected && timing.timeUntilNextEventUs != 0U &&
                  timing.timeUntilNextEventUs <= kHidSendLeadUs &&
                  (g_hidLastWindowUs == 0U ||
-                  (uint32_t)(timing.nowUs - g_hidLastWindowUs) >= windowSpacingUs) &&
-                 // Half an interval since the last report, whatever sent it,
-                 // so a fallback send cannot be followed straight away.
-                 (nowMs - g_hidLastReportMs) >= (g_hidReportPeriodMs / 2U);
+                  (uint32_t)(timing.nowUs - g_hidLastWindowUs) >= windowSpacingUs);
   }
 
   const uint8_t buttons = g_buttonStable ? MOUSE_BUTTON_LEFT : 0;
@@ -1309,20 +1426,22 @@ static void hidTask(uint32_t nowMs) {
       kHidIdleReportEnabled && ((nowMs - g_hidLastKeepaliveMs) >= kHidIdleReportMs);
 
   if (dx == 0 && dy == 0 && !buttonChanged && !keepaliveDue) {
-    // Keep the fallback reference fresh so it measures "motion has been waiting"
-    // rather than "the last send was long ago".
-    g_hidLastReportMs = nowMs;
+    // Deliberately no g_hidLastReportMs refresh here. The period now means "since
+    // the last hand-over", so letting it run out while the hand is still makes the
+    // first report of the next movement leave at once instead of a period late.
     return;  // nothing to say, and no keepalive wanted yet
   }
 
-  // Two routes. The window places the report for the event; the fallback is the
-  // rate limit for when the loop is too slow to hit the window, so the rate holds
-  // at the loop's rate instead of whatever luck catches.
-  bool sendNow = windowOpen;
-  if (!sendNow &&
-      (nowMs - g_hidLastReportMs) >= (g_hidReportPeriodMs + kHidSendSlackMs)) {
-    sendNow = true;
-  }
+  // Two routes, both limited to one hand-over per attempt period so the radio's
+  // queue cannot build up behind us. The window places the report for the event,
+  // which keeps the phase right when the period spans several events; the fallback
+  // covers a loop that keeps missing the window, so reporting does not depend on
+  // catching it.
+  const uint32_t attemptPeriodMs = hidAttemptPeriodMs();
+  const uint32_t sinceReportMs   = nowMs - g_hidLastReportMs;
+  const bool sendNow =
+      (windowOpen && sinceReportMs >= attemptPeriodMs) ||
+      (sinceReportMs >= (attemptPeriodMs + kHidSendSlackMs));
   if (!sendNow) {
     return;
   }
