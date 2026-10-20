@@ -36,7 +36,7 @@ nothing in the pointer path depends on a serial port. Every log excerpt below as
 been turned back on:
 
 ```cpp
-static const bool kSerialLogEnabled = true;  // false as shipped
+static const bool kSerialLogEnabled = false;  // false as shipped
 ```
 
 ## Startup sequence
@@ -250,13 +250,15 @@ The rules that shape the code, all of them from the core's own HID example:
   everything sitting in it arrives *after* your hand has stopped, which is a cursor that keeps going.
   Matching the rate is not enough, because a queue that is exactly full never empties: the pacing parks
   a margin *slower* than the link (`kHidPaceMarginMs`), so the queue drains and the motion stays in the
-  sketch, where a stop is a stop. The rate is not derived from the interval, because it is not a clean
-  function of it: measured 26–27 reports/s at a 15 ms interval (2.6 events each) and 52/s at 7.5 ms
-  (2.6 each). It is measured from the refusals instead, which are the direct signal: a refusal means the
-  queue was full, so in that second the radio accepted exactly what it could drain, and `1000 / tx_s` is
-  the link's own period. With nothing refused there is nothing to measure, so the parked period is held
-  and eased down 1 ms every `kHidPaceHoldMs` — the only way to find a link that got faster, at the cost
-  of one second of refusals when the guess was wrong.
+  sketch, where a stop is a stop. The steady rate is not derived from the interval, because it is not a
+  clean function of it: measured 26–27 reports/s at a 15 ms interval (2.6 events each) and 52/s at
+  7.5 ms (2.6 each). It is measured from the refusals instead, which are the direct signal: a refusal
+  means the queue was full, so in that second the radio accepted exactly what it could drain, and
+  `1000 / tx_s` is the link's own period. A new link starts at the measured 2.5-events-per-report
+  cadence, so a single busy second cannot park it far too slow; from there one bad second is ignored
+  and two in a row re-park the floor. With nothing refused the floor is held and eased down 1 ms every
+  `kHidPaceHoldMs` (1 s while recovering from a slow floor) — the only way to find a link that got
+  faster, at the cost of one second of refusals when the guess was wrong.
 - **Deltas are signed 8-bit**, so each report is clamped to ±127 counts. Only what was really sent is
   subtracted from the accumulator, so the sub-count remainder carries over and slow motion is not
   quantised away. If a report fails, the motion stays pending for the next slot.
@@ -387,6 +389,16 @@ firmware constant: a core that keeps the encrypted followup turnaround, or a lin
 encrypted, need not pay it, and nothing in this sketch can tell which case it is looking at other than
 by measuring.
 
+**Tested: the encrypted same-event follow-up does not help this host.** A local patch to core 1.0.22
+(`tools/patch-nrf54l15-encrypted-ack.ps1`) armed it for fully encrypted ATT notifications. At forced
+8 ms pacing (`try= 96`) `tx_s=` still capped at 52/s, and the counters showed the follow-up armed but
+never receiving a packet (`fe= 0`, `fc= 0`, `fl= 0/0`, `fb= 800`): the PC does not transmit after the
+notification in the same event. The 2.5 events/report is the host's scheduling, not just the core's
+encrypted-link gate. The patch was reverted; the core is original again.
+
+The 36/s seen after a reconnect was the pace's first sample including pairing, not the patch; the
+pace now waits for an encrypted, notify-enabled link before measuring.
+
 Anything queued beyond the one packet in flight lands in the notification queue (depth 8,
 `kCustomGattNotificationQueueDepth`) and drains at that rate, one packet per turn. Eight reports at
 ~19 ms each is ~150 ms of motion the hand has already made, so a full queue is a cursor that keeps
@@ -409,8 +421,9 @@ compositor) adds a frame or two on top. A gyro air pointer will not feel like a 
 | `kHidSendSlackMs` | 5 | How long past the paced period the send window is abandoned for the rate fallback |
 | `kHidPaceWindowMs` | 1000 | Window over which the pacing counts attempts against accepted reports |
 | `kHidPaceMarginMs` | 2 | Added to the measured drain period, so the queue empties and stays empty |
-| `kHidPaceProbePct` | 95 | Only before a drain has been measured: the period is scaled to this percent of itself to look for headroom |
-| `kHidPaceHoldMs` | 5000 | Once parked, how long before the floor is eased down 1 ms to re-probe the link |
+| `kHidPaceHoldMs` | 5000 | Once at the floor, how long before it is eased down 1 ms to re-probe the link |
+| `kHidPaceFastHoldMs` | 1000 | While the floor is above the seed, how often it is eased down 1 ms to recover |
+| `kHidPaceRefusalRunLimit` | 2 | Consecutive refusal seconds before a single bad second is allowed to re-park the floor |
 | `kHidPaceMinRate` | 8 | Below this many reports/s a window is too quiet to pace from |
 | `kHidCountsPerDeg` | 16.0 | Pointer gain, bounded by the report format — see below |
 | `kHidDeadzoneDps` | 3.0 | Per-axis soft deadzone on the pointer rate, set above the measured rest noise. `0.0f` passes the raw gyro |

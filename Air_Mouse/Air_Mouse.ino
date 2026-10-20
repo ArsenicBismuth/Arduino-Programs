@@ -32,7 +32,7 @@
 // Master switch for every print in this sketch. Off by default, so the pointer path
 // touches no serial port and the periodic line's link queries do not run. Set true to
 // bring the whole log back. Cost and reasoning: README, "Serial output".
-static const bool kSerialLogEnabled = false;
+static const bool kSerialLogEnabled = true;
 
 // Prints are routed through this rather than the port itself, so every call site still
 // reads Serial.print(...) and the compiler removes the lot when the switch is off.
@@ -221,11 +221,17 @@ static const uint32_t kHidReportCeilMs     = 50;
 // after the hand has stopped. A refusal means that queue was full, so 1000/tx_s is the
 // link's own period; the pacing parks a margin slower than that and stays there.
 // README, "HID transport".
-static const uint32_t kHidPaceWindowMs = 1000;  // measurement window
-static const uint32_t kHidPaceMarginMs = 2;     // added to the measured drain period
-static const uint32_t kHidPaceProbePct = 95;    // no drain measured yet: probe faster
-static const uint32_t kHidPaceHoldMs   = 5000;  // then re-probe this slowly
-static const uint32_t kHidPaceMinRate  = 8;     // below this reports/s, not a measurement
+static const uint32_t kHidPaceWindowMs        = 1000;  // measurement window
+static const uint32_t kHidPaceMarginMs        = 2;     // added to the measured drain period
+static const uint32_t kHidPaceHoldMs          = 5000;  // steady probe interval near the floor
+static const uint32_t kHidPaceFastHoldMs      = 1000;  // above the seed: recover quickly
+static const uint32_t kHidPaceRefusalRunLimit = 1;     // bad seconds before re-parking
+static const uint32_t kHidPaceMinRate         = 8;     // below this reports/s, not a measurement
+
+// Diagnostic override: 0 = normal adaptation. Non-zero forces this attempt
+// period so the link ceiling can be measured without waiting for the pace
+// floor to settle.
+static const uint32_t kHidPaceForceMs = 0;
 
 // How long before the next connection event the report is handed to the radio.
 // Must clear the loop's own ~1 ms granularity plus the radio's 2.2 ms pre-roll;
@@ -350,11 +356,12 @@ static uint32_t g_hidAttemptCount  = 0;  // times mouseReport was called
 static uint32_t g_hidWindowPerSec  = 0;
 static uint32_t g_hidAttemptPerSec = 0;
 
-// Pacing state (see hidMaintainPace). The period stays 0 until the first second of
-// movement is measured, and 0 means "no pacing", which is the free-running state
-// the first measurement is taken in.
+// Pacing state (see hidMaintainPace). A new link starts at the measured
+// 2.5-events-per-report cadence, then the floor adapts from there.
 static uint32_t g_hidPacePeriodMs    = 0;  // derived attempt period, 0 = unpaced
 static uint32_t g_hidPaceFloorMs     = 0;  // drain + margin, 0 = not measured yet
+static uint32_t g_hidPaceSeedMs      = 0;  // starting period for this link
+static uint32_t g_hidPaceRefusalRun  = 0;  // consecutive refusal seconds
 static uint32_t g_hidPaceHoldMs      = 0;  // when the floor was last set or eased
 static uint32_t g_hidPacePollMs      = 0;
 static uint32_t g_hidPaceWindowMs    = 0;  // start of the current measurement window
@@ -1217,6 +1224,22 @@ static void hidRefreshReportPeriod() {
   g_hidReportPeriodMs = ms;
 }
 
+// The measured cadence is 2.5 events per report. Use it only as the first
+// period for a new link; the adaptive floor still corrects a host that is
+// faster or slower. Units are 1.25 ms, so units * 3.125 = units * 25 / 8.
+static uint32_t hidPaceSeedMsForUnits(uint16_t units) {
+  if (units == 0U) {
+    return kHidReportFallbackMs;
+  }
+  uint32_t ms = (static_cast<uint32_t>(units) * 25U + 4U) / 8U;
+  if (ms < kHidReportFloorMs) {
+    ms = kHidReportFloorMs;
+  } else if (ms > kHidReportCeilMs) {
+    ms = kHidReportCeilMs;
+  }
+  return ms;
+}
+
 // The hand-over period actually in force: the link's own event period, or the
 // paced period once one has been measured, whichever is longer. Never shorter than
 // the event period, which would just queue reports the link cannot carry.
@@ -1229,6 +1252,26 @@ static uint32_t hidAttemptPeriodMs() {
 // it. Polled rather than per pass: it reads the connection interval, and that query
 // is not free (see kLinkPollMs).
 static void hidMaintainPace(uint32_t nowMs) {
+  if (kHidPaceForceMs != 0U) {
+    // Bypass the adaptive floor. The actual hand-over period is still
+    // max(kHidPaceForceMs, g_hidReportPeriodMs), i.e. 8 ms at a 7.5 ms
+    // connection interval.
+    g_hidPacePeriodMs = kHidPaceForceMs;
+    return;
+  }
+  if (!hidLinkReady()) {
+    // Pairing and notify-enable are not link-rate samples. Drop the window;
+    // the first ready pass seeds the period from the interval.
+    g_hidPaceIntervalUnits = 0;
+    g_hidPacePeriodMs      = 0;
+    g_hidPaceFloorMs       = 0;
+    g_hidPaceSeedMs        = 0;
+    g_hidPaceRefusalRun    = 0;
+    g_hidPaceWindowMs      = nowMs;
+    g_hidPaceBase          = g_hidReportCount;
+    g_hidPaceAttemptBase   = g_hidAttemptCount;
+    return;
+  }
   if ((nowMs - g_hidPacePollMs) < kConnPollMs) {
     return;
   }
@@ -1239,11 +1282,15 @@ static void hidMaintainPace(uint32_t nowMs) {
     return;  // no link, nothing to measure
   }
   if (units != g_hidPaceIntervalUnits) {
-    // A new link, or the host moved the interval. Whatever period was in force was
-    // set against the old rate, so start from scratch instead of creeping to it.
+    // A new link, or the host moved the interval. Start at the measured
+    // 2.5-events-per-report cadence rather than free-running: a single busy
+    // second at the event rate can otherwise park the floor far too slow.
     g_hidPaceIntervalUnits = units;
-    g_hidPacePeriodMs      = 0;
-    g_hidPaceFloorMs       = 0;
+    g_hidPaceSeedMs        = hidPaceSeedMsForUnits(units);
+    g_hidPaceFloorMs       = g_hidPaceSeedMs;
+    g_hidPacePeriodMs      = g_hidPaceSeedMs;
+    g_hidPaceRefusalRun    = 0;
+    g_hidPaceHoldMs        = nowMs;
     g_hidPaceWindowMs      = nowMs;
     g_hidPaceBase          = g_hidReportCount;
     g_hidPaceAttemptBase   = g_hidAttemptCount;
@@ -1263,6 +1310,7 @@ static void hidMaintainPace(uint32_t nowMs) {
   // A second with almost nothing handed over says nothing about the link: the hand
   // was still. Leave the period where it is rather than adapting to silence.
   if (attempts < kHidPaceMinRate) {
+    g_hidPaceRefusalRun = 0;
     return;
   }
 
@@ -1273,22 +1321,31 @@ static void hidMaintainPace(uint32_t nowMs) {
   if (reports == 0U) {
     // Nothing got through at all while reports were on offer. Treat the link as
     // unusable rather than dividing by it, and back right off.
+    g_hidPaceRefusalRun = 0;
     periodMs = kHidReportCeilMs;
   } else if (reports < attempts) {
     // Refusals mean the queue was full, so what left is exactly what the link drains.
-    // Park a margin slower: the queue then empties and stays empty, instead of holding
-    // a report per attempt period of motion the hand has already finished.
-    periodMs = (1000U / reports) + kHidPaceMarginMs;
-    g_hidPaceFloorMs = periodMs;
-    g_hidPaceHoldMs  = nowMs;
-  } else if (g_hidPaceFloorMs == 0U) {
-    // Nothing refused, and no drain measured yet to park on: probe faster.
-    periodMs = (periodMs * kHidPaceProbePct) / 100U;
+    // A single bad second may be the host or a stalled queue, not the link; only park
+    // after two in a row. Then keep a margin so the queue empties and stays empty.
+    ++g_hidPaceRefusalRun;
+    if (g_hidPaceRefusalRun >= kHidPaceRefusalRunLimit) {
+      periodMs = (1000U / reports) + kHidPaceMarginMs;
+      g_hidPaceFloorMs = periodMs;
+      g_hidPaceHoldMs  = nowMs;
+    } else {
+      periodMs = (g_hidPaceFloorMs != 0U) ? g_hidPaceFloorMs : periodMs;
+    }
   } else {
-    // Nothing refused, so the link kept up with the period in force. Hold it, and ease
-    // the floor down now and then: a probe is the only way to find a link that got
-    // faster, and it costs one second of refusals when the guess was wrong.
-    if ((nowMs - g_hidPaceHoldMs) >= kHidPaceHoldMs) {
+    // Nothing refused: hold the floor, and ease it down now and then. Recover
+    // quickly when it is above the seed, but probe gently near the link's rate.
+    g_hidPaceRefusalRun = 0;
+    if (g_hidPaceFloorMs == 0U) {
+      g_hidPaceFloorMs = periodMs;  // no floor yet: adopt the period in force
+    }
+    const uint32_t holdMs = (g_hidPaceFloorMs > g_hidPaceSeedMs)
+                                ? kHidPaceFastHoldMs
+                                : kHidPaceHoldMs;
+    if ((nowMs - g_hidPaceHoldMs) >= holdMs) {
       if (g_hidPaceFloorMs > kHidReportFloorMs) {
         --g_hidPaceFloorMs;
       }
