@@ -32,7 +32,7 @@
 // Master switch for every print in this sketch. Off by default, so the pointer path
 // touches no serial port and the periodic line's link queries do not run. Set true to
 // bring the whole log back. Cost and reasoning: README, "Serial output".
-static const bool kSerialLogEnabled = false;
+static const bool kSerialLogEnabled = true;
 
 // Prints are routed through this rather than the port itself, so every call site still
 // reads Serial.print(...) and the compiler removes the lot when the switch is off.
@@ -226,6 +226,11 @@ static const uint32_t kHidPaceMarginMs = 2;     // added to the measured drain p
 static const uint32_t kHidPaceProbePct = 95;    // no drain measured yet: probe faster
 static const uint32_t kHidPaceHoldMs   = 5000;  // then re-probe this slowly
 static const uint32_t kHidPaceMinRate  = 8;     // below this reports/s, not a measurement
+
+// Diagnostic override: 0 = normal adaptation. Non-zero forces this attempt
+// period so the link ceiling can be measured without waiting for the pace
+// floor to settle.
+static const uint32_t kHidPaceForceMs = 0;
 
 // How long before the next connection event the report is handed to the radio.
 // Must clear the loop's own ~1 ms granularity plus the radio's 2.2 ms pre-roll;
@@ -1229,6 +1234,25 @@ static uint32_t hidAttemptPeriodMs() {
 // it. Polled rather than per pass: it reads the connection interval, and that query
 // is not free (see kLinkPollMs).
 static void hidMaintainPace(uint32_t nowMs) {
+  if (kHidPaceForceMs != 0U) {
+    // Bypass the adaptive floor. The actual hand-over period is still
+    // max(kHidPaceForceMs, g_hidReportPeriodMs), i.e. 8 ms at a 7.5 ms
+    // connection interval.
+    g_hidPacePeriodMs = kHidPaceForceMs;
+    return;
+  }
+  if (!hidLinkReady()) {
+    // Pairing and notify-enable are not link-rate samples. Restart the window
+    // when the link is ready so the first measurement reflects the ceiling,
+    // not the pairing transient (which would park the pace too slowly).
+    g_hidPaceIntervalUnits = 0;
+    g_hidPacePeriodMs      = 0;
+    g_hidPaceFloorMs       = 0;
+    g_hidPaceWindowMs      = nowMs;
+    g_hidPaceBase          = g_hidReportCount;
+    g_hidPaceAttemptBase   = g_hidAttemptCount;
+    return;
+  }
   if ((nowMs - g_hidPacePollMs) < kConnPollMs) {
     return;
   }

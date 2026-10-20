@@ -387,6 +387,16 @@ firmware constant: a core that keeps the encrypted followup turnaround, or a lin
 encrypted, need not pay it, and nothing in this sketch can tell which case it is looking at other than
 by measuring.
 
+**Tested: the encrypted same-event follow-up does not help this host.** A local patch to core 1.0.22
+(`tools/patch-nrf54l15-encrypted-ack.ps1`) armed it for fully encrypted ATT notifications. At forced
+8 ms pacing (`try= 96`) `tx_s=` still capped at 52/s, and the counters showed the follow-up armed but
+never receiving a packet (`fe= 0`, `fc= 0`, `fl= 0/0`, `fb= 800`): the PC does not transmit after the
+notification in the same event. The 2.5 events/report is the host's scheduling, not just the core's
+encrypted-link gate. The patch was reverted; the core is original again.
+
+The 36/s seen after a reconnect was the pace's first sample including pairing, not the patch; the
+pace now waits for an encrypted, notify-enabled link before measuring.
+
 Anything queued beyond the one packet in flight lands in the notification queue (depth 8,
 `kCustomGattNotificationQueueDepth`) and drains at that rate, one packet per turn. Eight reports at
 ~19 ms each is ~150 ms of motion the hand has already made, so a full queue is a cursor that keeps
