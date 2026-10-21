@@ -19,13 +19,15 @@ substitutions:
   # The bridge sends an HTTP POST with an empty body to that URL.
   # Add, remove or reorder lines; keep a comma after every line but the last.
   #
-  # Optional third value: true = do not answer with the bridge's HTTP result,
-  # for targets that post their own Telegram message (here: /status).
+  # Optional third value: a URL to GET after the POST. Its JSON "value" field
+  # is sent back to Telegram verbatim, so the target device decides the text
+  # (e.g. the door's /text_sensor/Message). Without it the bridge answers
+  # "OK: /command".
   command_map: |-
-    {"/open", "http://smart-door.local/button/Open/press"},
+    {"/open", "http://smart-door.local/button/Open/press", "http://smart-door.local/text_sensor/Message"},
     {"/close", "http://smart-door.local/button/Close/press"},
     {"/zero", "http://smart-door.local/button/Zero/press"},
-    {"/status", "http://smart-door.local/button/Status/press", true}
+    {"/status", "http://smart-door.local/button/Status/press", "http://smart-door.local/text_sensor/Message"}
 
   # Seconds between Telegram polls. 1s = snappy, 5s = lighter on the ESP32.
   poll_interval: 1s
@@ -131,8 +133,13 @@ globals:
     type: std::string
     restore_value: false
     initial_value: '""'
-  # True when the target device reports back itself (no bridge reply).
-  - id: pending_quiet
+  # URL of the text the target produced for the pending command ("" = none).
+  - id: pending_text_url
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  # The next message is relayed text and should be parsed as Markdown.
+  - id: pending_markdown
     type: bool
     restore_value: false
     initial_value: "false"
@@ -205,8 +212,8 @@ interval:
                         // Maps a Telegram command to the URL it triggers.
                         struct CommandMap {
                           const char *command;
-                          const char *url;
-                          bool quiet;  // true = the target answers by itself
+                          const char *url;       // POST target ("" = skip)
+                          const char *text_url;  // GET: relay its text ("" = none)
                         };
                         static const CommandMap COMMANDS[] = {
                           ${command_map}
@@ -343,8 +350,8 @@ interval:
                           if (cmd != entry.command)
                             continue;
                           id(pending_command) = cmd;
-                          id(pending_url) = entry.url;
-                          id(pending_quiet) = entry.quiet;
+                          id(pending_url) = entry.url != nullptr ? entry.url : "";
+                          id(pending_text_url) = entry.text_url != nullptr ? entry.text_url : "";
                           ESP_LOGI("telegram-bridge", "Queued %s -> %s", entry.command, entry.url);
                           return true;
                         }
@@ -372,7 +379,7 @@ interval:
       #    Waits for the command it started, so the toast shows the result.
       - if:
           condition:
-            lambda: 'return !id(http_busy) && !id(pending_answer_id).empty() && id(pending_url).empty();'
+            lambda: 'return !id(http_busy) && !id(pending_answer_id).empty() && id(pending_url).empty() && id(pending_text_url).empty();'
           then:
             - lambda: |-
                 id(http_busy) = true;
@@ -413,12 +420,14 @@ interval:
                   root["chat_id"] = id(pending_chat_id);
                   root["text"] = id(outgoing_text);
                   root["disable_notification"] = true;
+                  if (id(pending_markdown))
+                    root["parse_mode"] = "Markdown";
                   if (id(pending_help)) {
                     // /help: one inline button per mapped command, two per row.
                     struct CommandMap {
                       const char *command;
                       const char *url;
-                      bool quiet;
+                      const char *text_url;
                     };
                     static const CommandMap COMMANDS[] = {
                       ${command_map}
@@ -441,14 +450,16 @@ interval:
                         ESP_LOGW("telegram-bridge", "sendMessage failed: HTTP %d: %s",
                                  response->status_code, body.c_str());
                       id(pending_help) = false;
+                      id(pending_markdown) = false;
                       id(http_busy) = false;
                 on_error:
                   - lambda: |-
                       ESP_LOGW("telegram-bridge", "sendMessage request failed");
                       id(pending_help) = false;
+                      id(pending_markdown) = false;
                       id(http_busy) = false;
 
-      # 2) Forwarded command (if any)
+      # 2) Forwarded command: POST the action (if it has one)
       - if:
           condition:
             lambda: 'return !id(http_busy) && !id(pending_url).empty();'
@@ -464,15 +475,24 @@ interval:
                       std::string result = id(pending_command) + " -> HTTP " + std::to_string(response->status_code);
                       ESP_LOGI("telegram-bridge", "%s", result.c_str());
                       id(last_result).publish_state(result);
-                      // Button presses get the result as a toast, typed
-                      // commands get a short "OK: /open" chat message.
-                      if (!id(pending_answer_id).empty())
-                        id(pending_answer_text) = std::string(ok ? "OK: " : "FAILED: ") + id(pending_command);
-                      else if (${1 if send_replies else 0} && !id(pending_quiet))
-                        id(pending_reply) = std::string(ok ? "OK: " : "FAILED: ") + id(pending_command);
                       id(pending_url).clear();
-                      id(pending_command).clear();
-                      id(pending_quiet) = false;
+                      if (!ok) {
+                        // Action failed: nothing to fetch, report the failure.
+                        id(pending_text_url).clear();
+                        if (!id(pending_answer_id).empty())
+                          id(pending_answer_text) = "FAILED: " + id(pending_command);
+                        else if (${1 if send_replies else 0})
+                          id(pending_reply) = "FAILED: " + id(pending_command);
+                        id(pending_command).clear();
+                      } else if (id(pending_text_url).empty()) {
+                        // No text to fetch: plain confirmation.
+                        if (!id(pending_answer_id).empty())
+                          id(pending_answer_text) = "OK: " + id(pending_command);
+                        else if (${1 if send_replies else 0})
+                          id(pending_reply) = "OK: " + id(pending_command);
+                        id(pending_command).clear();
+                      }
+                      // Otherwise step 3 fetches the text next.
                       id(http_busy) = false;
                 on_error:
                   - lambda: |-
@@ -481,11 +501,69 @@ interval:
                       id(last_result).publish_state(result);
                       if (!id(pending_answer_id).empty())
                         id(pending_answer_text) = "FAILED: " + id(pending_command);
-                      else if (${1 if send_replies else 0} && !id(pending_quiet))
+                      else if (${1 if send_replies else 0})
                         id(pending_reply) = "FAILED: " + id(pending_command);
                       id(pending_url).clear();
+                      id(pending_text_url).clear();
                       id(pending_command).clear();
-                      id(pending_quiet) = false;
+                      id(http_busy) = false;
+
+      # 3) Fetch the text the target produced and relay it verbatim.
+      #    The target exposes it as a text sensor, e.g. the door's Message:
+      #    {"id":"message","state":"...","value":"Status: Door is ..."}
+      - if:
+          condition:
+            lambda: 'return !id(http_busy) && id(pending_url).empty() && !id(pending_text_url).empty();'
+          then:
+            - lambda: |-
+                id(http_busy) = true;
+                ESP_LOGI("telegram-bridge", "GET %s", id(pending_text_url).c_str());
+            - http_request.get:
+                url: !lambda "return id(pending_text_url);"
+                capture_response: true
+                max_response_buffer_size: 2kB
+                on_response:
+                  - lambda: |-
+                      std::string text;
+                      if (response->status_code == 200)
+                        json::parse_json(body, [&text](JsonObject root) -> bool {
+                          const char *value = root["value"] | (const char *) nullptr;
+                          if (value == nullptr)
+                            return false;
+                          text = value;
+                          return true;
+                        });
+                      id(pending_text_url).clear();
+                      if (!text.empty()) {
+                        // Whatever the target wrote, sent as-is (Markdown).
+                        ESP_LOGI("telegram-bridge", "Relaying %s text (%u bytes)",
+                                 id(pending_command).c_str(), (unsigned) text.size());
+                        id(last_result).publish_state(id(pending_command) + " -> text");
+                        id(pending_reply) = text;
+                        id(pending_markdown) = true;
+                        if (!id(pending_answer_id).empty())
+                          id(pending_answer_text) = "OK: " + id(pending_command);
+                      } else {
+                        ESP_LOGW("telegram-bridge", "%s -> no text (HTTP %d)",
+                                 id(pending_command).c_str(), response->status_code);
+                        id(last_result).publish_state(id(pending_command) + " -> no text");
+                        if (!id(pending_answer_id).empty())
+                          id(pending_answer_text) = "FAILED: " + id(pending_command);
+                        else if (${1 if send_replies else 0})
+                          id(pending_reply) = "FAILED: " + id(pending_command) + " (no text)";
+                      }
+                      id(pending_command).clear();
+                      id(http_busy) = false;
+                on_error:
+                  - lambda: |-
+                      ESP_LOGW("telegram-bridge", "%s -> text request failed", id(pending_command).c_str());
+                      id(last_result).publish_state(id(pending_command) + " -> text request failed");
+                      if (!id(pending_answer_id).empty())
+                        id(pending_answer_text) = "FAILED: " + id(pending_command);
+                      else if (${1 if send_replies else 0})
+                        id(pending_reply) = "FAILED: " + id(pending_command);
+                      id(pending_text_url).clear();
+                      id(pending_command).clear();
                       id(http_busy) = false;
 
 button:
