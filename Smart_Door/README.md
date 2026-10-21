@@ -9,28 +9,21 @@ Using ESPHome for low-code development of the Servo-controlled key rotator, and 
 3. Run `esphome run smart-door.yaml` to compile and upload the firmware to the ESP32.
 4. Access http://smart-door.local:80 to control.
 
-## Telegram
+## Text API (used by Telegram_Bridge)
 
-- `use_telegram` — send door status messages to Telegram.
-- `use_telegram_polling` — read `/open` and `/status` commands from Telegram on
-  this device.
+This device does **not** talk to Telegram: no bot token, no chat id, no
+`http_request` component. It only exposes text, and
+[`Telegram_Bridge`](../Telegram_Bridge) relays it.
 
-Polling Telegram on the door competes with the servo loop, so keep
-`use_telegram_polling: false` and let [`Telegram_Bridge`](../Telegram_Bridge)
-poll instead:
-
-```yaml
-substitutions:
-  use_telegram: true           # keep status messages
-  use_telegram_polling: false  # commands are polled by Telegram_Bridge
-```
-
-The **Status** button sends the current door state to Telegram and is also
-available over the REST API:
+The **Status** button formats the current state and publishes it to the
+`Message` text sensor, and the `Open` action publishes an "OPENING" message:
 
 ```
-POST http://smart-door.local/button/Status/press
+POST http://smart-door.local/button/Status/press   # fill Message
+POST http://smart-door.local/button/Open/press     # open door + fill Message
+GET  http://smart-door.local/text_sensor/Message   # {"id":"message","value":"..."}
 ```
 
-`Telegram_Bridge` calls exactly this endpoint for `/status`. It requires
-`use_telegram: true`; otherwise the button just logs a warning.
+The text is Telegram-Markdown (`*Status: ...*`), so the bridge sends it with
+`parse_mode: Markdown`. Anything that can do an HTTP GET can read it — the
+telemetry is not tied to Telegram.
