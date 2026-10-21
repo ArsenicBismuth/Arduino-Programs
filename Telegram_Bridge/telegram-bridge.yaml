@@ -167,7 +167,7 @@ interval:
                   - lambda: |-
                       id(http_busy) = false;
                       if (response->status_code != 200) {
-                        ESP_LOGW(TAG, "getUpdates failed: HTTP %d", response->status_code);
+                        ESP_LOGW("telegram-bridge", "getUpdates failed: HTTP %d", response->status_code);
                         return;
                       }
 
@@ -183,7 +183,7 @@ interval:
 
                         if (!(root["ok"] | false)) {
                           const char *description = root["description"] | "unknown error";
-                          ESP_LOGW(TAG, "getUpdates returned an error: %s", description);
+                          ESP_LOGW("telegram-bridge", "getUpdates returned an error: %s", description);
                           return true;
                         }
 
@@ -204,7 +204,7 @@ interval:
                           // are and drop whatever was waiting for us.
                           if (id(last_update_id) == 0) {
                             id(last_update_id) = (int) update_id;
-                            ESP_LOGI(TAG, "Primed at update_id %d (backlog ignored)", id(last_update_id));
+                            ESP_LOGI("telegram-bridge", "Primed at update_id %d (backlog ignored)", id(last_update_id));
                             return true;
                           }
                         }
@@ -221,7 +221,7 @@ interval:
                         // Only the configured chat may drive the door.
                         long long chat_id = message["chat"]["id"] | 0LL;
                         if (chat_id != (long long) ${telegram_chat | int}) {
-                          ESP_LOGW(TAG, "Ignoring message from chat %lld (not allowed)", chat_id);
+                          ESP_LOGW("telegram-bridge", "Ignoring message from chat %lld (not allowed)", chat_id);
                           return true;
                         }
 
@@ -230,7 +230,7 @@ interval:
                         auto now = id(time_now).now();
                         if (${max_command_age} > 0 && now.is_valid() && msg_date > 0 &&
                             now.timestamp - (time_t) msg_date > (time_t) ${max_command_age}) {
-                          ESP_LOGW(TAG, "Ignoring stale command (%ld s old)",
+                          ESP_LOGW("telegram-bridge", "Ignoring stale command (%ld s old)",
                                    (long) (now.timestamp - (time_t) msg_date));
                           return true;
                         }
@@ -252,7 +252,7 @@ interval:
                             c = (char) (c - 'A' + 'a');
 
                         id(last_command).publish_state(cmd);
-                        ESP_LOGI(TAG, "Telegram command: %s", cmd.c_str());
+                        ESP_LOGI("telegram-bridge", "Telegram command: %s", cmd.c_str());
 
                         if (cmd == "/help" || cmd == "/commands" || cmd == "/start") {
                           std::string help = "Available commands:";
@@ -267,22 +267,22 @@ interval:
                             continue;
                           id(pending_command) = cmd;
                           id(pending_url) = entry.url;
-                          ESP_LOGI(TAG, "Queued %s -> %s", entry.command, entry.url);
+                          ESP_LOGI("telegram-bridge", "Queued %s -> %s", entry.command, entry.url);
                           return true;
                         }
 
-                        ESP_LOGW(TAG, "Unknown command: %s", cmd.c_str());
+                        ESP_LOGW("telegram-bridge", "Unknown command: %s", cmd.c_str());
                         if (${1 if send_replies else 0})
                           id(pending_reply) = "Unknown command: " + cmd + " (send /help for the list)";
                         return true;
                       });
                       if (!parsed)
-                        ESP_LOGW(TAG, "getUpdates response was not valid JSON (%u bytes, truncated?)",
+                        ESP_LOGW("telegram-bridge", "getUpdates response was not valid JSON (%u bytes, truncated?)",
                                  (unsigned) body.size());
                 on_error:
                   - lambda: |-
                       id(http_busy) = false;
-                      ESP_LOGW(TAG, "getUpdates request failed (WiFi down?)");
+                      ESP_LOGW("telegram-bridge", "getUpdates request failed (WiFi down?)");
 
   # ── Send queued replies and forward queued commands ──────────────────────
   - interval: 250ms
@@ -305,11 +305,11 @@ interval:
                 on_response:
                   - lambda: |-
                       if (response->status_code != 200)
-                        ESP_LOGW(TAG, "sendMessage failed: HTTP %d", response->status_code);
+                        ESP_LOGW("telegram-bridge", "sendMessage failed: HTTP %d", response->status_code);
                       id(http_busy) = false;
                 on_error:
                   - lambda: |-
-                      ESP_LOGW(TAG, "sendMessage request failed");
+                      ESP_LOGW("telegram-bridge", "sendMessage request failed");
                       id(http_busy) = false;
 
       # 2) Forwarded command (if any)
@@ -319,14 +319,14 @@ interval:
           then:
             - lambda: |-
                 id(http_busy) = true;
-                ESP_LOGI(TAG, "POST %s", id(pending_url).c_str());
+                ESP_LOGI("telegram-bridge", "POST %s", id(pending_url).c_str());
             - http_request.post:
                 url: !lambda "return id(pending_url);"
                 on_response:
                   - lambda: |-
                       bool ok = response->status_code >= 200 && response->status_code < 300;
                       std::string result = id(pending_command) + " -> HTTP " + std::to_string(response->status_code);
-                      ESP_LOGI(TAG, "%s", result.c_str());
+                      ESP_LOGI("telegram-bridge", "%s", result.c_str());
                       id(last_result).publish_state(result);
                       if (${1 if send_replies else 0})
                         id(pending_reply) = std::string(ok ? "OK: " : "FAILED: ") + result;
@@ -336,7 +336,7 @@ interval:
                 on_error:
                   - lambda: |-
                       std::string result = id(pending_command) + " -> request failed";
-                      ESP_LOGW(TAG, "%s", result.c_str());
+                      ESP_LOGW("telegram-bridge", "%s", result.c_str());
                       id(last_result).publish_state(result);
                       if (${1 if send_replies else 0})
                         id(pending_reply) = result;
@@ -355,4 +355,4 @@ button:
       - lambda: |-
           id(last_update_id) = 0;
           id(primed) = false;
-          ESP_LOGI(TAG, "Offset reset, next poll re-primes");
+          ESP_LOGI("telegram-bridge", "Offset reset, next poll re-primes");
