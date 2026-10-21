@@ -4,10 +4,13 @@
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
+#include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 
+#include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
 namespace esphome {
@@ -15,9 +18,9 @@ namespace latest_snapshot {
 
 static const char *TAG = "latest_snapshot";
 
-// Chunk used to copy the file to the socket. Deliberately a small static buffer:
-// the handler must never allocate a whole-file buffer (see the header / README).
-static char STREAM_BUF[2048];
+// 1 KB, not 2: with ~4 KB free heap the largest block is often only ~1.5 KB, so a 2 KB
+// pbuf allocation fails and httpd_send_chunk() blocks until the socket timeout.
+static char STREAM_BUF[1024];
 
 // Files are streamed in small chunks; with Nagle enabled the client can wait an extra
 // round-trip between them. Turn it off for this response.
@@ -27,6 +30,14 @@ static void set_tcp_nodelay(httpd_req_t *req) {
   if (fd >= 0 && setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) < 0) {
     ESP_LOGW(TAG, "setsockopt(TCP_NODELAY) failed: %s", strerror(errno));
   }
+}
+
+// httpd keeps a session (and its socket buffers, ~10 KB of heap) after the response unless
+// it is told to close it; seven of those leave the heap too small to send the next chunk.
+static void close_session(httpd_req_t *req) {
+  int fd = httpd_req_to_sockfd(req);
+  if (fd >= 0 && req->handle != nullptr)
+    httpd_sess_trigger_close(req->handle, fd);
 }
 
 void LatestSnapshot::setup() { this->base_->add_handler(this); }
@@ -115,13 +126,27 @@ void LatestSnapshot::handleRequest(AsyncWebServerRequest *request) {
 
   size_t total = 0;
   size_t n;
+  uint32_t t = millis();
   while ((n = fread(STREAM_BUF, 1, sizeof(STREAM_BUF), fp)) > 0) {
-    if (httpd_resp_send_chunk(req, STREAM_BUF, n) != ESP_OK)
+    uint32_t rms = millis() - t;
+    if (rms > 250)
+      ESP_LOGW(TAG, "fread %u B took %u ms (at %u)", (unsigned) n, (unsigned) rms, (unsigned) total);
+    t = millis();
+    esp_err_t err = httpd_resp_send_chunk(req, STREAM_BUF, n);
+    uint32_t sms = millis() - t;
+    if (sms > 250)
+      ESP_LOGW(TAG, "send %u B took %u ms (at %u) heap %u min %u largest %u", (unsigned) n, (unsigned) sms,
+               (unsigned) total, (unsigned) esp_get_free_heap_size(), (unsigned) esp_get_minimum_free_heap_size(),
+               (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    t = millis();
+    if (err != ESP_OK)
       break;
     total += n;
   }
   fclose(fp);
-  httpd_resp_send_chunk(req, nullptr, 0);
+  if (httpd_resp_send_chunk(req, nullptr, 0) != ESP_OK)
+    ESP_LOGW(TAG, "terminator failed, heap %u", (unsigned) esp_get_free_heap_size());
+  close_session(req);
 
   ESP_LOGD(TAG, "Served %s (%u bytes)", path.c_str(), (unsigned) total);
 }

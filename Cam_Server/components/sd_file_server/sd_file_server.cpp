@@ -11,6 +11,7 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #endif
+#include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 #include "esphome/components/network/util.h"
 #include "esphome/core/helpers.h"
@@ -41,6 +42,18 @@ static void set_tcp_nodelay(httpd_req_t *req) {
 // connection once the body is read, so browsing files never holds a slot a later request needs
 // (a full server makes httpd evict the least recently used session, i.e. drop a live request).
 static void set_connection_close(httpd_req_t *req) { httpd_resp_set_hdr(req, "Connection", "close"); }
+
+// httpd keeps a session (and its socket buffers, ~10 KB of heap) after the response unless
+// it is told to close it; seven of those leave the heap too small to send the next chunk.
+static void close_session(httpd_req_t *req) {
+  int fd = httpd_req_to_sockfd(req);
+  if (fd >= 0 && req->handle != nullptr)
+    httpd_sess_trigger_close(req->handle, fd);
+}
+
+// 1 KB chunks: with ~4 KB free heap the largest block is often ~1.5 KB, and a 2 KB send
+// needs a ~2 KB allocation that fails -> httpd_send_chunk() blocks until its 5 s timeout.
+static char CHUNK_BUF[1024];
 #endif
 
 // Sends the index page in small pieces instead of accumulating the whole page in a
@@ -52,24 +65,49 @@ class ChunkWriter {
 #ifdef USE_ESP_IDF
   explicit ChunkWriter(httpd_req_t *req) : req_(req) {}
   bool write(const char *data, size_t len) {
-    // Once a chunk fails the connection is unusable, so make every later write a no-op
-    // instead of retrying it: a retry can block for the full socket send timeout (5 s), and
-    // one httpd task serves every client, so a dead peer would otherwise freeze the whole
-    // web server for as many chunks as the page still has.
     if (!this->ok_)
       return false;
-    this->ok_ = httpd_resp_send_chunk(this->req_, data, len) == ESP_OK;
-    return this->ok_;
+    while (len > 0) {
+      size_t room = sizeof(CHUNK_BUF) - this->used_;
+      size_t n = len < room ? len : room;
+      memcpy(CHUNK_BUF + this->used_, data, n);
+      this->used_ += n;
+      data += n;
+      len -= n;
+      if (this->used_ == sizeof(CHUNK_BUF) && !this->flush_())
+        return false;
+    }
+    return true;
   }
   bool finish() {
     if (!this->ok_)
       return false;
+    if (!this->flush_())
+      return false;
     this->ok_ = false;
-    return httpd_resp_send_chunk(this->req_, nullptr, 0) == ESP_OK;
+    bool ok = httpd_resp_send_chunk(this->req_, nullptr, 0) == ESP_OK;
+    close_session(this->req_);
+    return ok;
   }
 
  protected:
+  bool flush_() {
+    if (this->used_ == 0)
+      return true;
+    size_t len = this->used_;
+    this->used_ = 0;
+    uint32_t t = millis();
+    this->ok_ = httpd_resp_send_chunk(this->req_, CHUNK_BUF, len) == ESP_OK;
+    uint32_t ms = millis() - t;
+    if (ms > 250)
+      ESP_LOGW(TAG, "page send %u B took %u ms", (unsigned) len, (unsigned) ms);
+    if (!this->ok_)
+      close_session(this->req_);
+    return this->ok_;
+  }
+
   httpd_req_t *req_;
+  size_t used_{0};
   bool ok_{true};
 #else
   explicit ChunkWriter(AsyncResponseStream *response) : response_(response) {}
@@ -511,16 +549,29 @@ void SDFileServer::handle_download(AsyncWebServerRequest *request, std::string c
   set_connection_close(req);
   set_tcp_nodelay(req);
 
-  // 2 KB chunks keep the per-chunk framing and syscall overhead down while staying well
-  // within the heap budget.
-  static char buffer[2048];
+  // 1 KB chunks: a 2 KB send needs a ~2 KB pbuf allocation, which fails when the heap is
+  // down to a few KB (largest free block ~1.5 KB) and blocks for the socket send timeout.
+  static char buffer[1024];
   size_t read = 0;
+  size_t sent = 0;
+  uint32_t t = millis();
   while ((read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
-    if (httpd_resp_send_chunk(req, buffer, read) != ESP_OK)
+    uint32_t rms = millis() - t;
+    if (rms > 250)
+      ESP_LOGW(TAG, "fread %u B took %u ms (at %u)", (unsigned) read, (unsigned) rms, (unsigned) sent);
+    t = millis();
+    esp_err_t err = httpd_resp_send_chunk(req, buffer, read);
+    uint32_t sms = millis() - t;
+    if (sms > 250)
+      ESP_LOGW(TAG, "send %u B took %u ms (at %u)", (unsigned) read, (unsigned) sms, (unsigned) sent);
+    t = millis();
+    if (err != ESP_OK)
       break;
+    sent += read;
   }
   fclose(file);
   httpd_resp_send_chunk(req, nullptr, 0);
+  close_session(req);
 #else
   auto file = this->sd_mmc_card_->read_file(path);
   if (file.size() == 0) {
