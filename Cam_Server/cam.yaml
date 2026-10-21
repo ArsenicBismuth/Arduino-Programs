@@ -118,8 +118,8 @@ esp32_camera:
   id: my_camera
 
   # Boot-time orientation
-  vertical_flip: false
-  horizontal_mirror: false
+  vertical_flip: true
+  horizontal_mirror: true
 
   # Frame rates (see "Max FPS" / "Idle FPS" controls in [6]):
   #   max_framerate  - cap while the MJPEG stream is open (schema allows up to 60)

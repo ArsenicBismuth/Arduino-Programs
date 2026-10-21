@@ -205,6 +205,26 @@ stream open; `:8080` streams ~60-80 KB/s while a download runs; three concurrent
 all complete. Five concurrent 20 KB transfers still fail one or two (the heap cannot hold
 that many pbufs), but the server and the stream stay up instead of wedging.
 
+**Which fix matters most** (if one ever has to be backed out):
+
+1. **Session close** (`httpd_sess_trigger_close` after every response) - guarantees
+   recovery; a failed transfer costs one request instead of the whole server.
+2. **1 KB chunks** - makes the failed allocation rare: a 1 KB pbuf fits the fragmented heap,
+   2 KB often does not.
+3. **TCP buffers 5760 -> 2880** - what keeps three concurrent transfers working (and five
+   degrading gracefully).
+4. **`power_save_mode: none`** - separate axis (26% -> 0% packet loss); helps latency, but
+   would not have fixed the lock-up alone.
+
+**Why the two earlier closing attempts were incomplete:**
+
+- `Connection: close` is only a hint to the client; httpd keeps the session open regardless
+  (a raw socket saw no FIN even after a complete response).
+- `shutdown(fd, SHUT_RDWR)` breaks the connection but leaves httpd's session entry and its
+  buffers allocated until httpd times it out.
+- Only `httpd_sess_trigger_close()` queues the close on the httpd task, freeing the slot
+  immediately after the handler returns (on both the success and the failure path).
+
 ## Periodic snapshots + change gate (`cam_snapshot.h`)
 
 `cam.yaml` saves snapshots on a schedule and filters near-duplicates, using the helpers in
