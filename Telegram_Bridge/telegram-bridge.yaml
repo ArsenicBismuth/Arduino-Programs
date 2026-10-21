@@ -49,6 +49,16 @@ esp32:
   board: nodemcu-32s
   framework:
     type: esp-idf
+    advanced:
+      # Boot log reports this chip as rev 3.1, and min rev >= 3.0 drops the
+      # old-chip workarounds (~10 KB flash). The firmware then refuses to boot
+      # on an ESP32 older than 3.1 — keep this in sync with the actual board.
+      minimum_chip_revision: "3.1"
+      # +40 KB IRAM from SRAM1, handy for the WiFi/TLS stack. The boot log
+      # confirmed the installed bootloader supports it ("Bootloader supports
+      # SRAM1 as IRAM"). OTA cannot update an old bootloader; if the device
+      # ever fails to boot after enabling this, flash once over USB.
+      sram1_as_iram: true
 
 safe_mode:
   disabled: true
@@ -70,6 +80,7 @@ wifi:
   ssid: "Ab-Apart"
   password: !secret wifi_password
   fast_connect: true
+  power_save_mode: none
 
   ap:
     ssid: "Telegram-Bridge Fallback Hotspot"

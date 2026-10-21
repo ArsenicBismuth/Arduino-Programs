@@ -152,4 +152,14 @@ Mappings used by this bridge:
 | `send_replies` | `true` | Answer commands without a text URL with `OK: /command`. |
 | `request_timeout` | `8s` | Per-request timeout. |
 
+## Chip-specific build options
+
+`esp32 > framework > advanced` in the YAML carries two options the board's boot
+log asks for (this chip reports rev 3.1):
+
+| Option | Value | Effect |
+| --- | --- | --- |
+| `minimum_chip_revision` | `"3.1"` | Drops old-silicon workarounds (~2–10 KB flash). The firmware will then refuse to boot on a chip older than 3.1 — only copy this to other boards that report the same revision. |
+| `sram1_as_iram` | `true` | Adds 40 KB of IRAM (SRAM1) for the WiFi/TLS stack. Requires a bootloader from ESP-IDF 5.1+; the boot log says "Bootloader supports SRAM1 as IRAM" when it is safe. OTA cannot update an old bootloader — if the device stops booting after enabling this, flash once over USB. |
+
 Logs are available with `esphome logs telegram-bridge.yaml`.
