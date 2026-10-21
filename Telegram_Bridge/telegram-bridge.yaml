@@ -151,6 +151,11 @@ globals:
     type: bool
     restore_value: false
     initial_value: "false"
+  # Chat that sent the pending command; replies go back to it.
+  - id: pending_chat_id
+    type: long long
+    restore_value: false
+    initial_value: "0"
   # Telegram message waiting to be sent.
   - id: pending_reply
     type: std::string
@@ -247,30 +252,19 @@ interval:
                         if (message.isNull() && callback.isNull())
                           return true;  // edited_message, channel posts, ...
 
-                        const long long allowed_chat = (long long) ${telegram_chat | int};
-                        const char *raw_text = nullptr;
                         bool from_button = !callback.isNull();
+                        long long chat_id = 0;
+                        const char *raw_text = nullptr;
 
                         if (from_button) {
                           // The menu message may be old, so a button press is
                           // never treated as stale.
                           JsonVariant cb_message = callback["message"].as<JsonVariant>();
-                          long long chat_id = cb_message.isNull() ? (callback["from"]["id"] | 0LL)
-                                                                 : (cb_message["chat"]["id"] | 0LL);
-                          if (chat_id != allowed_chat) {
-                            ESP_LOGW("telegram-bridge", "Ignoring button press from chat %lld (not allowed)", chat_id);
-                            return true;
-                          }
+                          chat_id = cb_message.isNull() ? (callback["from"]["id"] | 0LL)
+                                                        : (cb_message["chat"]["id"] | 0LL);
                           raw_text = callback["data"] | (const char *) nullptr;
-                          // Must be answered, or the button keeps spinning.
-                          id(pending_answer_id) = callback["id"] | "";
                         } else {
-                          // Only the configured chat may drive the door.
-                          long long chat_id = message["chat"]["id"] | 0LL;
-                          if (chat_id != allowed_chat) {
-                            ESP_LOGW("telegram-bridge", "Ignoring message from chat %lld (not allowed)", chat_id);
-                            return true;
-                          }
+                          chat_id = message["chat"]["id"] | 0LL;
 
                           // Do not act on commands from an old backlog.
                           long long msg_date = message["date"] | 0LL;
@@ -283,6 +277,37 @@ interval:
                           }
 
                           raw_text = message["text"] | (const char *) nullptr;
+                        }
+
+                        // Only the chats in telegram_chat_id may drive the door.
+                        // That value is a comma-separated list ("111,222");
+                        // replies go back to the chat that sent the command.
+                        std::string allowed = "${telegram_chat}";
+                        std::string want = std::to_string(chat_id);
+                        bool chat_allowed = false;
+                        size_t pos = 0;
+                        while (true) {
+                          size_t comma = allowed.find(',', pos);
+                          size_t segment_end = comma == std::string::npos ? allowed.size() : comma;
+                          size_t begin = allowed.find_first_not_of(" \t\r\n", pos);
+                          if (begin != std::string::npos && begin < segment_end) {
+                            size_t last = allowed.find_last_not_of(" \t\r\n", segment_end - 1);
+                            if (last >= begin && allowed.compare(begin, last - begin + 1, want) == 0)
+                              chat_allowed = true;
+                          }
+                          if (chat_allowed || comma == std::string::npos)
+                            break;
+                          pos = comma + 1;
+                        }
+                        if (!chat_allowed) {
+                          ESP_LOGW("telegram-bridge", "Ignoring update from chat %lld (not allowed)", chat_id);
+                          return true;
+                        }
+                        id(pending_chat_id) = chat_id;
+
+                        if (from_button) {
+                          // Must be answered, or the button keeps spinning.
+                          id(pending_answer_id) = callback["id"] | "";
                         }
 
                         if (raw_text == nullptr)
@@ -385,7 +410,7 @@ interval:
                 request_headers:
                   Content-Type: application/json
                 json: |-
-                  root["chat_id"] = ${telegram_chat | int};
+                  root["chat_id"] = id(pending_chat_id);
                   root["text"] = id(outgoing_text);
                   root["disable_notification"] = true;
                   if (id(pending_help)) {

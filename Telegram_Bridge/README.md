@@ -32,7 +32,8 @@ Telegram  ──getUpdates──▶  telegram-bridge (ESP32)  ──POST──�
 
 Getting the `telegram_chat_id`: message the bot once, then run
 `python ../Smart_Door/macro/telegram.py --get-id` (uses the Smart_Door
-`secrets.yaml`).
+`secrets.yaml`). Use a comma-separated list to allow more than one chat:
+`telegram_chat_id: "123123123,456456789"`.
 
 ## The command map
 
@@ -89,9 +90,11 @@ Notes:
 - **One request at a time.** Polling, forwarded commands and replies are
   serialised through a single `http_busy` flag, so the bridge never opens
   overlapping TLS connections.
-- **Single chat only.** Messages from any chat other than `telegram_chat_id` are
-  ignored and logged. Do not remove this check — the bot would otherwise be an
-  open doorbell.
+- **Allowed chats only.** `telegram_chat_id` accepts one id or a
+  comma-separated list (`"123123123,456456789"`). Messages and button presses
+  from any other chat are ignored and logged. Replies and the `/help` menu go
+  back to the chat that sent the command. Do not remove this check — the bot
+  would otherwise be an open doorbell.
 - **No replay after reboot.** The last handled `update_id` is persisted, so a
   reboot continues where it left off.
 - **No replay after flashing.** On the first poll after a fresh flash the
@@ -122,17 +125,18 @@ Then add (or keep) mappings in this bridge:
 
 | Telegram | HTTP request | Notes |
 | --- | --- | --- |
-| `/open` | `http://smart-door.local/button/Open/press` | replies `OK: /open -> HTTP 200` |
-| `/close` | `http://smart-door.local/button/Close/press` | replies `OK: /close -> HTTP 200` |
-| `/zero` | `http://smart-door.local/button/Zero/press` | replies `OK: /zero -> HTTP 200` |
+| `/open` | `http://smart-door.local/button/Open/press` | replies `OK: /open` |
+| `/close` | `http://smart-door.local/button/Close/press` | replies `OK: /close` |
+| `/zero` | `http://smart-door.local/button/Zero/press` | replies `OK: /zero` |
 | `/status` | `http://smart-door.local/button/Status/press` | quiet: the door sends the status message itself |
 
 `/status` works because `send_status_message` in Smart_Door is exposed as a
 normal button named **Status**, so the API endpoint is
 `POST http://smart-door.local/button/Status/press`. Pressing it sends the
-formatted `Status: Door is OPEN/CLOSED ...` message to `telegram_chat_id`.
-This needs `use_telegram: true` on the door; with it `false`, the button only
-logs a warning.
+formatted `Status: Door is OPEN/CLOSED ...` message to the chat configured in
+**`Smart_Door/secrets.yaml`** (a single id — the door does not read the
+bridge's list). This needs `use_telegram: true` on the door; with it `false`,
+the button only logs a warning.
 
 ## Tuning
 
