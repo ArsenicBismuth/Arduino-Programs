@@ -24,3 +24,13 @@ substitutions:
   use_telegram: true           # keep status messages
   use_telegram_polling: false  # commands are polled by Telegram_Bridge
 ```
+
+The **Status** button sends the current door state to Telegram and is also
+available over the REST API:
+
+```
+POST http://smart-door.local/button/Status/press
+```
+
+`Telegram_Bridge` calls exactly this endpoint for `/status`. It requires
+`use_telegram: true`; otherwise the button just logs a warning.

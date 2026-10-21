@@ -43,13 +43,19 @@ All mappings live in `substitutions.command_map` at the top of
 command_map: |-
   {"/open", "http://smart-door.local/button/Open/press"},
   {"/close", "http://smart-door.local/button/Close/press"},
-  {"/zero", "http://smart-door.local/button/Zero/press"}
+  {"/zero", "http://smart-door.local/button/Zero/press"},
+  {"/status", "http://smart-door.local/button/Status/press", true}
 ```
 
 Each entry is `{"/command", "http://host/path"}`. Every command is forwarded as
 an **HTTP POST with an empty body**, so any ESPHome REST endpoint works
 (`/button/<name>/press`, `/switch/<name>/turn_on`, `/select/<name>/set?option=...`
 needs a body, so use a script endpoint or a query string instead).
+
+The optional third value `true` marks a **quiet** command: the bridge still calls
+the URL and updates *Last Result*, but sends no `OK: ...` / `FAILED: ...` reply.
+Use it when the target posts its own Telegram message — `/status` makes the door
+send a formatted status message, so a second "OK" line would just be noise.
 
 Adding an action is one line — no other changes needed:
 
@@ -58,13 +64,14 @@ command_map: |-
   {"/open", "http://smart-door.local/button/Open/press"},
   {"/close", "http://smart-door.local/button/Close/press"},
   {"/zero", "http://smart-door.local/button/Zero/press"},
+  {"/status", "http://smart-door.local/button/Status/press", true},
   {"/lights", "http://192.168.1.50/button/Desk_Lights/press"}
 ```
 
 Notes:
 
 - Command names are matched case-insensitively. `/open@MyBot` (group chat form)
-  works too.
+  works too, and arguments are ignored (`/status now` → `/status`).
 - `/help` (also `/commands`, `/start`) replies with the list of mapped commands
   and does not call anything.
 - Entity names in the URL are **case sensitive** and use the ESPHome entity
@@ -89,7 +96,8 @@ Notes:
   fire hours later. Set it to `0` to accept any age.
 - **Optional result replies.** With `send_replies: true` you get
   `OK: /open -> HTTP 200` back in Telegram. Set it to `false` to halve the
-  number of requests.
+  number of requests. Commands marked quiet (third map value `true`) never get
+  this confirmation.
 
 ## Smart Door side
 
@@ -104,16 +112,19 @@ substitutions:
 
 Then add (or keep) mappings in this bridge:
 
-| Telegram | HTTP request |
-| --- | --- |
-| `/open` | `http://smart-door.local/button/Open/press` |
-| `/close` | `http://smart-door.local/button/Close/press` |
-| `/zero` | `http://smart-door.local/button/Zero/press` |
+| Telegram | HTTP request | Notes |
+| --- | --- | --- |
+| `/open` | `http://smart-door.local/button/Open/press` | replies `OK: /open -> HTTP 200` |
+| `/close` | `http://smart-door.local/button/Close/press` | replies `OK: /close -> HTTP 200` |
+| `/zero` | `http://smart-door.local/button/Zero/press` | replies `OK: /zero -> HTTP 200` |
+| `/status` | `http://smart-door.local/button/Status/press` | quiet: the door sends the status message itself |
 
-`/status` is not mapped because `send_status_message` is `internal: true` in
-Smart_Door and therefore not reachable over HTTP. To get it, remove
-`internal: true`, give it a `name:` (e.g. `Status`) and add
-`{"/status", "http://smart-door.local/button/Status/press"}`.
+`/status` works because `send_status_message` in Smart_Door is exposed as a
+normal button named **Status**, so the API endpoint is
+`POST http://smart-door.local/button/Status/press`. Pressing it sends the
+formatted `Status: Door is OPEN/CLOSED ...` message to `telegram_chat_id`.
+This needs `use_telegram: true` on the door; with it `false`, the button only
+logs a warning.
 
 ## Tuning
 

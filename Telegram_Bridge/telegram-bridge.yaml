@@ -18,10 +18,14 @@ substitutions:
   # One entry per line:  {"/command", "http://host/path"},
   # The bridge sends an HTTP POST with an empty body to that URL.
   # Add, remove or reorder lines; keep a comma after every line but the last.
+  #
+  # Optional third value: true = do not answer with the bridge's HTTP result,
+  # for targets that post their own Telegram message (here: /status).
   command_map: |-
     {"/open", "http://smart-door.local/button/Open/press"},
     {"/close", "http://smart-door.local/button/Close/press"},
-    {"/zero", "http://smart-door.local/button/Zero/press"}
+    {"/zero", "http://smart-door.local/button/Zero/press"},
+    {"/status", "http://smart-door.local/button/Status/press", true}
 
   # Seconds between Telegram polls. 1s = snappy, 5s = lighter on the ESP32.
   poll_interval: 1s
@@ -127,6 +131,11 @@ globals:
     type: std::string
     restore_value: false
     initial_value: '""'
+  # True when the target device reports back itself (no bridge reply).
+  - id: pending_quiet
+    type: bool
+    restore_value: false
+    initial_value: "false"
   # Telegram message waiting to be sent.
   - id: pending_reply
     type: std::string
@@ -176,6 +185,7 @@ interval:
                         struct CommandMap {
                           const char *command;
                           const char *url;
+                          bool quiet;  // true = the target answers by itself
                         };
                         static const CommandMap COMMANDS[] = {
                           ${command_map}
@@ -272,6 +282,7 @@ interval:
                             continue;
                           id(pending_command) = cmd;
                           id(pending_url) = entry.url;
+                          id(pending_quiet) = entry.quiet;
                           ESP_LOGI("telegram-bridge", "Queued %s -> %s", entry.command, entry.url);
                           return true;
                         }
@@ -339,20 +350,22 @@ interval:
                       std::string result = id(pending_command) + " -> HTTP " + std::to_string(response->status_code);
                       ESP_LOGI("telegram-bridge", "%s", result.c_str());
                       id(last_result).publish_state(result);
-                      if (${1 if send_replies else 0})
+                      if (${1 if send_replies else 0} && !id(pending_quiet))
                         id(pending_reply) = std::string(ok ? "OK: " : "FAILED: ") + result;
                       id(pending_url).clear();
                       id(pending_command).clear();
+                      id(pending_quiet) = false;
                       id(http_busy) = false;
                 on_error:
                   - lambda: |-
                       std::string result = id(pending_command) + " -> request failed";
                       ESP_LOGW("telegram-bridge", "%s", result.c_str());
                       id(last_result).publish_state(result);
-                      if (${1 if send_replies else 0})
+                      if (${1 if send_replies else 0} && !id(pending_quiet))
                         id(pending_reply) = result;
                       id(pending_url).clear();
                       id(pending_command).clear();
+                      id(pending_quiet) = false;
                       id(http_busy) = false;
 
 button:

@@ -335,10 +335,15 @@ button:
         - number.set:
             id: servo_number
             value: 0
-  # Hidden button to trigger status message (called from interval)
+  # Sends the current door status to Telegram.
+  # Exposed on the REST API as: POST http://smart-door.local/button/Status/press
+  # (used by Telegram_Bridge for /status)
   - platform: template
+    name: Status
     id: send_status_message
-    internal: true
+    icon: "mdi:information-outline"
+    web_server:
+      sorting_group_id: sorting_group_door_actions
     on_press:
       then:
         - if:
@@ -369,6 +374,8 @@ button:
                     root["chat_id"] = ${telegram_chat};
                     root["text"] = message;
                     root["parse_mode"] = "Markdown";
+            else:
+              - logger.log: "Status requested over API, but use_telegram is false"
   - platform: template
     id: send_opening_message
     internal: true
