@@ -136,6 +136,21 @@ globals:
     type: bool
     restore_value: false
     initial_value: "false"
+  # Inline-keyboard press waiting for its answerCallbackQuery. Telegram keeps
+  # showing a spinner on the button until this is answered.
+  - id: pending_answer_id
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: pending_answer_text
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  # The message being sent is the /help menu, so attach the inline keyboard.
+  - id: pending_help
+    type: bool
+    restore_value: false
+    initial_value: "false"
   # Telegram message waiting to be sent.
   - id: pending_reply
     type: std::string
@@ -155,7 +170,8 @@ interval:
             lambda: |-
               // Never poll while a request is running or a command/reply is
               // still queued, so requests stay strictly sequential.
-              return !id(http_busy) && id(pending_url).empty() && id(pending_reply).empty();
+              return !id(http_busy) && id(pending_url).empty() &&
+                     id(pending_reply).empty() && id(pending_answer_id).empty();
           then:
             - lambda: |-
                 id(http_busy) = true;
@@ -167,7 +183,7 @@ interval:
                   int offset = id(last_update_id) > 0 ? id(last_update_id) + 1 : -1;
                   snprintf(url, sizeof(url),
                            "https://api.telegram.org/bot${telegram_token}/getUpdates"
-                           "?offset=%d&limit=1&timeout=0&allowed_updates=%%5B%%22message%%22%%5D",
+                           "?offset=%d&limit=1&timeout=0&allowed_updates=%%5B%%22message%%22%%2C%%22callback_query%%22%%5D",
                            offset);
                   return std::string(url);
                 capture_response: true
@@ -224,28 +240,51 @@ interval:
                           return true;
                         id(last_update_id) = (int) update_id;
 
+                        // A typed message, or a press on a button of the /help
+                        // inline keyboard (which arrives as callback_query).
                         JsonVariant message = update["message"].as<JsonVariant>();
-                        if (message.isNull())
+                        JsonVariant callback = update["callback_query"].as<JsonVariant>();
+                        if (message.isNull() && callback.isNull())
                           return true;  // edited_message, channel posts, ...
 
-                        // Only the configured chat may drive the door.
-                        long long chat_id = message["chat"]["id"] | 0LL;
-                        if (chat_id != (long long) ${telegram_chat | int}) {
-                          ESP_LOGW("telegram-bridge", "Ignoring message from chat %lld (not allowed)", chat_id);
-                          return true;
+                        const long long allowed_chat = (long long) ${telegram_chat | int};
+                        const char *raw_text = nullptr;
+                        bool from_button = !callback.isNull();
+
+                        if (from_button) {
+                          // The menu message may be old, so a button press is
+                          // never treated as stale.
+                          JsonVariant cb_message = callback["message"].as<JsonVariant>();
+                          long long chat_id = cb_message.isNull() ? (callback["from"]["id"] | 0LL)
+                                                                 : (cb_message["chat"]["id"] | 0LL);
+                          if (chat_id != allowed_chat) {
+                            ESP_LOGW("telegram-bridge", "Ignoring button press from chat %lld (not allowed)", chat_id);
+                            return true;
+                          }
+                          raw_text = callback["data"] | (const char *) nullptr;
+                          // Must be answered, or the button keeps spinning.
+                          id(pending_answer_id) = callback["id"] | "";
+                        } else {
+                          // Only the configured chat may drive the door.
+                          long long chat_id = message["chat"]["id"] | 0LL;
+                          if (chat_id != allowed_chat) {
+                            ESP_LOGW("telegram-bridge", "Ignoring message from chat %lld (not allowed)", chat_id);
+                            return true;
+                          }
+
+                          // Do not act on commands from an old backlog.
+                          long long msg_date = message["date"] | 0LL;
+                          auto now = id(time_now).now();
+                          if (${max_command_age} > 0 && now.is_valid() && msg_date > 0 &&
+                              now.timestamp - (time_t) msg_date > (time_t) ${max_command_age}) {
+                            ESP_LOGW("telegram-bridge", "Ignoring stale command (%ld s old)",
+                                     (long) (now.timestamp - (time_t) msg_date));
+                            return true;
+                          }
+
+                          raw_text = message["text"] | (const char *) nullptr;
                         }
 
-                        // Do not act on commands from an old backlog.
-                        long long msg_date = message["date"] | 0LL;
-                        auto now = id(time_now).now();
-                        if (${max_command_age} > 0 && now.is_valid() && msg_date > 0 &&
-                            now.timestamp - (time_t) msg_date > (time_t) ${max_command_age}) {
-                          ESP_LOGW("telegram-bridge", "Ignoring stale command (%ld s old)",
-                                   (long) (now.timestamp - (time_t) msg_date));
-                          return true;
-                        }
-
-                        const char *raw_text = message["text"] | (const char *) nullptr;
                         if (raw_text == nullptr)
                           return true;  // photos, stickers, ...
 
@@ -270,10 +309,8 @@ interval:
                         ESP_LOGI("telegram-bridge", "Telegram command: %s", cmd.c_str());
 
                         if (cmd == "/help" || cmd == "/commands" || cmd == "/start") {
-                          std::string help = "Available commands:";
-                          for (const auto &entry : COMMANDS)
-                            help += std::string(" ") + entry.command;
-                          id(pending_reply) = help;
+                          id(pending_help) = true;
+                          id(pending_reply) = "Tap a command:";
                           return true;
                         }
 
@@ -288,7 +325,9 @@ interval:
                         }
 
                         ESP_LOGW("telegram-bridge", "Unknown command: %s", cmd.c_str());
-                        if (${1 if send_replies else 0})
+                        if (from_button)
+                          id(pending_answer_text) = "Unknown: " + cmd;
+                        else if (${1 if send_replies else 0})
                           id(pending_reply) = "Unknown command: " + cmd + " (send /help for the list)";
                         return true;
                       });
@@ -303,6 +342,34 @@ interval:
   # ── Send queued replies and forward queued commands ──────────────────────
   - interval: 250ms
     then:
+      # 0) Acknowledge a button press. Telegram requires an
+      #    answerCallbackQuery or the button keeps its progress spinner.
+      #    Waits for the command it started, so the toast shows the result.
+      - if:
+          condition:
+            lambda: 'return !id(http_busy) && !id(pending_answer_id).empty() && id(pending_url).empty();'
+          then:
+            - lambda: |-
+                id(http_busy) = true;
+            - http_request.post:
+                url: "https://api.telegram.org/bot${telegram_token}/answerCallbackQuery"
+                request_headers:
+                  Content-Type: application/json
+                json: |-
+                  root["callback_query_id"] = id(pending_answer_id);
+                  if (!id(pending_answer_text).empty())
+                    root["text"] = id(pending_answer_text);
+                on_response:
+                  - lambda: |-
+                      id(pending_answer_id).clear();
+                      id(pending_answer_text).clear();
+                      id(http_busy) = false;
+                on_error:
+                  - lambda: |-
+                      id(pending_answer_id).clear();
+                      id(pending_answer_text).clear();
+                      id(http_busy) = false;
+
       # 1) Telegram reply (if any)
       - if:
           condition:
@@ -321,6 +388,26 @@ interval:
                   root["chat_id"] = ${telegram_chat | int};
                   root["text"] = id(outgoing_text);
                   root["disable_notification"] = true;
+                  if (id(pending_help)) {
+                    // /help: one inline button per mapped command, two per row.
+                    struct CommandMap {
+                      const char *command;
+                      const char *url;
+                      bool quiet;
+                    };
+                    static const CommandMap COMMANDS[] = {
+                      ${command_map}
+                    };
+                    JsonArray rows = root["reply_markup"]["inline_keyboard"].to<JsonArray>();
+                    JsonArray row;
+                    for (size_t i = 0; i < sizeof(COMMANDS) / sizeof(COMMANDS[0]); i++) {
+                      if (i % 2 == 0)
+                        row = rows.add<JsonArray>();
+                      JsonObject button = row.add<JsonObject>();
+                      button["text"] = COMMANDS[i].command;
+                      button["callback_data"] = COMMANDS[i].command;
+                    }
+                  }
                 capture_response: true
                 max_response_buffer_size: 2kB
                 on_response:
@@ -328,10 +415,12 @@ interval:
                       if (response->status_code != 200)
                         ESP_LOGW("telegram-bridge", "sendMessage failed: HTTP %d: %s",
                                  response->status_code, body.c_str());
+                      id(pending_help) = false;
                       id(http_busy) = false;
                 on_error:
                   - lambda: |-
                       ESP_LOGW("telegram-bridge", "sendMessage request failed");
+                      id(pending_help) = false;
                       id(http_busy) = false;
 
       # 2) Forwarded command (if any)
@@ -350,8 +439,12 @@ interval:
                       std::string result = id(pending_command) + " -> HTTP " + std::to_string(response->status_code);
                       ESP_LOGI("telegram-bridge", "%s", result.c_str());
                       id(last_result).publish_state(result);
-                      if (${1 if send_replies else 0} && !id(pending_quiet))
-                        id(pending_reply) = std::string(ok ? "OK: " : "FAILED: ") + result;
+                      // Button presses get the result as a toast, typed
+                      // commands get a short "OK: /open" chat message.
+                      if (!id(pending_answer_id).empty())
+                        id(pending_answer_text) = std::string(ok ? "OK: " : "FAILED: ") + id(pending_command);
+                      else if (${1 if send_replies else 0} && !id(pending_quiet))
+                        id(pending_reply) = std::string(ok ? "OK: " : "FAILED: ") + id(pending_command);
                       id(pending_url).clear();
                       id(pending_command).clear();
                       id(pending_quiet) = false;
@@ -361,8 +454,10 @@ interval:
                       std::string result = id(pending_command) + " -> request failed";
                       ESP_LOGW("telegram-bridge", "%s", result.c_str());
                       id(last_result).publish_state(result);
-                      if (${1 if send_replies else 0} && !id(pending_quiet))
-                        id(pending_reply) = result;
+                      if (!id(pending_answer_id).empty())
+                        id(pending_answer_text) = "FAILED: " + id(pending_command);
+                      else if (${1 if send_replies else 0} && !id(pending_quiet))
+                        id(pending_reply) = "FAILED: " + id(pending_command);
                       id(pending_url).clear();
                       id(pending_command).clear();
                       id(pending_quiet) = false;

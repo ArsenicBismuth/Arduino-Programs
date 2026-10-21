@@ -53,9 +53,10 @@ an **HTTP POST with an empty body**, so any ESPHome REST endpoint works
 needs a body, so use a script endpoint or a query string instead).
 
 The optional third value `true` marks a **quiet** command: the bridge still calls
-the URL and updates *Last Result*, but sends no `OK: ...` / `FAILED: ...` reply.
-Use it when the target posts its own Telegram message — `/status` makes the door
-send a formatted status message, so a second "OK" line would just be noise.
+the URL and updates *Last Result*, but sends no `OK: /status` chat message. Use
+it when the target posts its own Telegram message — `/status` makes the door
+send a formatted status message, so a second "OK" line would just be noise. The
+button toast in `/help` is still shown.
 
 Adding an action is one line — no other changes needed:
 
@@ -72,8 +73,12 @@ Notes:
 
 - Command names are matched case-insensitively. `/open@MyBot` (group chat form)
   works too, and arguments are ignored (`/status now` → `/status`).
-- `/help` (also `/commands`, `/start`) replies with the list of mapped commands
-  and does not call anything.
+- `/help` (also `/commands`, `/start`) replies with an **inline keyboard**: one
+  button per mapped command, two per row. Tapping a button runs that command;
+  the result appears as a short toast on the button (`OK: /open`), so no extra
+  chat message is added. The buttons always reflect `command_map`.
+- A typed command gets a short chat reply, `OK: /open` or `FAILED: /open`. The
+  HTTP status code stays in the *Last Result* sensor and in the logs.
 - Entity names in the URL are **case sensitive** and use the ESPHome entity
   `name:`, e.g. `name: Open` → `/button/Open/press`.
 - `.local` names are resolved over mDNS. If a target does not answer, use its
@@ -93,11 +98,14 @@ Notes:
   current cursor is stored and the backlog is dropped.
 - **Stale commands are dropped.** Anything older than `max_command_age`
   seconds (default 120) is ignored, so a `/open` sent before an outage cannot
-  fire hours later. Set it to `0` to accept any age.
-- **Optional result replies.** With `send_replies: true` you get
-  `OK: /open -> HTTP 200` back in Telegram. Set it to `false` to halve the
-  number of requests. Commands marked quiet (third map value `true`) never get
-  this confirmation.
+  fire hours later. Set it to `0` to accept any age. Button presses are exempt:
+  the `/help` menu may legitimately be used much later.
+- **Optional result replies.** With `send_replies: true` a typed command answers
+  with `OK: /open` (or `FAILED: /open`). Set it to `false` to halve the number
+  of requests. Commands marked quiet never send this message.
+- **Buttons always get feedback.** Telegram requires an `answerCallbackQuery`
+  for every inline button press; that call doubles as the toast showing
+  `OK: /status` / `FAILED: /open` without adding a chat message.
 
 ## Smart Door side
 
