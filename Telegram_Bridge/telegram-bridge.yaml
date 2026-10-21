@@ -1,0 +1,358 @@
+# Telegram Bridge
+#
+# Polls a Telegram bot for messages and forwards each known command to a plain
+# HTTP request. This keeps the Telegram/TLS polling work off devices that have
+# better things to do with their CPU, like the smart-door ESP32.
+#
+#   Telegram  --getUpdates-->  telegram-bridge  --POST-->  http://target/...
+#
+# Commands are matched against the `command_map` below, so adding a new action
+# is a one-line change. See README.md for details.
+
+substitutions:
+  # ── Telegram bot credentials (see secrets.example.yaml) ──────────────────
+  telegram_token: !secret telegram_bot_token
+  telegram_chat: !secret telegram_chat_id
+
+  # ── Command → HTTP request map ───────────────────────────────────────────
+  # One entry per line:  {"/command", "http://host/path"},
+  # The bridge sends an HTTP POST with an empty body to that URL.
+  # Add, remove or reorder lines; keep a comma after every line but the last.
+  command_map: |-
+    {"/open", "http://smart-door.local/button/Open/press"},
+    {"/close", "http://smart-door.local/button/Close/press"},
+    {"/zero", "http://smart-door.local/button/Zero/press"}
+
+  # Seconds between Telegram polls. 1s = snappy, 5s = lighter on the ESP32.
+  poll_interval: 1s
+
+  # Ignore commands older than this many seconds (0 = accept any age).
+  # Stops a backlog of old /open messages from firing after a long outage.
+  max_command_age: 120
+
+  # Answer every command in Telegram with the HTTP result.
+  send_replies: true
+
+  # Timeout for each HTTP request (Telegram and the target device).
+  request_timeout: 8s
+
+esphome:
+  name: telegram-bridge
+
+esp32:
+  board: nodemcu-32s
+  framework:
+    type: esp-idf
+
+safe_mode:
+  disabled: true
+
+logger:
+  level: INFO
+  logs:
+    # The http_request component is very chatty at INFO level
+    http_request.idf: WARN
+
+api:
+  # Never reboot just because Home Assistant is not connected
+  reboot_timeout: 0s
+
+ota:
+  platform: esphome
+
+wifi:
+  ssid: "Ab-Apart"
+  password: !secret wifi_password
+  fast_connect: true
+
+  ap:
+    ssid: "Telegram-Bridge Fallback Hotspot"
+    password: !secret ap_password
+
+captive_portal:
+
+http_request:
+  timeout: ${request_timeout}
+
+time:
+  - platform: sntp
+    id: time_now
+    timezone: Europe/Berlin
+
+debug:
+  update_interval: 60s
+
+sensor:
+  - platform: debug
+    free:
+      name: "Heap Free"
+      unit_of_measurement: "B"
+      icon: "mdi:memory"
+
+text_sensor:
+  # Handy for checking that messages are actually reaching the device.
+  - platform: template
+    id: last_command
+    name: "Last Command"
+    icon: "mdi:telegram"
+  - platform: template
+    id: last_result
+    name: "Last Result"
+    icon: "mdi:http"
+
+globals:
+  # Last Telegram update_id we have handled. Persisted so a reboot does not
+  # replay old commands.
+  - id: last_update_id
+    type: int
+    restore_value: true
+    initial_value: "0"
+  # False until the first successful poll, used to skip the backlog after a
+  # fresh flash.
+  - id: primed
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # One HTTP request at a time, shared by polling, commands and replies.
+  - id: http_busy
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # Command waiting to be forwarded (set by the poll, sent by the executor).
+  - id: pending_url
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: pending_command
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  # Telegram message waiting to be sent.
+  - id: pending_reply
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: outgoing_text
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+interval:
+  # ── Poll Telegram ────────────────────────────────────────────────────────
+  - interval: ${poll_interval}
+    then:
+      - if:
+          condition:
+            lambda: |-
+              // Never poll while a request is running or a command/reply is
+              // still queued, so requests stay strictly sequential.
+              return !id(http_busy) && id(pending_url).empty() && id(pending_reply).empty();
+          then:
+            - lambda: |-
+                id(http_busy) = true;
+            - http_request.get:
+                # offset = last handled + 1. Before the first successful poll,
+                # -1 asks Telegram for the newest update only.
+                url: !lambda |-
+                  char url[384];
+                  int offset = id(last_update_id) > 0 ? id(last_update_id) + 1 : -1;
+                  snprintf(url, sizeof(url),
+                           "https://api.telegram.org/bot${telegram_token}/getUpdates"
+                           "?offset=%d&limit=1&timeout=0&allowed_updates=%%5B%%22message%%22%%5D",
+                           offset);
+                  return std::string(url);
+                capture_response: true
+                max_response_buffer_size: 4kB
+                on_response:
+                  - lambda: |-
+                      id(http_busy) = false;
+                      if (response->status_code != 200) {
+                        ESP_LOGW(TAG, "getUpdates failed: HTTP %d", response->status_code);
+                        return;
+                      }
+
+                      bool parsed = json::parse_json(body, [](JsonObject root) -> bool {
+                        // Maps a Telegram command to the URL it triggers.
+                        struct CommandMap {
+                          const char *command;
+                          const char *url;
+                        };
+                        static const CommandMap COMMANDS[] = {
+                          ${command_map}
+                        };
+
+                        if (!(root["ok"] | false)) {
+                          const char *description = root["description"] | "unknown error";
+                          ESP_LOGW(TAG, "getUpdates returned an error: %s", description);
+                          return true;
+                        }
+
+                        JsonArray result = root["result"].as<JsonArray>();
+                        if (result.isNull() || result.size() == 0) {
+                          id(primed) = true;  // first poll worked, nothing to replay
+                          return true;
+                        }
+
+                        JsonVariant update = result[0].as<JsonVariant>();
+                        long long update_id = update["update_id"] | 0LL;
+                        if (update_id <= 0)
+                          return true;
+
+                        if (!id(primed)) {
+                          id(primed) = true;
+                          // Fresh flash (no saved offset): remember where we
+                          // are and drop whatever was waiting for us.
+                          if (id(last_update_id) == 0) {
+                            id(last_update_id) = (int) update_id;
+                            ESP_LOGI(TAG, "Primed at update_id %d (backlog ignored)", id(last_update_id));
+                            return true;
+                          }
+                        }
+
+                        // Already handled (or older than what we handled).
+                        if (update_id <= (long long) id(last_update_id))
+                          return true;
+                        id(last_update_id) = (int) update_id;
+
+                        JsonVariant message = update["message"].as<JsonVariant>();
+                        if (message.isNull())
+                          return true;  // edited_message, channel posts, ...
+
+                        // Only the configured chat may drive the door.
+                        long long chat_id = message["chat"]["id"] | 0LL;
+                        if (chat_id != (long long) ${telegram_chat | int}) {
+                          ESP_LOGW(TAG, "Ignoring message from chat %lld (not allowed)", chat_id);
+                          return true;
+                        }
+
+                        // Do not act on commands from an old backlog.
+                        long long msg_date = message["date"] | 0LL;
+                        auto now = id(time_now).now();
+                        if (${max_command_age} > 0 && now.is_valid() && msg_date > 0 &&
+                            now.timestamp - (time_t) msg_date > (time_t) ${max_command_age}) {
+                          ESP_LOGW(TAG, "Ignoring stale command (%ld s old)",
+                                   (long) (now.timestamp - (time_t) msg_date));
+                          return true;
+                        }
+
+                        const char *raw_text = message["text"] | (const char *) nullptr;
+                        if (raw_text == nullptr)
+                          return true;  // photos, stickers, ...
+
+                        // "/open@MyBot" -> "/open", trim, ignore case.
+                        std::string cmd(raw_text);
+                        while (!cmd.empty() && (cmd.back() == ' ' || cmd.back() == '\t' ||
+                                                cmd.back() == '\r' || cmd.back() == '\n'))
+                          cmd.pop_back();
+                        size_t at = cmd.find('@');
+                        if (at != std::string::npos)
+                          cmd.erase(at);
+                        for (auto &c : cmd)
+                          if (c >= 'A' && c <= 'Z')
+                            c = (char) (c - 'A' + 'a');
+
+                        id(last_command).publish_state(cmd);
+                        ESP_LOGI(TAG, "Telegram command: %s", cmd.c_str());
+
+                        if (cmd == "/help" || cmd == "/commands" || cmd == "/start") {
+                          std::string help = "Available commands:";
+                          for (const auto &entry : COMMANDS)
+                            help += std::string(" ") + entry.command;
+                          id(pending_reply) = help;
+                          return true;
+                        }
+
+                        for (const auto &entry : COMMANDS) {
+                          if (cmd != entry.command)
+                            continue;
+                          id(pending_command) = cmd;
+                          id(pending_url) = entry.url;
+                          ESP_LOGI(TAG, "Queued %s -> %s", entry.command, entry.url);
+                          return true;
+                        }
+
+                        ESP_LOGW(TAG, "Unknown command: %s", cmd.c_str());
+                        if (${1 if send_replies else 0})
+                          id(pending_reply) = "Unknown command: " + cmd + " (send /help for the list)";
+                        return true;
+                      });
+                      if (!parsed)
+                        ESP_LOGW(TAG, "getUpdates response was not valid JSON (%u bytes, truncated?)",
+                                 (unsigned) body.size());
+                on_error:
+                  - lambda: |-
+                      id(http_busy) = false;
+                      ESP_LOGW(TAG, "getUpdates request failed (WiFi down?)");
+
+  # ── Send queued replies and forward queued commands ──────────────────────
+  - interval: 250ms
+    then:
+      # 1) Telegram reply (if any)
+      - if:
+          condition:
+            lambda: 'return !id(http_busy) && !id(pending_reply).empty();'
+          then:
+            - lambda: |-
+                id(http_busy) = true;
+                id(outgoing_text) = id(pending_reply);
+                id(pending_reply).clear();
+            - http_request.post:
+                url: "https://api.telegram.org/bot${telegram_token}/sendMessage"
+                json: |-
+                  root["chat_id"] = ${telegram_chat | int};
+                  root["text"] = id(outgoing_text);
+                  root["disable_notification"] = true;
+                on_response:
+                  - lambda: |-
+                      if (response->status_code != 200)
+                        ESP_LOGW(TAG, "sendMessage failed: HTTP %d", response->status_code);
+                      id(http_busy) = false;
+                on_error:
+                  - lambda: |-
+                      ESP_LOGW(TAG, "sendMessage request failed");
+                      id(http_busy) = false;
+
+      # 2) Forwarded command (if any)
+      - if:
+          condition:
+            lambda: 'return !id(http_busy) && !id(pending_url).empty();'
+          then:
+            - lambda: |-
+                id(http_busy) = true;
+                ESP_LOGI(TAG, "POST %s", id(pending_url).c_str());
+            - http_request.post:
+                url: !lambda "return id(pending_url);"
+                on_response:
+                  - lambda: |-
+                      bool ok = response->status_code >= 200 && response->status_code < 300;
+                      std::string result = id(pending_command) + " -> HTTP " + std::to_string(response->status_code);
+                      ESP_LOGI(TAG, "%s", result.c_str());
+                      id(last_result).publish_state(result);
+                      if (${1 if send_replies else 0})
+                        id(pending_reply) = std::string(ok ? "OK: " : "FAILED: ") + result;
+                      id(pending_url).clear();
+                      id(pending_command).clear();
+                      id(http_busy) = false;
+                on_error:
+                  - lambda: |-
+                      std::string result = id(pending_command) + " -> request failed";
+                      ESP_LOGW(TAG, "%s", result.c_str());
+                      id(last_result).publish_state(result);
+                      if (${1 if send_replies else 0})
+                        id(pending_reply) = result;
+                      id(pending_url).clear();
+                      id(pending_command).clear();
+                      id(http_busy) = false;
+
+button:
+  # Re-primes the update offset and drops anything currently waiting.
+  - platform: template
+    name: "Reset Telegram Offset"
+    id: reset_offset
+    icon: "mdi:restore"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(last_update_id) = 0;
+          id(primed) = false;
+          ESP_LOGI(TAG, "Offset reset, next poll re-primes");
