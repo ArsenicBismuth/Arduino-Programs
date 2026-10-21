@@ -239,17 +239,22 @@ interval:
                         if (raw_text == nullptr)
                           return true;  // photos, stickers, ...
 
-                        // "/open@MyBot" -> "/open", trim, ignore case.
+                        // "/open@MyBot now" -> "/open": trim, keep the first
+                        // word, drop the bot mention, ignore case.
                         std::string cmd(raw_text);
-                        while (!cmd.empty() && (cmd.back() == ' ' || cmd.back() == '\t' ||
-                                                cmd.back() == '\r' || cmd.back() == '\n'))
-                          cmd.pop_back();
+                        size_t first = cmd.find_first_not_of(" \t\r\n");
+                        cmd.erase(0, first == std::string::npos ? cmd.size() : first);
+                        size_t end = cmd.find_first_of(" \t\r\n");
+                        if (end != std::string::npos)
+                          cmd.erase(end);
                         size_t at = cmd.find('@');
                         if (at != std::string::npos)
                           cmd.erase(at);
                         for (auto &c : cmd)
                           if (c >= 'A' && c <= 'Z')
                             c = (char) (c - 'A' + 'a');
+                        if (cmd.empty())
+                          return true;
 
                         id(last_command).publish_state(cmd);
                         ESP_LOGI("telegram-bridge", "Telegram command: %s", cmd.c_str());
@@ -298,14 +303,20 @@ interval:
                 id(pending_reply).clear();
             - http_request.post:
                 url: "https://api.telegram.org/bot${telegram_token}/sendMessage"
+                # Telegram only parses the body as JSON with this header.
+                request_headers:
+                  Content-Type: application/json
                 json: |-
                   root["chat_id"] = ${telegram_chat | int};
                   root["text"] = id(outgoing_text);
                   root["disable_notification"] = true;
+                capture_response: true
+                max_response_buffer_size: 2kB
                 on_response:
                   - lambda: |-
                       if (response->status_code != 200)
-                        ESP_LOGW("telegram-bridge", "sendMessage failed: HTTP %d", response->status_code);
+                        ESP_LOGW("telegram-bridge", "sendMessage failed: HTTP %d: %s",
+                                 response->status_code, body.c_str());
                       id(http_busy) = false;
                 on_error:
                   - lambda: |-
