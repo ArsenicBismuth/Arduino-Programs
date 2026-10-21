@@ -8,3 +8,19 @@ Using ESPHome for low-code development of the Servo-controlled key rotator, and 
 2. Install ESPHome CLI: https://esphome.io/guides/getting-started-command-line.html
 3. Run `esphome run smart-door.yaml` to compile and upload the firmware to the ESP32.
 4. Access http://smart-door.local:80 to control.
+
+## Telegram
+
+- `use_telegram` — send door status messages to Telegram.
+- `use_telegram_polling` — read `/open` and `/status` commands from Telegram on
+  this device.
+
+Polling Telegram on the door competes with the servo loop, so keep
+`use_telegram_polling: false` and let [`Telegram_Bridge`](../Telegram_Bridge)
+poll instead:
+
+```yaml
+substitutions:
+  use_telegram: true           # keep status messages
+  use_telegram_polling: false  # commands are polled by Telegram_Bridge
+```
