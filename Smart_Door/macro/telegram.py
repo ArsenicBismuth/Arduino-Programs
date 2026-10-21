@@ -231,8 +231,13 @@ def main():
         print("Create it based on secrets.example.yaml")
         sys.exit(1)
     
-    # Load configuration
+    # Load configuration. Telegram credentials live in the bridge (the door
+    # itself has no Telegram), so fall back to its secrets file.
     secrets = load_secrets(secrets_path)
+    if not secrets.get("telegram_bot_token"):
+        bridge_secrets = script_dir.parent / "Telegram_Bridge" / "secrets.yaml"
+        if bridge_secrets.exists():
+            secrets = load_secrets(bridge_secrets)
     
     bot_token = secrets.get("telegram_bot_token")
     main_chat_id = secrets.get("telegram_chat_id")

@@ -1,0 +1,591 @@
+# Telegram Bridge
+#
+# Polls a Telegram bot for messages and forwards each known command to a plain
+# HTTP request. This keeps the Telegram/TLS polling work off devices that have
+# better things to do with their CPU, like the smart-door ESP32.
+#
+#   Telegram  --getUpdates-->  telegram-bridge  --POST-->  http://target/...
+#
+# Commands are matched against the `command_map` below, so adding a new action
+# is a one-line change. See README.md for details.
+
+substitutions:
+  # ── Telegram bot credentials (see secrets.example.yaml) ──────────────────
+  telegram_token: !secret telegram_bot_token
+  telegram_chat: !secret telegram_chat_id
+
+  # ── Command → HTTP request map ───────────────────────────────────────────
+  # One entry per line:  {"/command", "http://host/path"},
+  # The bridge sends an HTTP POST with an empty body to that URL.
+  # Add, remove or reorder lines; keep a comma after every line but the last.
+  #
+  # Optional third value: a URL to GET after the POST. Its JSON "value" field
+  # is sent back to Telegram verbatim, so the target device decides the text
+  # (e.g. the door's /text_sensor/Message). Without it the bridge answers
+  # "OK: /command".
+  command_map: |-
+    {"/open", "http://smart-door.local/button/Open/press", "http://smart-door.local/text_sensor/Message"},
+    {"/close", "http://smart-door.local/button/Close/press"},
+    {"/zero", "http://smart-door.local/button/Zero/press"},
+    {"/status", "http://smart-door.local/button/Status/press", "http://smart-door.local/text_sensor/Message"}
+
+  # Seconds between Telegram polls. 1s = snappy, 5s = lighter on the ESP32.
+  poll_interval: 1s
+
+  # Ignore commands older than this many seconds (0 = accept any age).
+  # Stops a backlog of old /open messages from firing after a long outage.
+  max_command_age: 120
+
+  # Answer every command in Telegram with the HTTP result.
+  send_replies: true
+
+  # Timeout for each HTTP request (Telegram and the target device).
+  request_timeout: 8s
+
+esphome:
+  name: telegram-bridge
+
+esp32:
+  board: nodemcu-32s
+  framework:
+    type: esp-idf
+    advanced:
+      # Boot log reports this chip as rev 3.1, and min rev >= 3.0 drops the
+      # old-chip workarounds (~10 KB flash). The firmware then refuses to boot
+      # on an ESP32 older than 3.1 — keep this in sync with the actual board.
+      minimum_chip_revision: "3.1"
+      # +40 KB IRAM from SRAM1, handy for the WiFi/TLS stack. The boot log
+      # confirmed the installed bootloader supports it ("Bootloader supports
+      # SRAM1 as IRAM"). OTA cannot update an old bootloader; if the device
+      # ever fails to boot after enabling this, flash once over USB.
+      sram1_as_iram: true
+
+safe_mode:
+  disabled: true
+
+logger:
+  level: INFO
+  logs:
+    # The http_request component is very chatty at INFO level
+    http_request.idf: WARN
+
+api:
+  # Never reboot just because Home Assistant is not connected
+  reboot_timeout: 0s
+
+ota:
+  platform: esphome
+
+wifi:
+  ssid: "Ab-Apart"
+  password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: none
+
+  ap:
+    ssid: "Telegram-Bridge Fallback Hotspot"
+    password: !secret ap_password
+
+captive_portal:
+
+http_request:
+  timeout: ${request_timeout}
+
+time:
+  - platform: sntp
+    id: time_now
+    timezone: Europe/Berlin
+
+debug:
+  update_interval: 60s
+
+sensor:
+  - platform: debug
+    free:
+      name: "Heap Free"
+      unit_of_measurement: "B"
+      icon: "mdi:memory"
+
+text_sensor:
+  # Handy for checking that messages are actually reaching the device.
+  - platform: template
+    id: last_command
+    name: "Last Command"
+    icon: "mdi:telegram"
+  - platform: template
+    id: last_result
+    name: "Last Result"
+    icon: "mdi:http"
+
+globals:
+  # Last Telegram update_id we have handled. Persisted so a reboot does not
+  # replay old commands.
+  - id: last_update_id
+    type: int
+    restore_value: true
+    initial_value: "0"
+  # False until the first successful poll, used to skip the backlog after a
+  # fresh flash.
+  - id: primed
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # One HTTP request at a time, shared by polling, commands and replies.
+  - id: http_busy
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # Command waiting to be forwarded (set by the poll, sent by the executor).
+  - id: pending_url
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: pending_command
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  # URL of the text the target produced for the pending command ("" = none).
+  - id: pending_text_url
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  # The next message is relayed text and should be parsed as Markdown.
+  - id: pending_markdown
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # Inline-keyboard press waiting for its answerCallbackQuery. Telegram keeps
+  # showing a spinner on the button until this is answered.
+  - id: pending_answer_id
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: pending_answer_text
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  # The message being sent is the /help menu, so attach the inline keyboard.
+  - id: pending_help
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # Chat that sent the pending command; replies go back to it.
+  - id: pending_chat_id
+    type: long long
+    restore_value: false
+    initial_value: "0"
+  # Telegram message waiting to be sent.
+  - id: pending_reply
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: outgoing_text
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+interval:
+  # ── Poll Telegram ────────────────────────────────────────────────────────
+  - interval: ${poll_interval}
+    then:
+      - if:
+          condition:
+            lambda: |-
+              // Never poll while a request is running or a command/reply is
+              // still queued, so requests stay strictly sequential.
+              return !id(http_busy) && id(pending_url).empty() &&
+                     id(pending_reply).empty() && id(pending_answer_id).empty();
+          then:
+            - lambda: |-
+                id(http_busy) = true;
+            - http_request.get:
+                # offset = last handled + 1. Before the first successful poll,
+                # -1 asks Telegram for the newest update only.
+                url: !lambda |-
+                  char url[384];
+                  int offset = id(last_update_id) > 0 ? id(last_update_id) + 1 : -1;
+                  snprintf(url, sizeof(url),
+                           "https://api.telegram.org/bot${telegram_token}/getUpdates"
+                           "?offset=%d&limit=1&timeout=0&allowed_updates=%%5B%%22message%%22%%2C%%22callback_query%%22%%5D",
+                           offset);
+                  return std::string(url);
+                capture_response: true
+                max_response_buffer_size: 4kB
+                on_response:
+                  - lambda: |-
+                      id(http_busy) = false;
+                      if (response->status_code != 200) {
+                        ESP_LOGW("telegram-bridge", "getUpdates failed: HTTP %d", response->status_code);
+                        return;
+                      }
+
+                      bool parsed = json::parse_json(body, [](JsonObject root) -> bool {
+                        // Maps a Telegram command to the URL it triggers.
+                        struct CommandMap {
+                          const char *command;
+                          const char *url;       // POST target ("" = skip)
+                          const char *text_url;  // GET: relay its text ("" = none)
+                        };
+                        static const CommandMap COMMANDS[] = {
+                          ${command_map}
+                        };
+
+                        if (!(root["ok"] | false)) {
+                          const char *description = root["description"] | "unknown error";
+                          ESP_LOGW("telegram-bridge", "getUpdates returned an error: %s", description);
+                          return true;
+                        }
+
+                        JsonArray result = root["result"].as<JsonArray>();
+                        if (result.isNull() || result.size() == 0) {
+                          id(primed) = true;  // first poll worked, nothing to replay
+                          return true;
+                        }
+
+                        JsonVariant update = result[0].as<JsonVariant>();
+                        long long update_id = update["update_id"] | 0LL;
+                        if (update_id <= 0)
+                          return true;
+
+                        if (!id(primed)) {
+                          id(primed) = true;
+                          // Fresh flash (no saved offset): remember where we
+                          // are and drop whatever was waiting for us.
+                          if (id(last_update_id) == 0) {
+                            id(last_update_id) = (int) update_id;
+                            ESP_LOGI("telegram-bridge", "Primed at update_id %d (backlog ignored)", id(last_update_id));
+                            return true;
+                          }
+                        }
+
+                        // Already handled (or older than what we handled).
+                        if (update_id <= (long long) id(last_update_id))
+                          return true;
+                        id(last_update_id) = (int) update_id;
+
+                        // A typed message, or a press on a button of the /help
+                        // inline keyboard (which arrives as callback_query).
+                        JsonVariant message = update["message"].as<JsonVariant>();
+                        JsonVariant callback = update["callback_query"].as<JsonVariant>();
+                        if (message.isNull() && callback.isNull())
+                          return true;  // edited_message, channel posts, ...
+
+                        bool from_button = !callback.isNull();
+                        long long chat_id = 0;
+                        const char *raw_text = nullptr;
+
+                        if (from_button) {
+                          // The menu message may be old, so a button press is
+                          // never treated as stale.
+                          JsonVariant cb_message = callback["message"].as<JsonVariant>();
+                          chat_id = cb_message.isNull() ? (callback["from"]["id"] | 0LL)
+                                                        : (cb_message["chat"]["id"] | 0LL);
+                          raw_text = callback["data"] | (const char *) nullptr;
+                        } else {
+                          chat_id = message["chat"]["id"] | 0LL;
+
+                          // Do not act on commands from an old backlog.
+                          long long msg_date = message["date"] | 0LL;
+                          auto now = id(time_now).now();
+                          if (${max_command_age} > 0 && now.is_valid() && msg_date > 0 &&
+                              now.timestamp - (time_t) msg_date > (time_t) ${max_command_age}) {
+                            ESP_LOGW("telegram-bridge", "Ignoring stale command (%ld s old)",
+                                     (long) (now.timestamp - (time_t) msg_date));
+                            return true;
+                          }
+
+                          raw_text = message["text"] | (const char *) nullptr;
+                        }
+
+                        // Only the chats in telegram_chat_id may drive the door.
+                        // That value is a comma-separated list ("111,222");
+                        // replies go back to the chat that sent the command.
+                        std::string allowed = "${telegram_chat}";
+                        std::string want = std::to_string(chat_id);
+                        bool chat_allowed = false;
+                        size_t pos = 0;
+                        while (true) {
+                          size_t comma = allowed.find(',', pos);
+                          size_t segment_end = comma == std::string::npos ? allowed.size() : comma;
+                          size_t begin = allowed.find_first_not_of(" \t\r\n", pos);
+                          if (begin != std::string::npos && begin < segment_end) {
+                            size_t last = allowed.find_last_not_of(" \t\r\n", segment_end - 1);
+                            if (last >= begin && allowed.compare(begin, last - begin + 1, want) == 0)
+                              chat_allowed = true;
+                          }
+                          if (chat_allowed || comma == std::string::npos)
+                            break;
+                          pos = comma + 1;
+                        }
+                        if (!chat_allowed) {
+                          ESP_LOGW("telegram-bridge", "Ignoring update from chat %lld (not allowed)", chat_id);
+                          return true;
+                        }
+                        id(pending_chat_id) = chat_id;
+
+                        if (from_button) {
+                          // Must be answered, or the button keeps spinning.
+                          id(pending_answer_id) = callback["id"] | "";
+                        }
+
+                        if (raw_text == nullptr)
+                          return true;  // photos, stickers, ...
+
+                        // "/open@MyBot now" -> "/open": trim, keep the first
+                        // word, drop the bot mention, ignore case.
+                        std::string cmd(raw_text);
+                        size_t first = cmd.find_first_not_of(" \t\r\n");
+                        cmd.erase(0, first == std::string::npos ? cmd.size() : first);
+                        size_t end = cmd.find_first_of(" \t\r\n");
+                        if (end != std::string::npos)
+                          cmd.erase(end);
+                        size_t at = cmd.find('@');
+                        if (at != std::string::npos)
+                          cmd.erase(at);
+                        for (auto &c : cmd)
+                          if (c >= 'A' && c <= 'Z')
+                            c = (char) (c - 'A' + 'a');
+                        if (cmd.empty())
+                          return true;
+
+                        id(last_command).publish_state(cmd);
+                        ESP_LOGI("telegram-bridge", "Telegram command: %s", cmd.c_str());
+
+                        if (cmd == "/help" || cmd == "/commands" || cmd == "/start") {
+                          id(pending_help) = true;
+                          id(pending_reply) = "Tap a command:";
+                          return true;
+                        }
+
+                        for (const auto &entry : COMMANDS) {
+                          if (cmd != entry.command)
+                            continue;
+                          id(pending_command) = cmd;
+                          id(pending_url) = entry.url != nullptr ? entry.url : "";
+                          id(pending_text_url) = entry.text_url != nullptr ? entry.text_url : "";
+                          ESP_LOGI("telegram-bridge", "Queued %s -> %s", entry.command, entry.url);
+                          return true;
+                        }
+
+                        ESP_LOGW("telegram-bridge", "Unknown command: %s", cmd.c_str());
+                        if (from_button)
+                          id(pending_answer_text) = "Unknown: " + cmd;
+                        else if (${1 if send_replies else 0})
+                          id(pending_reply) = "Unknown command: " + cmd + " (send /help for the list)";
+                        return true;
+                      });
+                      if (!parsed)
+                        ESP_LOGW("telegram-bridge", "getUpdates response was not valid JSON (%u bytes, truncated?)",
+                                 (unsigned) body.size());
+                on_error:
+                  - lambda: |-
+                      id(http_busy) = false;
+                      ESP_LOGW("telegram-bridge", "getUpdates request failed (WiFi down?)");
+
+  # ── Send queued replies and forward queued commands ──────────────────────
+  - interval: 250ms
+    then:
+      # 0) Acknowledge a button press. Telegram requires an
+      #    answerCallbackQuery or the button keeps its progress spinner.
+      #    Waits for the command it started, so the toast shows the result.
+      - if:
+          condition:
+            lambda: 'return !id(http_busy) && !id(pending_answer_id).empty() && id(pending_url).empty() && id(pending_text_url).empty();'
+          then:
+            - lambda: |-
+                id(http_busy) = true;
+            - http_request.post:
+                url: "https://api.telegram.org/bot${telegram_token}/answerCallbackQuery"
+                request_headers:
+                  Content-Type: application/json
+                json: |-
+                  root["callback_query_id"] = id(pending_answer_id);
+                  if (!id(pending_answer_text).empty())
+                    root["text"] = id(pending_answer_text);
+                on_response:
+                  - lambda: |-
+                      id(pending_answer_id).clear();
+                      id(pending_answer_text).clear();
+                      id(http_busy) = false;
+                on_error:
+                  - lambda: |-
+                      id(pending_answer_id).clear();
+                      id(pending_answer_text).clear();
+                      id(http_busy) = false;
+
+      # 1) Telegram reply (if any)
+      - if:
+          condition:
+            lambda: 'return !id(http_busy) && !id(pending_reply).empty();'
+          then:
+            - lambda: |-
+                id(http_busy) = true;
+                id(outgoing_text) = id(pending_reply);
+                id(pending_reply).clear();
+            - http_request.post:
+                url: "https://api.telegram.org/bot${telegram_token}/sendMessage"
+                # Telegram only parses the body as JSON with this header.
+                request_headers:
+                  Content-Type: application/json
+                json: |-
+                  root["chat_id"] = id(pending_chat_id);
+                  root["text"] = id(outgoing_text);
+                  root["disable_notification"] = true;
+                  if (id(pending_markdown))
+                    root["parse_mode"] = "Markdown";
+                  if (id(pending_help)) {
+                    // /help: one inline button per mapped command, two per row.
+                    struct CommandMap {
+                      const char *command;
+                      const char *url;
+                      const char *text_url;
+                    };
+                    static const CommandMap COMMANDS[] = {
+                      ${command_map}
+                    };
+                    JsonArray rows = root["reply_markup"]["inline_keyboard"].to<JsonArray>();
+                    JsonArray row;
+                    for (size_t i = 0; i < sizeof(COMMANDS) / sizeof(COMMANDS[0]); i++) {
+                      if (i % 2 == 0)
+                        row = rows.add<JsonArray>();
+                      JsonObject button = row.add<JsonObject>();
+                      button["text"] = COMMANDS[i].command;
+                      button["callback_data"] = COMMANDS[i].command;
+                    }
+                  }
+                capture_response: true
+                max_response_buffer_size: 2kB
+                on_response:
+                  - lambda: |-
+                      if (response->status_code != 200)
+                        ESP_LOGW("telegram-bridge", "sendMessage failed: HTTP %d: %s",
+                                 response->status_code, body.c_str());
+                      id(pending_help) = false;
+                      id(pending_markdown) = false;
+                      id(http_busy) = false;
+                on_error:
+                  - lambda: |-
+                      ESP_LOGW("telegram-bridge", "sendMessage request failed");
+                      id(pending_help) = false;
+                      id(pending_markdown) = false;
+                      id(http_busy) = false;
+
+      # 2) Forwarded command: POST the action (if it has one)
+      - if:
+          condition:
+            lambda: 'return !id(http_busy) && !id(pending_url).empty();'
+          then:
+            - lambda: |-
+                id(http_busy) = true;
+                ESP_LOGI("telegram-bridge", "POST %s", id(pending_url).c_str());
+            - http_request.post:
+                url: !lambda "return id(pending_url);"
+                on_response:
+                  - lambda: |-
+                      bool ok = response->status_code >= 200 && response->status_code < 300;
+                      std::string result = id(pending_command) + " -> HTTP " + std::to_string(response->status_code);
+                      ESP_LOGI("telegram-bridge", "%s", result.c_str());
+                      id(last_result).publish_state(result);
+                      id(pending_url).clear();
+                      if (!ok) {
+                        // Action failed: nothing to fetch, report the failure.
+                        id(pending_text_url).clear();
+                        if (!id(pending_answer_id).empty())
+                          id(pending_answer_text) = "FAILED: " + id(pending_command);
+                        else if (${1 if send_replies else 0})
+                          id(pending_reply) = "FAILED: " + id(pending_command);
+                        id(pending_command).clear();
+                      } else if (id(pending_text_url).empty()) {
+                        // No text to fetch: plain confirmation.
+                        if (!id(pending_answer_id).empty())
+                          id(pending_answer_text) = "OK: " + id(pending_command);
+                        else if (${1 if send_replies else 0})
+                          id(pending_reply) = "OK: " + id(pending_command);
+                        id(pending_command).clear();
+                      }
+                      // Otherwise step 3 fetches the text next.
+                      id(http_busy) = false;
+                on_error:
+                  - lambda: |-
+                      std::string result = id(pending_command) + " -> request failed";
+                      ESP_LOGW("telegram-bridge", "%s", result.c_str());
+                      id(last_result).publish_state(result);
+                      if (!id(pending_answer_id).empty())
+                        id(pending_answer_text) = "FAILED: " + id(pending_command);
+                      else if (${1 if send_replies else 0})
+                        id(pending_reply) = "FAILED: " + id(pending_command);
+                      id(pending_url).clear();
+                      id(pending_text_url).clear();
+                      id(pending_command).clear();
+                      id(http_busy) = false;
+
+      # 3) Fetch the text the target produced and relay it verbatim.
+      #    The target exposes it as a text sensor, e.g. the door's Message:
+      #    {"id":"message","state":"...","value":"Status: Door is ..."}
+      - if:
+          condition:
+            lambda: 'return !id(http_busy) && id(pending_url).empty() && !id(pending_text_url).empty();'
+          then:
+            - lambda: |-
+                id(http_busy) = true;
+                ESP_LOGI("telegram-bridge", "GET %s", id(pending_text_url).c_str());
+            - http_request.get:
+                url: !lambda "return id(pending_text_url);"
+                capture_response: true
+                max_response_buffer_size: 2kB
+                on_response:
+                  - lambda: |-
+                      std::string text;
+                      if (response->status_code == 200)
+                        json::parse_json(body, [&text](JsonObject root) -> bool {
+                          const char *value = root["value"] | (const char *) nullptr;
+                          if (value == nullptr)
+                            return false;
+                          text = value;
+                          return true;
+                        });
+                      id(pending_text_url).clear();
+                      if (!text.empty()) {
+                        // Whatever the target wrote, sent as-is (Markdown).
+                        ESP_LOGI("telegram-bridge", "Relaying %s text (%u bytes)",
+                                 id(pending_command).c_str(), (unsigned) text.size());
+                        id(last_result).publish_state(id(pending_command) + " -> text");
+                        id(pending_reply) = text;
+                        id(pending_markdown) = true;
+                        if (!id(pending_answer_id).empty())
+                          id(pending_answer_text) = "OK: " + id(pending_command);
+                      } else {
+                        ESP_LOGW("telegram-bridge", "%s -> no text (HTTP %d)",
+                                 id(pending_command).c_str(), response->status_code);
+                        id(last_result).publish_state(id(pending_command) + " -> no text");
+                        if (!id(pending_answer_id).empty())
+                          id(pending_answer_text) = "FAILED: " + id(pending_command);
+                        else if (${1 if send_replies else 0})
+                          id(pending_reply) = "FAILED: " + id(pending_command) + " (no text)";
+                      }
+                      id(pending_command).clear();
+                      id(http_busy) = false;
+                on_error:
+                  - lambda: |-
+                      ESP_LOGW("telegram-bridge", "%s -> text request failed", id(pending_command).c_str());
+                      id(last_result).publish_state(id(pending_command) + " -> text request failed");
+                      if (!id(pending_answer_id).empty())
+                        id(pending_answer_text) = "FAILED: " + id(pending_command);
+                      else if (${1 if send_replies else 0})
+                        id(pending_reply) = "FAILED: " + id(pending_command);
+                      id(pending_text_url).clear();
+                      id(pending_command).clear();
+                      id(http_busy) = false;
+
+button:
+  # Re-primes the update offset and drops anything currently waiting.
+  - platform: template
+    name: "Reset Telegram Offset"
+    id: reset_offset
+    icon: "mdi:restore"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(last_update_id) = 0;
+          id(primed) = false;
+          ESP_LOGI("telegram-bridge", "Offset reset, next poll re-primes");
