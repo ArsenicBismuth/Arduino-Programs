@@ -167,6 +167,44 @@ had already been given `TCP_NODELAY` in an earlier pass; the (newer) index was m
 instead of retrying every remaining one: a retry can block for the full 5 s send timeout per
 chunk, and with one httpd task that would wedge the whole web server for a closed client.
 
+### 2026-10-21 — the web server locked up because lwIP had no heap for pbufs
+
+**Symptom.** `/file` and `/latest` returned headers and then stopped at random offsets
+(1-16 KB), `:8080` delivered the multipart header and no frames, and after a handful of
+requests `/`, `/file`, `/latest` and even OTA stopped answering until the board recovered
+by itself or was restarted.
+
+**Measurements (live, via the web UI's `/events` log stream).**
+
+- `enter, heap 6160..7732` at the start of a handler, `heap 676..2748` while sending,
+  `largest 184..1536` - the largest free block is often smaller than a 1 KB pbuf.
+- `send 1024 B took 353..1425 ms` (up to 11 s with 2 KB chunks); there is **no** slow
+  `fread` line, so the SD card is not involved.
+- ICMP loss was 26% with the default modem sleep, 0% with `power_save_mode: none`.
+
+**Root cause.** Without PSRAM the camera frame buffer (~60 KB) plus three HTTP servers and
+the web UI leave only a few KB of heap. lwIP allocates pbufs from that same heap
+(`MEM_LIBC_MALLOC=1`), so a 1-2 KB send can fail with `ERR_MEM`; `send()` then waits for
+the socket send timeout (5 s), the response is cut short, and httpd keeps the session with
+its queued data. A few of those exhaust the heap and every server (including OTA) stops.
+
+**Fix.**
+
+- **1 KB chunks** in `handle_download()`, the index `ChunkWriter`, and `/latest`, so each
+  send needs a ~1 KB allocation instead of 2 KB.
+- **`httpd_sess_trigger_close()` after every response** (success or failure): httpd does not
+  close the session by itself, and each idle session holds socket buffers. This is the part
+  that used to need a reboot.
+- **`CONFIG_LWIP_TCP_WND_DEFAULT` / `TCP_SND_BUF_DEFAULT = 2880`**: halves the per-socket
+  receive/send buffers so seven web sockets plus the camera servers still fit.
+- **`power_save_mode: none`**: 26% -> 0% ICMP loss on this link (secondary; it does not fix
+  the heap problem on its own).
+
+**Verified after flashing:** 12/12 sequential `/file` and `/latest` with the UI's `/events`
+stream open; `:8080` streams ~60-80 KB/s while a download runs; three concurrent transfers
+all complete. Five concurrent 20 KB transfers still fail one or two (the heap cannot hold
+that many pbufs), but the server and the stream stay up instead of wedging.
+
 ## Periodic snapshots + change gate (`cam_snapshot.h`)
 
 `cam.yaml` saves snapshots on a schedule and filters near-duplicates, using the helpers in

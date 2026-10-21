@@ -56,6 +56,10 @@ esp32:
     sdkconfig_options:
       # Long file names, needed for names like snap_20261017_141530.jpg
       CONFIG_FATFS_LFN_STACK: "y"
+      # No PSRAM: ~4-10 KB free heap at runtime. Halve lwIP's per-connection buffers so the
+      # 7 web sockets plus the two camera servers still fit (and sends can allocate).
+      CONFIG_LWIP_TCP_WND_DEFAULT: "2880"
+      CONFIG_LWIP_TCP_SND_BUF_DEFAULT: "2880"
 
 # Enable logging
 logger:
@@ -67,6 +71,9 @@ ota:
 wifi:
   ssid: "Ab-Apart"
   password: !secret wifi_password
+
+  # Default modem sleep measured here: 19-170 ms pings, ~26% loss; off: 4-13 ms, ~10%.
+  power_save_mode: none
 
   # Enable fallback hotspot (captive portal) in case wifi connection fails
   ap:
