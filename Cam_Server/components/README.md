@@ -225,6 +225,22 @@ that many pbufs), but the server and the stream stay up instead of wedging.
 - Only `httpd_sess_trigger_close()` queues the close on the httpd task, freeing the slot
   immediately after the handler returns (on both the success and the failure path).
 
+### 2026-10-22 — `Got invalid frame from camera!` while streaming
+
+**Symptom.** Occasionally a viewer shows no frame and the log has
+`[W][esp32_camera:238]: Got invalid frame from camera!`; reopening the stream usually recovers.
+
+**Cause.** ESPHome's framebuffer task waits up to 4 s for a frame (`FB_GET_TIMEOUT` in
+esp32-camera) and logs this when the driver sends none. With `frame_buffer_count: 1` (the
+only option without PSRAM) the camera cannot capture while the previous frame is still being
+sent, so a busy link turns into a multi-second gap and a null frame. Reproduced once in a
+60 s stream while ten HTTP transfers ran in parallel; zero in 60 s idle and zero in a 30 s
+stream on its own.
+
+**Mitigation.** `max_framerate` 10 -> 5 fps (the "Max FPS" control defaults to 5): fewer
+frames to push means the single buffer comes back sooner. A second frame buffer would remove
+the gap, but needs another ~60 KB that this board does not have.
+
 ## Periodic snapshots + change gate (`cam_snapshot.h`)
 
 `cam.yaml` saves snapshots on a schedule and filters near-duplicates, using the helpers in
