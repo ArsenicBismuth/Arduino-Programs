@@ -5,6 +5,9 @@ substitutions:
     # No battery: Auto-close on power.
     # Battery: Close on door sensor.
   servo_acceleration: 100  # Ramp speed in servo_number units per second (-100..100 scale)
+  # Child safety: the physical button only opens the door when double-pressed.
+  double_press_window: 250ms  # Max gap between first release and second press
+  press_max_length: 250ms     # Holds longer than this are not counted as a press
 
 esphome:
   name: smart-door
@@ -451,9 +454,17 @@ binary_sensor:
         pullup: true
     filters:
       - delayed_on_off: 20ms
-    on_press:
-      then: # High = pressed. Open the door
-        - button.press: door_open
+    # Child safety: one press does nothing. Open only on a rapid double press,
+    # so a child hitting the button once cannot unlock the door.
+    on_multi_click:
+      - timing:
+          - ON for at most ${press_max_length}
+          - OFF for at most ${double_press_window}
+          - ON for at most ${press_max_length}
+          - OFF for at least 200ms
+        then: # High = pressed. Open the door
+          - button.press: door_open
+        invalid_cooldown: 500ms
 
 servo:
   - id: servo_hw

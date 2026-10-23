@@ -9,6 +9,14 @@ Using ESPHome for low-code development of the Servo-controlled key rotator, and 
 3. Run `esphome run smart-door.yaml` to compile and upload the firmware to the ESP32.
 4. Access http://smart-door.local:80 to control.
 
+## Physical button (child safety)
+
+The wired button on GPIO14 does **not** open the door on a single press. It must
+be pressed twice in quick succession: each press can last at most
+`press_max_length` (1s) and the gap between them at most
+`double_press_window` (500ms), both tunable in `substitutions:` at the top of
+`smart-door.yaml`. A single, long, or slow press is ignored.
+
 ## Text API (used by Telegram_Bridge)
 
 This device does **not** talk to Telegram: no bot token, no chat id, no
