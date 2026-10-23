@@ -251,6 +251,19 @@ fixed 640-byte array (and stats only those 20, instead of every entry as before)
 `?start=N` pager is gone. A zero-RAM variant (one scan per row) was measured at 0.7-1.3 s per
 page versus 0.3 s for this one.
 
+### 2026-10-23 (b) — Delete button answered 405 Method Not Allowed
+
+**Cause.** The page sent `DELETE /file/<name>`, but ESPHome's esp-idf shim registers only GET,
+POST and OPTIONS with httpd, so the request never reached the component and httpd itself
+replied 405. The old reply path was broken too: `request->send()` maps every status other than
+200/404/409 to 500, and the success case used 204, so a delete that worked still looked like a
+server error to the client.
+
+**Fix.** The button now posts `?delete=1` (DELETE is still accepted on the Arduino build), and
+`handle_delete()` writes the status line through httpd directly. `sd_mmc_card::delete_file()`
+also returns false when `remove()` fails instead of always reporting success. The button is
+styled red (`.danger`) and asks for confirmation.
+
 ## Periodic snapshots + change gate (`cam_snapshot.h`)
 
 `cam.yaml` saves snapshots on a schedule and filters near-duplicates, using the helpers in

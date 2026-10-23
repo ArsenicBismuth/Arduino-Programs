@@ -123,6 +123,7 @@ bool SdMmc::delete_file(const char *path) {
   std::string absolut_path = build_path(path);
   if (remove(absolut_path.c_str()) != 0) {
     ESP_LOGE(TAG, "Failed to remove file: %s", strerror(errno));
+    return false;
   }
   this->update_sensors();
   return true;

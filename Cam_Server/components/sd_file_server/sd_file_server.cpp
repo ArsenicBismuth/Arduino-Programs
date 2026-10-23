@@ -192,6 +192,12 @@ static const char INDEX_HEAD[] = R"(
     button:hover, .action-link:hover {
       background: #388bfd;
     }
+    button.danger {
+      background: #da3633;
+    }
+    button.danger:hover {
+      background: #f85149;
+    }
     .upload-form {
       margin-bottom: 2rem;
       padding: 1rem;
@@ -271,7 +277,11 @@ static const char INDEX_TABLE_HEAD[] =
 static const char INDEX_FOOT[] =
     "</tbody></table>"
     "<script>"
-    "function delete_file(path) {fetch(path, {method: \"DELETE\"});}"
+    "function delete_file(path) {"
+    "if (!confirm('Delete ' + path + '?')) return;"
+    "fetch(path + '?delete=1', {method: 'POST'})"
+    ".then(function (r) { if (r.ok) location.reload(); else alert('Delete failed (' + r.status + ')'); });"
+    "}"
     "</script>";
 
 static const char UPLOAD_FORM[] =
@@ -311,14 +321,15 @@ void SDFileServer::handleRequest(AsyncWebServerRequest *request) {
     this->handle_get(request);
     return;
   }
-  if (request->method() == HTTP_DELETE) {
+  // The esp-idf shim registers only GET/POST, so DELETE is answered with 405 before this
+  // handler runs. The UI posts ?delete=1 instead; DELETE still works on the Arduino build.
+  if (request->method() == HTTP_DELETE || (request->method() == HTTP_POST && request->hasArg("delete"))) {
     this->handle_delete(request);
     return;
   }
 
-  // GET and DELETE are the only methods this handler implements. Anything else used to
-  // fall through without sending a response at all, leaving the client to hang until its
-  // own timeout. Reply explicitly instead.
+  // Anything else used to fall through without sending a response at all, leaving the
+  // client to hang until its own timeout. Reply explicitly instead.
 #ifdef USE_ESP_IDF
   // The ESPHome shim maps any status it doesn't know to 500, so set 405 directly.
   httpd_req_t *req = *request;
@@ -419,7 +430,7 @@ void SDFileServer::write_row(std::string &out, sd_mmc_card::FileInfo const &info
       out += "\" target=\"_blank\" rel=\"noopener\">Open</a>";
     }
     if (this->deletion_enabled_) {
-      out += "<button onClick=\"delete_file('";
+      out += "<button class=\"danger\" onClick=\"delete_file('";
       out += uri;
       out += "')\">Delete</button>";
     }
@@ -603,21 +614,39 @@ void SDFileServer::handle_download(AsyncWebServerRequest *request, std::string c
 }
 
 void SDFileServer::handle_delete(AsyncWebServerRequest *request) {
-  if (!this->deletion_enabled_) {
-    request->send(401, "application/json", "{ \"error\": \"file deletion is disabled\" }");
-    return;
-  }
   std::string extracted = this->extract_path_from_url(std::string(request->url().c_str()));
   std::string path = this->build_absolute_path(extracted);
-  if (this->sd_mmc_card_->is_directory(path)) {
-    request->send(401, "application/json", "{ \"error\": \"cannot delete a directory\" }");
-    return;
+
+  const char *error = nullptr;
+  if (!this->deletion_enabled_) {
+    error = "file deletion is disabled";
+  } else if (this->sd_mmc_card_->is_directory(path)) {
+    error = "cannot delete a directory";
+  } else if (!this->sd_mmc_card_->delete_file(path)) {
+    error = "failed to delete file";
   }
-  if (this->sd_mmc_card_->delete_file(path)) {
-    request->send(204, "application/json", "{}");
-    return;
-  }
-  request->send(401, "application/json", "{ \"error\": \"failed to delete file\" }");
+  ESP_LOGI(TAG, "delete %s -> %s", path.c_str(), error == nullptr ? "ok" : error);
+
+#ifdef USE_ESP_IDF
+  // The shim turns any status other than 200/404/409 into 500, and 204 must not carry a
+  // body, so reply directly.
+  char body[64];
+  if (error != nullptr)
+    snprintf(body, sizeof(body), "{ \"error\": \"%s\" }", error);
+  else
+    strcpy(body, "{}");
+  httpd_req_t *req = *request;
+  httpd_resp_set_status(req, error != nullptr ? "401 Unauthorized" : "200 OK");
+  httpd_resp_set_type(req, "application/json");
+  set_connection_close(req);
+  httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+  close_session(req);
+#else
+  if (error != nullptr)
+    request->send(401, "application/json", error);
+  else
+    request->send(200, "application/json", "{}");
+#endif
 }
 
 std::string SDFileServer::build_prefix() const {
