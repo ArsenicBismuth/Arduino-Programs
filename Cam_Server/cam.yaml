@@ -116,17 +116,19 @@ esp32_camera:
   # Image settings
   name: My Camera
   id: my_camera
+  aec2: true                   # AEC DSP: better indoor low-light exposure
 
   # Boot-time orientation
   vertical_flip: true
   horizontal_mirror: true
 
   # Frame rates (see "Max FPS" / "Idle FPS" controls in [6]):
-  #   max_framerate  - cap while the MJPEG stream is open (schema allows up to 60)
+  #   max_framerate  - cap while the MJPEG stream is open (schema allows up to 60).
+  #                   5 keeps the single DRAM frame buffer from starving on this link.
   #   idle_framerate - background frames when nothing is streaming. The periodic
   #                    snapshot logic rides these, so this is the effective
   #                    upper bound on how often a scheduled snapshot is taken.
-  max_framerate: 10 fps
+  max_framerate: 5 fps
   idle_framerate: 0.1 fps
 
   # This is the only safe way to get a frame: esp32_camera's own framebuffer
@@ -269,7 +271,7 @@ sd_file_server:
   url_prefix: file
   root_path: "/"
   enable_download: true
-  enable_deletion: false
+  enable_deletion: true
   enable_upload: false
 
 # Serve the newest snapshot straight off the card, no UI:
@@ -523,7 +525,7 @@ number:
     min_value: 1
     max_value: 60
     step: 1
-    initial_value: 10
+    initial_value: 5
     set_action:
       - lambda: |-
           id(my_camera)->set_max_update_interval((uint32_t) (1000.0f / x));
@@ -893,7 +895,7 @@ switch:
     icon: mdi:auto-fix
     entity_category: config
     optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
+    restore_mode: RESTORE_DEFAULT_ON
     turn_on_action:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();

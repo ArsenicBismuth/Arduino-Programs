@@ -225,6 +225,45 @@ that many pbufs), but the server and the stream stay up instead of wedging.
 - Only `httpd_sess_trigger_close()` queues the close on the httpd task, freeing the slot
   immediately after the handler returns (on both the success and the failure path).
 
+### 2026-10-22 — `Got invalid frame from camera!` while streaming
+
+**Symptom.** Occasionally a viewer shows no frame and the log has
+`[W][esp32_camera:238]: Got invalid frame from camera!`; reopening the stream usually recovers.
+
+**Cause.** ESPHome's framebuffer task waits up to 4 s for a frame (`FB_GET_TIMEOUT` in
+esp32-camera) and logs this when the driver sends none. With `frame_buffer_count: 1` (the
+only option without PSRAM) the camera cannot capture while the previous frame is still being
+sent, so a busy link turns into a multi-second gap and a null frame. Reproduced once in a
+60 s stream while ten HTTP transfers ran in parallel; zero in 60 s idle and zero in a 30 s
+stream on its own.
+
+**Mitigation.** `max_framerate` 10 -> 5 fps (the "Max FPS" control defaults to 5): fewer
+frames to push means the single buffer comes back sooner. A second frame buffer would remove
+the gap, but needs another ~60 KB that this board does not have.
+
+### 2026-10-23 — file browser lists newest first
+
+**Change.** `handle_index()` renders names in descending order (snapshot names are
+zero-padded timestamps, so that is chronological, newest first). Sorting a day folder in RAM
+is not possible on this board, so one directory scan keeps only the 20 largest names in a
+fixed 640-byte array (and stats only those 20, instead of every entry as before);
+`?before=<name>` pages back through older entries ("Older" / "Newest" links). The old
+`?start=N` pager is gone. A zero-RAM variant (one scan per row) was measured at 0.7-1.3 s per
+page versus 0.3 s for this one.
+
+### 2026-10-23 (b) — Delete button answered 405 Method Not Allowed
+
+**Cause.** The page sent `DELETE /file/<name>`, but ESPHome's esp-idf shim registers only GET,
+POST and OPTIONS with httpd, so the request never reached the component and httpd itself
+replied 405. The old reply path was broken too: `request->send()` maps every status other than
+200/404/409 to 500, and the success case used 204, so a delete that worked still looked like a
+server error to the client.
+
+**Fix.** The button now posts `?delete=1` (DELETE is still accepted on the Arduino build), and
+`handle_delete()` writes the status line through httpd directly. `sd_mmc_card::delete_file()`
+also returns false when `remove()` fails instead of always reporting success. The button is
+styled red (`.danger`) and asks for confirmation.
+
 ## Periodic snapshots + change gate (`cam_snapshot.h`)
 
 `cam.yaml` saves snapshots on a schedule and filters near-duplicates, using the helpers in
