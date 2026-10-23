@@ -241,6 +241,16 @@ stream on its own.
 frames to push means the single buffer comes back sooner. A second frame buffer would remove
 the gap, but needs another ~60 KB that this board does not have.
 
+### 2026-10-23 — file browser lists newest first
+
+**Change.** `handle_index()` renders names in descending order (snapshot names are
+zero-padded timestamps, so that is chronological, newest first). Sorting a day folder in RAM
+is not possible on this board, so one directory scan keeps only the 20 largest names in a
+fixed 640-byte array (and stats only those 20, instead of every entry as before);
+`?before=<name>` pages back through older entries ("Older" / "Newest" links). The old
+`?start=N` pager is gone. A zero-RAM variant (one scan per row) was measured at 0.7-1.3 s per
+page versus 0.3 s for this one.
+
 ## Periodic snapshots + change gate (`cam_snapshot.h`)
 
 `cam.yaml` saves snapshots on a schedule and filters near-duplicates, using the helpers in

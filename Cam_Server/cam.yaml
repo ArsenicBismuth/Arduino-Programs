@@ -271,7 +271,7 @@ sd_file_server:
   url_prefix: file
   root_path: "/"
   enable_download: true
-  enable_deletion: false
+  enable_deletion: true
   enable_upload: false
 
 # Serve the newest snapshot straight off the card, no UI:

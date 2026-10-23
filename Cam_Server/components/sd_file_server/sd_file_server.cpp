@@ -3,8 +3,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <map>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 #ifdef USE_ESP_IDF
 #include <netinet/in.h>
@@ -425,22 +427,15 @@ void SDFileServer::write_row(std::string &out, sd_mmc_card::FileInfo const &info
   out += "<div></td></tr>";
 }
 
-void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string const &path) const {
-  // A day folder can hold thousands of snapshots. Buffering the whole listing (or the
-  // whole HTML page) in RAM first exhausts the heap on this non-PSRAM board and aborts
-  // the device. Instead, stream the page in small chunks and render at most PAGE_SIZE
-  // rows per request (?start=N selects the page), stopping the directory walk as soon as
-  // the page is full.
-  static constexpr size_t PAGE_SIZE = 100;
+// Newest-first listing only needs the PAGE_SIZE largest names, never the whole directory:
+// 20 * 32 B. Sizes/types are read with stat() for the visible rows only (not every entry).
+static constexpr size_t PAGE_SIZE = 20;
+static char listing[PAGE_SIZE][32];
 
-  size_t start = 0;
-  std::string start_arg = request->arg("start");
-  if (!start_arg.empty()) {
-    char *end = nullptr;
-    unsigned long parsed = strtoul(start_arg.c_str(), &end, 10);
-    if (end != start_arg.c_str())
-      start = parsed;
-  }
+void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string const &path) const {
+  // Names are zero-padded timestamps, so the largest names are the newest. One directory
+  // scan keeps the PAGE_SIZE largest names; `?before=<name>` walks older pages.
+  std::string before = request->arg("before");
 
 #ifdef USE_ESP_IDF
   httpd_req_t *req = *request;
@@ -478,38 +473,61 @@ void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string cons
 
   out.write(INDEX_TABLE_HEAD);
 
-  size_t index = 0;
-  size_t shown = 0;
-  bool has_more = false;
   std::string row;
-  this->sd_mmc_card_->list_directory_file_info(path, 0, [&](sd_mmc_card::FileInfo const &info) {
-    if (index++ < start)
-      return true;  // skip the rows of earlier pages
-    if (shown >= PAGE_SIZE) {
-      has_more = true;
-      return false;  // page is full: stop the directory walk
+  std::string dir_path = sd_mmc_card::build_path(path.c_str());
+  size_t kept = 0;
+  bool has_more = false;
+  DIR *dir = opendir(dir_path.c_str());
+  if (dir == nullptr) {
+    ESP_LOGE(TAG, "opendir(%s) failed: %s", dir_path.c_str(), strerror(errno));
+  } else {
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+      const char *name = entry->d_name;
+      if (name[0] == '\0' || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+        continue;
+      if (!before.empty() && strcmp(name, before.c_str()) >= 0)
+        continue;  // newer than this page's cursor: already shown
+      if (kept == PAGE_SIZE) {
+        has_more = true;
+        if (strcmp(name, listing[0]) <= 0)
+          continue;  // smaller than the smallest name kept so far
+        memmove(listing, listing + 1, sizeof(listing[0]) * (PAGE_SIZE - 1));
+        kept--;
+      }
+      size_t pos = kept;
+      while (pos > 0 && strcmp(name, listing[pos - 1]) < 0) {
+        memcpy(listing[pos], listing[pos - 1], sizeof(listing[0]));
+        pos--;
+      }
+      strlcpy(listing[pos], name, sizeof(listing[0]));
+      kept++;
     }
+    closedir(dir);
+  }
+
+  for (size_t i = kept; i > 0; i--) {
+    std::string rel = Path::join(path, listing[i - 1]);
+    struct stat st;
+    bool ok = stat(sd_mmc_card::build_path(rel.c_str()).c_str(), &st) == 0;
+    bool is_dir = ok && S_ISDIR(st.st_mode);
     row.clear();
-    write_row(row, info);
+    write_row(row, sd_mmc_card::FileInfo(rel, ok ? static_cast<size_t>(st.st_size) : 0, is_dir));
     out.write(row.data(), row.size());
-    shown++;
-    return true;
-  });
+  }
 
   out.write(INDEX_FOOT);
 
-  if (start > 0 || has_more) {
-    std::string base = "/" + Path::join(this->url_prefix_, Path::remove_root_path(path, this->root_path_));
+  std::string base = "/" + Path::join(this->url_prefix_, Path::remove_root_path(path, this->root_path_));
+  if (!before.empty() || has_more) {
     out.write("<div class=\"pager\">");
-    if (start > 0) {
-      std::string prev = "<a class=\"action-link\" href=\"" + base + "?start=" +
-                         std::to_string(start > PAGE_SIZE ? start - PAGE_SIZE : 0) + "\">&laquo; Previous</a>";
-      out.write(prev.data(), prev.size());
+    if (!before.empty()) {
+      std::string newest = "<a class=\"action-link\" href=\"" + base + "\">&laquo; Newest</a>";
+      out.write(newest.data(), newest.size());
     }
-    if (has_more) {
-      std::string next = "<a class=\"action-link\" href=\"" + base + "?start=" + std::to_string(start + PAGE_SIZE) +
-                         "\">Next &raquo;</a>";
-      out.write(next.data(), next.size());
+    if (has_more && kept > 0) {
+      std::string older = "<a class=\"action-link\" href=\"" + base + "?before=" + listing[0] + "\">Older &raquo;</a>";
+      out.write(older.data(), older.size());
     }
     out.write("</div>");
   }
