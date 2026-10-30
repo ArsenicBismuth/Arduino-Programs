@@ -8,6 +8,10 @@
 #
 # Commands are matched against the `command_map` below, so adding a new action
 # is a one-line change. See README.md for details.
+#
+# The bridge also remembers the last allowed chat that interacted with it and
+# exposes a small REST API (text entity "Announce") that sends a message to
+# that chat. Smart_Door uses it to report when the door has closed.
 
 substitutions:
   # ── Telegram bot credentials (see secrets.example.yaml) ──────────────────
@@ -88,6 +92,11 @@ wifi:
 
 captive_portal:
 
+# Needed for the announcement API: POST /text/Announce/set?value=<text>
+web_server:
+  version: 3
+  port: 80
+
 http_request:
   timeout: ${request_timeout}
 
@@ -116,6 +125,31 @@ text_sensor:
     id: last_result
     name: "Last Result"
     icon: "mdi:http"
+  - platform: template
+    id: last_announcement
+    name: "Last Announcement"
+    icon: "mdi:bullhorn"
+
+# Announcement API. POST /text/Announce/set?value=<url-encoded text> queues the
+# text for the last chat that interacted with the bridge (see last_user_id).
+text:
+  - platform: template
+    name: "Announce"
+    id: announce
+    icon: "mdi:bullhorn"
+    mode: text
+    optimistic: true
+    max_length: 255
+    set_action:
+      - lambda: |-
+          if (x.empty())
+            return;
+          if (id(last_user_id) == 0) {
+            ESP_LOGW("telegram-bridge", "Announcement ignored: no user has interacted yet");
+            return;
+          }
+          id(pending_announcement) = x;
+          ESP_LOGI("telegram-bridge", "Queued announcement for chat %lld", id(last_user_id));
 
 globals:
   # Last Telegram update_id we have handled. Persisted so a reboot does not
@@ -130,6 +164,12 @@ globals:
     type: bool
     restore_value: false
     initial_value: "false"
+  # Last allowed chat that interacted with the bridge. Announcements go here.
+  # Persisted so the door can still report a close after a bridge reboot.
+  - id: last_user_id
+    type: long long
+    restore_value: true
+    initial_value: "0"
   # One HTTP request at a time, shared by polling, commands and replies.
   - id: http_busy
     type: bool
@@ -183,6 +223,16 @@ globals:
     type: std::string
     restore_value: false
     initial_value: '""'
+  # Announcement queued through the REST API ("" = none).
+  - id: pending_announcement
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  # Copy being sent, so the JSON body stays valid while the request runs.
+  - id: outgoing_announcement
+    type: std::string
+    restore_value: false
+    initial_value: '""'
 
 interval:
   # ── Poll Telegram ────────────────────────────────────────────────────────
@@ -194,7 +244,8 @@ interval:
               // Never poll while a request is running or a command/reply is
               // still queued, so requests stay strictly sequential.
               return !id(http_busy) && id(pending_url).empty() &&
-                     id(pending_reply).empty() && id(pending_answer_id).empty();
+                     id(pending_reply).empty() && id(pending_answer_id).empty() &&
+                     id(pending_announcement).empty();
           then:
             - lambda: |-
                 id(http_busy) = true;
@@ -321,6 +372,9 @@ interval:
                           ESP_LOGW("telegram-bridge", "Ignoring update from chat %lld (not allowed)", chat_id);
                           return true;
                         }
+                        // Remember who to announce to. Only allowed chats get
+                        // here, so door status can never leak to a stranger.
+                        id(last_user_id) = chat_id;
                         id(pending_chat_id) = chat_id;
 
                         if (from_button) {
@@ -470,7 +524,44 @@ interval:
                       id(pending_markdown) = false;
                       id(http_busy) = false;
 
-      # 2) Forwarded command: POST the action (if it has one)
+      # 2) Announcement queued through the REST API (text entity "Announce").
+      #    Sent to the last allowed chat that interacted with the bridge.
+      - if:
+          condition:
+            lambda: 'return !id(http_busy) && !id(pending_announcement).empty() && id(last_user_id) != 0;'
+          then:
+            - lambda: |-
+                id(http_busy) = true;
+                id(outgoing_announcement) = id(pending_announcement);
+                id(pending_announcement).clear();
+                ESP_LOGI("telegram-bridge", "Announcing to chat %lld", id(last_user_id));
+            - http_request.post:
+                url: "https://api.telegram.org/bot${telegram_token}/sendMessage"
+                request_headers:
+                  Content-Type: application/json
+                json: |-
+                  root["chat_id"] = id(last_user_id);
+                  root["text"] = id(outgoing_announcement);
+                  // Door status text is Markdown (*bold*, bullets, emoji).
+                  root["parse_mode"] = "Markdown";
+                capture_response: true
+                max_response_buffer_size: 2kB
+                on_response:
+                  - lambda: |-
+                      if (response->status_code != 200)
+                        ESP_LOGW("telegram-bridge", "announcement failed: HTTP %d: %s",
+                                 response->status_code, body.c_str());
+                      else
+                        id(last_announcement).publish_state(id(outgoing_announcement));
+                      id(outgoing_announcement).clear();
+                      id(http_busy) = false;
+                on_error:
+                  - lambda: |-
+                      ESP_LOGW("telegram-bridge", "announcement request failed");
+                      id(outgoing_announcement).clear();
+                      id(http_busy) = false;
+
+      # 3) Forwarded command: POST the action (if it has one)
       - if:
           condition:
             lambda: 'return !id(http_busy) && !id(pending_url).empty();'
@@ -503,7 +594,7 @@ interval:
                           id(pending_reply) = "OK: " + id(pending_command);
                         id(pending_command).clear();
                       }
-                      // Otherwise step 3 fetches the text next.
+                      // Otherwise step 4 fetches the text next.
                       id(http_busy) = false;
                 on_error:
                   - lambda: |-
@@ -519,7 +610,7 @@ interval:
                       id(pending_command).clear();
                       id(http_busy) = false;
 
-      # 3) Fetch the text the target produced and relay it verbatim.
+      # 4) Fetch the text the target produced and relay it verbatim.
       #    The target exposes it as a text sensor, e.g. the door's Message:
       #    {"id":"message","state":"...","value":"Status: Door is ..."}
       - if:

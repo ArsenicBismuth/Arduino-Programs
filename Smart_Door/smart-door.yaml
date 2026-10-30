@@ -8,6 +8,9 @@ substitutions:
   # Child safety: the physical button only opens the door when double-pressed.
   double_press_window: 250ms  # Max gap between first release and second press
   press_max_length: 250ms     # Holds longer than this are not counted as a press
+  # Announcement API of Telegram_Bridge (text entity "Announce"). Called after
+  # the door has closed so the last Telegram user gets the status message.
+  telegram_bridge_url: http://telegram-bridge.local
 
 esphome:
   name: smart-door
@@ -78,6 +81,10 @@ wifi:
     password: !secret ap_password
 
 captive_portal:
+
+# Used only to announce a finished close to Telegram_Bridge.
+http_request:
+  timeout: 8s
 
 time:
   - platform: sntp
@@ -243,6 +250,59 @@ script:
             - servo.detach:
                 id: servo_hw
 
+  # Publishes the current status to the `message` sensor. When `announce` is
+  # true it also hands the same text to Telegram_Bridge, which forwards it to
+  # the last Telegram user. The Status button calls it with announce: false;
+  # the close sequence calls it with announce: true.
+  - id: send_status_message
+    parameters:
+      announce: bool
+    then:
+      - lambda: |-
+          std::string status_emoji = id(door_is_open).state ? "🟥" : "🟩";
+          std::string status_text = id(door_is_open).state ? "OPEN" : "CLOSED";
+
+          char str[30];
+          time_t currTime = id(global_open_time);
+          strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
+          std::string open_time = std::string(str);
+
+          currTime = id(global_close_time);
+          strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
+          std::string close_time = std::string(str);
+
+          std::string status_message = "*Status: Door is " + status_text + "* " + status_emoji + "\n";
+          status_message += "• Last opened: " + open_time + "\n";
+          status_message += "• Last closed: " + close_time;
+          id(message).publish_state(status_message);
+      - if:
+          condition:
+            lambda: 'return announce;'
+          then:
+            - http_request.post:
+                url: !lambda |-
+                  std::string url = "${telegram_bridge_url}/text/Announce/set?value=";
+                  static const char *hex = "0123456789ABCDEF";
+                  for (unsigned char c : id(message).state) {
+                    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                        c == '.' || c == '~') {
+                      url += (char) c;
+                    } else {
+                      url += '%';
+                      url += hex[c >> 4];
+                      url += hex[c & 0x0F];
+                    }
+                  }
+                  return url;
+                on_response:
+                  - lambda: |-
+                      if (response->status_code != 200)
+                        ESP_LOGE("smart-door", "Announce failed: HTTP %d", response->status_code);
+                on_error:
+                  - lambda: |-
+                      ESP_LOGE("smart-door", "Announce request failed (bridge offline?)");
+
 button:
   # Most components have REST API, read more: https://esphome.io/web-api/#api-rest
   - platform: template
@@ -309,6 +369,11 @@ button:
                 id: servo_ramp_to
                 target: 0.0
             - script.wait: servo_ramp_to
+            # The servo has stopped, so the door is closed. Publish the status
+            # and let the script announce it to the last Telegram user.
+            - script.execute:
+                id: send_status_message
+                announce: true
   - platform: template
     name: Zero
     id: servo_zero
@@ -327,34 +392,18 @@ button:
   # Publishes the current door status as text to the `message` sensor.
   # Exposed on the REST API as: POST http://smart-door.local/button/Status/press
   # followed by GET http://smart-door.local/text_sensor/Message
-  # (Telegram_Bridge does exactly that for /status).
+  # (Telegram_Bridge does exactly that for /status). Manual status is silent;
+  # the close sequence calls the same script with announce: true.
   - platform: template
     name: Status
-    id: send_status_message
+    id: status_button
     icon: "mdi:information-outline"
     web_server:
       sorting_group_id: sorting_group_door_actions
     on_press:
-      then:
-        - text_sensor.template.publish:
-            id: message
-            state: !lambda |-
-              std::string status_emoji = id(door_is_open).state ? "🟥" : "🟩";
-              std::string status_text = id(door_is_open).state ? "OPEN" : "CLOSED";
-
-              char str[30];
-              time_t currTime = id(global_open_time);
-              strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
-              std::string open_time = std::string(str);
-
-              currTime = id(global_close_time);
-              strftime(str, sizeof(str), "%Y-%m-%d %H:%M", localtime(&currTime));
-              std::string close_time = std::string(str);
-
-              std::string message = "*Status: Door is " + status_text + "* " + status_emoji + "\n";
-              message += "• Last opened: " + open_time + "\n";
-              message += "• Last closed: " + close_time;
-              return message;
+      - script.execute:
+          id: send_status_message
+          announce: false
   - platform: restart
     name: "Restart"
     icon: "mdi:restart"

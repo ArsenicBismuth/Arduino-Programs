@@ -6,11 +6,13 @@ matching HTTP request, and send back whatever text the target device produced.
 It exists because `Smart_Door` used to poll Telegram and post status messages
 itself, which competed with the servo control and web server for the ESP32's CPU
 and memory — and needed the bot token. Now the door is Telegram-free: it only
-exposes plain text over its REST API, and this device does all the talking.
+exposes plain text over its REST API and calls the bridge's announcement API,
+and this device does all the talking.
 
 ```
 Telegram  ──getUpdates──▶  telegram-bridge  ──POST──▶  http://smart-door.local/button/Status/press
           ◀──sendMessage──                  ◀──GET───  http://smart-door.local/text_sensor/Message
+                                            ◀──POST──  http://telegram-bridge.local/text/Announce/set?value=...
 ```
 
 ## Files
@@ -27,9 +29,10 @@ Telegram  ──getUpdates──▶  telegram-bridge  ──POST──▶  http:
    Telegram values.
 2. Install the ESPHome CLI: https://esphome.io/guides/getting-started-command-line.html
 3. Flash it: `esphome run telegram-bridge.yaml`
-4. Open http://telegram-bridge.local — the *Last Command* and *Last Result*
-   sensors show what is happening, and *Reset Telegram Offset* re-syncs the
-   bot cursor.
+4. Open http://telegram-bridge.local — the *Last Command*, *Last Result* and
+   *Last Announcement* sensors show what is happening, the *Announce* text
+   entity is the announcement API, and *Reset Telegram Offset* re-syncs the bot
+   cursor.
 
 Getting the `telegram_chat_id`: message the bot once, then run
 `python ../Smart_Door/macro/telegram.py --get-id` (it reads the token from the
@@ -92,6 +95,29 @@ Notes:
 - `.local` names are resolved over mDNS. If a target does not answer, use its
   IP address instead (and give it a static DHCP lease).
 
+## Announcement API
+
+The bridge remembers the **last allowed chat** that interacted with it (the id is
+persisted across reboots). It exposes a text entity that pushes a message to that
+chat:
+
+```
+POST http://telegram-bridge.local/text/Announce/set?value=<url-encoded text>
+```
+
+The value must be URL-encoded (spaces as `%20`, newlines as `%0A`, UTF-8 bytes as
+`%XX`). The text is sent with `parse_mode: Markdown`, so the caller may use
+`*bold*`. If no user has interacted yet, the request is accepted but ignored and
+logged as a warning — nothing is sent to the chats in `telegram_chat_id`
+automatically.
+
+Only chats in `telegram_chat_id` update the remembered id, so door status can
+never be announced to a stranger. `GET /text/Announce` shows the last accepted
+text, and the *Last Announcement* sensor shows the last one Telegram accepted.
+
+The announcement is queued behind any in-flight request, so it never opens a
+second TLS connection.
+
 ## Behaviour
 
 - **One request at a time.** Polling, forwarded commands and replies are
@@ -102,6 +128,12 @@ Notes:
   from any other chat are ignored and logged. Replies and the `/help` menu go
   back to the chat that sent the command. Do not remove this check — the bot
   would otherwise be an open doorbell.
+- **Last user.** Every message or button press from an allowed chat updates
+  `last_user_id`, which is persisted across reboots. The announcement API sends
+  to that chat only.
+- **Announcements.** Text pushed through `/text/Announce/set` is queued and sent
+  after any in-flight request. It is sent as Markdown and is not a reply, so it
+  starts a new message in the chat.
 - **No replay after reboot.** The last handled `update_id` is persisted, so a
   reboot continues where it left off.
 - **No replay after flashing.** On the first poll after a fresh flash the
@@ -122,7 +154,7 @@ Notes:
 
 ## Smart Door side
 
-`Smart_Door` no longer mentions Telegram at all. It just exposes text over its
+`Smart_Door` needs no Telegram token and no chat id. It exposes text over its
 REST API, and this bridge relays it:
 
 - `POST http://smart-door.local/button/Status/press` — puts the current status
@@ -131,15 +163,20 @@ REST API, and this bridge relays it:
   `*Status: Door is OPENING...* 🟥` into the same sensor.
 - `GET http://smart-door.local/text_sensor/Message` — returns the text.
 
-The door needs no Telegram token, no chat id and no `http_request` component;
-its `secrets.yaml` only holds WiFi credentials.
+After a close sequence the door calls its `send_status_message` script with
+`announce: true`, which publishes the status and POSTs that text to this
+bridge's `/text/Announce/set` API, so the last Telegram user receives the status
+without asking. A manual press of the door's *Status* button calls the same
+script with `announce: false`, so it stays silent. This is the only outbound
+request the door makes (`http_request`), and its `secrets.yaml` still only holds
+WiFi credentials.
 
 Mappings used by this bridge:
 
 | Telegram | POST | Then GET |
 | --- | --- | --- |
 | `/open` | `/button/Open/press` | `/text_sensor/Message` (→ "OPENING...") |
-| `/close` | `/button/Close/press` | – (replies `OK: /close`) |
+| `/close` | `/button/Close/press` | – (replies `OK: /close`; door announces status when closed) |
 | `/zero` | `/button/Zero/press` | – (replies `OK: /zero`) |
 | `/status` | `/button/Status/press` | `/text_sensor/Message` (→ full status) |
 
