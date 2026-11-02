@@ -1,0 +1,1122 @@
+# =============================================================================
+#  cam_s3.yaml - Seeed XIAO ESP32S3 Sense (8 MB octal PSRAM) + microSD snapshots
+#
+#  Board-specific sibling of cam.yaml (the AI-Thinker ESP32-CAM build). Same
+#  feature set, different hardware - and, unlike the old board, 8 MB of PSRAM:
+#
+#    [0] Memory             psram (octal, 8 MB) and the camera's memory profile
+#    [1] Device & network   esphome / esp32 / logger / ota / wifi / time / i2c
+#    [2] Camera             esp32_camera, incl. the snapshot-on-image logic
+#    [3] Web                web_server + the MJPEG / snapshot HTTP servers
+#    [4] microSD storage    sd_mmc_card + /file browser + /latest endpoint
+#    [5] Snapshot logic     globals / Save button / Change Score / retention
+#    [6] Controls           Basic | Frame rate | Snapshots | Retention | Advanced | Diagnostics
+#
+# =============================================================================
+
+# =============================================================================
+#  [0] MEMORY (PSRAM)
+# =============================================================================
+# The XIAO ESP32S3 Sense carries an ESP32-S3R8: 8 MB of octal PSRAM next to the
+# 8 MB of flash. `psram:` below turns it on; [2] spends it on the camera.
+#
+# The camera profile is fixed at boot and hardcoded in [2]: two JPEG frame
+# buffers in PSRAM, UXGA-sized. That is the whole point of this board - the
+# sensor can capture while the previous frame is still being streamed, and
+# internal DRAM is left to lwIP and the three HTTP servers.
+#
+# There is deliberately no runtime High/Low switch: the buffer parameters are
+# arguments to esp_camera_init(), so a switch would have to duplicate the [2]
+# values in an on_boot lambda and restart the board to apply them. If you ever
+# do need the old ESP32-CAM arrangement (1 buffer in internal DRAM, VGA), edit
+# [2] to:
+#
+#     frame_buffer_location: DRAM
+#     frame_buffer_count: 1        # CAMERA_GRAB_WHEN_EMPTY
+#     resolution: VGA
+#     jpeg_quality: 30
+#
+# and keep the Resolution control at 640x480 - the buffer is sized once at
+# boot, so anything larger overruns it (the driver drops the truncated frame,
+# which looks like a stalled stream rather than a crash).
+# =============================================================================
+
+# =============================================================================
+#  [1] DEVICE & NETWORK
+# =============================================================================
+esphome:
+  # Different from cam.yaml's `cam` on purpose: the old ESP32-CAM keeps running
+  # on the network, and two devices sharing a name would make OTA and mDNS
+  # ambiguous (and could send the wrong firmware to the wrong board).
+  name: cam-s3
+
+  # Shared helpers used by the lambdas below:
+  #   cam_ctl.h      - cam_sensor() / CAM_SENSOR_OR_RETURN() camera helpers
+  #   cam_snapshot.h - cam_gate::* JPEG change detection and cam_store::* SD helpers
+  includes:
+    - cam_ctl.h
+    - cam_snapshot.h
+
+esp32:
+  board: seeed_xiao_esp32s3   # ESP32-S3R8: 8 MB flash + 8 MB octal PSRAM
+  flash_size: 8MB
+  cpu_frequency: 240MHz       # gives the JPEG web server + change gate some headroom
+  framework:
+    type: esp-idf
+    # The SD card component needs FatFs and VFS directory support, which
+    # ESPHome excludes by default to save flash; re-enable both here.
+    advanced:
+      include_builtin_idf_components: ["fatfs", "spiffs"]
+      disable_vfs_support_dir: false
+    sdkconfig_options:
+      # Long file names, needed for names like snap_20261017_141530.jpg
+      CONFIG_FATFS_LFN_STACK: "y"
+      # The camera no longer competes with lwIP for internal RAM, so this only
+      # matters for bursts (a few parallel HTTP transfers): it lets pbufs spill
+      # into PSRAM instead of failing the allocation. The old 2880-byte TCP
+      # window/buffer workaround from cam.yaml is no longer needed.
+      CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP: "y"
+      # Optional: have the camera DMA write straight into PSRAM. Left off
+      # because it is not reliable on every OV2640/PSRAM combination.
+      # CONFIG_CAMERA_PSRAM_DMA: "y"
+
+# Octal PSRAM, as fitted to the XIAO ESP32S3 (Sense). `ignore_not_found` stays
+# at its default (true) so the board still boots if PSRAM is unavailable - but
+# the camera profile in [2] then fails to allocate, so see the fallback in [0].
+psram:
+  mode: octal
+  speed: 80MHZ
+
+# Enable logging
+logger:
+
+ota:
+  - platform: esphome
+    password: ""
+
+wifi:
+  ssid: "Ab-Apart"
+  password: !secret wifi_password
+
+  # Default modem sleep measured here: 19-170 ms pings, ~26% loss; off: 4-13 ms, ~10%.
+  power_save_mode: none
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Cam S3 Fallback Hotspot"
+    password: !secret ap_password
+
+captive_portal:
+
+# Network time, used to stamp snapshot filenames with local time.
+time:
+  - platform: sntp
+    id: cam_time
+    timezone: Europe/Berlin
+
+i2c:
+  # SCCB for the Sense camera module: SDA = GPIO40, SCL = GPIO39.
+  - id: camera_i2c
+    sda: GPIO40
+    scl: GPIO39
+
+# =============================================================================
+#  [2] CAMERA
+# =============================================================================
+esp32_camera:
+  external_clock:
+    pin: GPIO10
+    frequency: 20MHz
+  i2c_id: camera_i2c
+  # D0..D7 = Y2, Y3, Y4, Y5, Y6, Y7, Y8, Y9 of the Sense expansion board.
+  data_pins: [GPIO15, GPIO17, GPIO18, GPIO16, GPIO14, GPIO12, GPIO11, GPIO48]
+  vsync_pin: GPIO38
+  href_pin: GPIO47
+  pixel_clock_pin: GPIO13
+  # The camera module has no power-down / reset line wired.
+
+  # ⚠️ These are boot-time defaults ⚠️
+  # esp_camera_init() sizes and allocates the frame buffers from these values
+  # once, at boot. The Resolution control in [6] rewrites the sensor registers
+  # live (no allocation), so it can go up to this size but not beyond it.
+  #
+  # A JPEG buffer is sized as width*height/5, so UXGA = ~384 KB, VGA = ~60 KB.
+  frame_buffer_location: PSRAM
+  frame_buffer_count: 2        # 2 + PSRAM: capture continues while streaming
+  resolution: UXGA             # buffer size only; the Resolution control changes the sensor live
+  jpeg_quality: 12             # much sharper than the old 30 now that size is free
+
+  # Image settings
+  name: My Camera
+  id: my_camera
+  aec2: true                   # AEC DSP: better indoor low-light exposure
+
+  # Boot-time orientation
+  vertical_flip: true
+  horizontal_mirror: true
+
+  # Frame rates (see "Max FPS" / "Idle FPS" controls in [6]):
+  #   max_framerate  - cap while the MJPEG stream is open. Two PSRAM buffers
+  #                    feed the stream and the snapshot servers independently,
+  #                    so 10 fps at UXGA is realistic here.
+  #   idle_framerate - background frames when nothing is streaming. The periodic
+  #                    snapshot logic rides these, so this is the effective
+  #                    upper bound on how often a scheduled snapshot is taken.
+  max_framerate: 10 fps
+  idle_framerate: 0.1 fps
+
+  # This is still the only safe way to get a frame: esp32_camera's own
+  # framebuffer task owns the driver's buffers, so calling esp_camera_fb_get()
+  # directly returns nullptr here. Note on_image also fires for the camera's
+  # *idle* frames (~every 10 s, `idle_framerate`), so a periodic snapshot needs
+  # no extra request_image() polling - it piggybacks on frames the camera was
+  # going to take anyway.
+  on_image:
+    then:
+      - lambda: |-
+          const bool manual = id(cam_save_requested);
+          if (manual)
+            id(cam_save_requested) = false;
+
+          // --- scheduled snapshot, unless this is a manual "Save Snapshot" ---
+          if (!manual) {
+            if (!id(cam_auto)->state)
+              return;
+            const uint32_t period_ms = static_cast<uint32_t>(id(cam_period)->state * 1000.0f);
+            const uint32_t now = millis();
+            if (period_ms == 0 || now - id(cam_last_auto_ms) < period_ms)
+              return;
+            id(cam_last_auto_ms) = now;
+
+            // --- change gate: skip frames that look like the last one kept ---
+            if (id(cam_gate_enabled)->state) {
+              const int score = cam_gate::analyze(image.data, image.length);
+              if (score >= 0)
+                id(cam_change_score)->publish_state(score);
+              const float threshold = id(cam_threshold)->state;
+              if (score >= 0 && static_cast<float>(score) < threshold) {
+                ESP_LOGD("cam_snap", "Changed by %d (< %.0f), skipped", score, threshold);
+                return;
+              }
+            }
+          }
+
+          // --- write to /snap/<YYYYMMDD>/<HHMMSS>.jpg plus a /latest.jpg copy ---
+          char path[96];
+          auto t = id(cam_time).now();
+          if (t.is_valid()) {
+            char dir[48];
+            snprintf(dir, sizeof(dir), "/snap/%04d%02d%02d", t.year, t.month, t.day_of_month);
+            if (!id(sd_card)->is_directory(dir)) {
+              if (!id(sd_card)->is_directory("/snap"))
+                id(sd_card)->create_directory("/snap");
+              id(sd_card)->create_directory(dir);
+            }
+            snprintf(path, sizeof(path), "/sdcard%s/%02d%02d%02d.jpg",
+                     dir, t.hour, t.minute, t.second);
+          } else if (manual) {
+            // RTC not synced yet: keep manual saves working with a fallback name.
+            // Leading '0' keeps it sorted before "latest.jpg" for /latest.
+            snprintf(path, sizeof(path), "/sdcard/0nosync_%lu.jpg", (unsigned long) millis());
+          } else {
+            ESP_LOGW("cam_snap", "Time not synced, skipping scheduled snapshot");
+            return;
+          }
+
+          if (cam_store::write_file(path, image.data, image.length)) {
+            cam_store::write_file("/sdcard/latest.jpg", image.data, image.length);
+            cam_gate::commit();
+            ESP_LOGI("cam_snap", "Saved %s (%u bytes, score %d)",
+                     path, (unsigned) image.length, cam_gate::last_score());
+          } else {
+            ESP_LOGE("cam_snap", "Failed to write %s", path);
+          }
+
+# =============================================================================
+#  [3] WEB
+# =============================================================================
+# Browser control UI + REST API (v3). Also hosts the runtime camera controls.
+# cam_stream.js/.css inject a "Camera" panel that opens the :8080 MJPEG stream
+# on demand (button click), so no stream connection is made on page load. They
+# also add a floating "?" button listing the other endpoints: /file, /latest,
+# and the camera servers on :8080 (stream) / :8081 (snapshot).
+#
+# The UI groups entities into named sections using v3 sorting_groups; each
+# entity opts in with its own `web_server: { sorting_group_id, sorting_weight }`
+# block (search for "sorting_group_id" below). Groups sort by `sorting_weight`,
+# entities within a group sort by their `sorting_weight`.
+web_server:
+  version: 3
+  port: 80
+  js_include: cam_stream.js
+  css_include: cam_stream.css
+  sorting_groups:
+    - id: cam_grp_basic
+      name: "Basic"
+      sorting_weight: 10
+    - id: cam_grp_framerate
+      name: "Frame Rate"
+      sorting_weight: 20
+    - id: cam_grp_snapshots
+      name: "Snapshots"
+      sorting_weight: 30
+    - id: cam_grp_retention
+      name: "Retention"
+      sorting_weight: 40
+    - id: cam_grp_advanced
+      name: "Image Processing (Advanced)"
+      sorting_weight: 50
+    - id: cam_grp_diagnostics
+      name: "Diagnostics"
+      sorting_weight: 60
+
+# Serve the camera image directly over HTTP (independent of the web_server UI)
+esp32_camera_web_server:
+  - port: 8080
+    mode: stream
+  - port: 8081
+    mode: snapshot
+
+# =============================================================================
+#  [4] microSD STORAGE
+# =============================================================================
+# SD driver (components/sd_mmc_card), the /file browser (components/sd_file_server,
+# locally patched to stream downloads), and the /latest endpoint
+# (components/latest_snapshot) - see components/README.md.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [sd_mmc_card, sd_file_server, latest_snapshot]
+
+# --- microSD card (SDMMC, 1-bit) ---------------------------------------------
+# XIAO ESP32S3 Sense expansion board: the slot is wired to GPIO7 (CLK),
+# GPIO9 (CMD) and GPIO8 (D0) - the same three wires the board uses in SPI mode
+# (SCK/MOSI/MISO), so 1-bit SDMMC works and is roughly twice as fast as SPI.
+# GPIO21 is the card's CS line in SPI mode and is not used here, which leaves it
+# free for the on-board user LED.
+sd_mmc_card:
+  id: sd_card
+  mode_1bit: true
+  format_if_mount_failed: false   # never auto-format the card
+  clk_pin: GPIO7
+  cmd_pin: GPIO9
+  data0_pin: GPIO8
+
+# Browse/download the card in a browser at http://<host>/file
+# (upload and deletion don't work reliably under the esp-idf framework).
+sd_file_server:
+  id: sd_files
+  url_prefix: file
+  root_path: "/"
+  enable_download: true
+  enable_deletion: true
+  enable_upload: false
+
+# Serve the newest snapshot straight off the card, no UI:
+#   GET http://<host>/latest  ->  newest *.jpg in /sdcard, as image/jpeg
+# Local component in components/latest_snapshot; it streams the file in small chunks so
+# the whole image is never buffered in RAM (see components/README.md -> "Troubleshooting log").
+latest_snapshot:
+  id: latest_snapshot_srv
+  url: /latest
+  root: /sdcard
+  extension: .jpg
+
+# =============================================================================
+#  [5] SNAPSHOT LOGIC
+# =============================================================================
+# The writes themselves happen in esp32_camera's on_image trigger (see [2]); the
+# pieces here are the state it needs plus the manual-save button, the tuning
+# sensor and the retention pass.
+
+globals:
+  - id: cam_save_requested
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  # millis() at the last scheduled (non-manual) snapshot, for the period check.
+  - id: cam_last_auto_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+# --- Manual "Save Snapshot" button -------------------------------------------
+button:
+  - platform: template
+    name: "Save Snapshot"
+    id: cam_save_snapshot
+    icon: mdi:content-save
+    on_press:
+      - lambda: |-
+          id(cam_save_requested) = true;
+          id(my_camera)->request_image(camera::IDLE);
+    web_server:
+      sorting_group_id: cam_grp_snapshots
+      sorting_weight: 10
+  - platform: restart
+    name: "Restart"
+    id: cam_restart
+    icon: "mdi:restart"
+    entity_category: diagnostic
+
+# --- Change score (for tuning the gate) --------------------------------------
+sensor:
+  # Mean luma difference of the newest frame vs. the last kept one (0..255).
+  # Useful for tuning "Change Threshold": watch it while something moves.
+  - platform: template
+    name: "Change Score"
+    id: cam_change_score
+    icon: mdi:image-filter-center-focus
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+    web_server:
+      sorting_group_id: cam_grp_snapshots
+      sorting_weight: 40
+  - platform: debug
+    free:
+      name: "Heap Free"
+      unit_of_measurement: "B" # B for Bytes
+      icon: "mdi:memory"
+      web_server:
+        sorting_group_id: cam_grp_diagnostics
+        sorting_weight: 10
+    psram:
+      name: "PSRAM Free"
+      unit_of_measurement: "B"
+      icon: "mdi:memory"
+      web_server:
+        sorting_group_id: cam_grp_diagnostics
+        sorting_weight: 20
+
+# Enables the ability to read debug information.
+debug:
+  update_interval: 1min # How often to check the memory.
+
+# --- Retention ---------------------------------------------------------------
+# Once a day, delete files older than the retention window (age from the FAT
+# mtime), then drop empty day folders. The pass drains in bounded 100-file
+# batches so a big backlog can't stall the main loop in one go, but gives up
+# after 2000 files so the worst case stays bounded. Note this runs regardless
+# of the "Auto Snapshot" switch, and (like any ESPHome interval) first fires
+# ~24 h after boot - a device rebooted more often than that never prunes.
+interval:
+  - interval: 24h
+    then:
+      - lambda: |-
+          const int days = (int) id(cam_retention_days)->state;
+          int total = 0;
+          int n;
+          do {
+            n = cam_store::prune("/sdcard/snap", days, 100);
+            total += n;
+          } while (n == 100 && total < 2000);
+          if (total > 0)
+            ESP_LOGI("cam_snap", "Pruned %d old snapshot(s)", total);
+
+# =============================================================================
+#  [6] CONTROLS
+#  Entities are grouped as: Basic -> Frame rate -> Snapshots -> Retention ->
+#  Advanced image -> Diagnostics.
+#  Each entity's `web_server.sorting_group_id` selects its UI section and
+#  `sorting_weight` orders it inside that section.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  Selects
+# -----------------------------------------------------------------------------
+select:
+  # --- Basic ------------------------------------------------------------------
+  # Resolution selector. `resolution:` in [2] only sizes the boot buffer; this
+  # rewrites the sensor registers live (no allocation), which is why it can go up
+  # to the boot buffer's resolution without a restart.
+  - platform: template
+    name: "Resolution"
+    id: cam_resolution
+    icon: mdi:aspect-ratio
+    entity_category: config
+    optimistic: true
+    initial_option: "1600x1200"
+    options:
+      - "160x120"    # QQVGA
+      - "320x240"    # QVGA
+      - "400x296"    # CIF
+      - "640x480"    # VGA
+      - "800x600"    # SVGA
+      - "1024x768"   # XGA
+      - "1280x1024"  # SXGA
+      - "1600x1200"  # UXGA
+    set_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          framesize_t f = FRAMESIZE_VGA;
+          if      (x == "160x120") f = FRAMESIZE_QQVGA;
+          else if (x == "320x240") f = FRAMESIZE_QVGA;
+          else if (x == "400x296") f = FRAMESIZE_CIF;
+          else if (x == "640x480") f = FRAMESIZE_VGA;
+          else if (x == "800x600") f = FRAMESIZE_SVGA;
+          else if (x == "1024x768") f = FRAMESIZE_XGA;
+          else if (x == "1280x1024") f = FRAMESIZE_SXGA;
+          else if (x == "1600x1200") f = FRAMESIZE_UXGA;
+          s->set_framesize(s, f);
+          ESP_LOGI("cam_ctl", "Resolution -> %s", x.c_str());
+    web_server:
+      sorting_group_id: cam_grp_basic
+      sorting_weight: 10
+
+  # --- Advanced image (rarely used) ------------------------------------------
+  # White balance mode
+  - platform: template
+    name: "White Balance Mode"
+    id: cam_wb_mode
+    icon: mdi:white-balance-auto
+    entity_category: config
+    optimistic: true
+    initial_option: "Auto"
+    options:
+      - "Auto"    # 0
+      - "Sunny"   # 1
+      - "Cloudy"  # 2
+      - "Office"  # 3
+      - "Home"    # 4
+    set_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          int m = 0;
+          if      (x == "Sunny")  m = 1;
+          else if (x == "Cloudy") m = 2;
+          else if (x == "Office") m = 3;
+          else if (x == "Home")   m = 4;
+          s->set_wb_mode(s, m);
+          ESP_LOGI("cam_ctl", "WB mode -> %s", x.c_str());
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 80
+
+  # AGC gain ceiling
+  - platform: template
+    name: "Gain Ceiling"
+    id: cam_gain_ceiling
+    icon: mdi:signal
+    entity_category: config
+    optimistic: true
+    initial_option: "2X"
+    options:
+      - "2X"
+      - "4X"
+      - "8X"
+      - "16X"
+      - "32X"
+      - "64X"
+      - "128X"
+    set_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          gainceiling_t g = GAINCEILING_2X;
+          if      (x == "4X")   g = GAINCEILING_4X;
+          else if (x == "8X")   g = GAINCEILING_8X;
+          else if (x == "16X")  g = GAINCEILING_16X;
+          else if (x == "32X")  g = GAINCEILING_32X;
+          else if (x == "64X")  g = GAINCEILING_64X;
+          else if (x == "128X") g = GAINCEILING_128X;
+          s->set_gainceiling(s, g);
+          ESP_LOGI("cam_ctl", "Gain ceiling -> %s", x.c_str());
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 90
+
+  # Special effect
+  - platform: template
+    name: "Special Effect"
+    id: cam_special_effect
+    icon: mdi:magic-staff
+    entity_category: config
+    optimistic: true
+    initial_option: "None"
+    options:
+      - "None"
+      - "Negative"
+      - "Grayscale"
+      - "Red Tint"
+      - "Green Tint"
+      - "Blue Tint"
+      - "Sepia"
+    set_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          int e = 0;
+          if      (x == "Negative")   e = 1;
+          else if (x == "Grayscale")  e = 2;
+          else if (x == "Red Tint")   e = 3;
+          else if (x == "Green Tint") e = 4;
+          else if (x == "Blue Tint")  e = 5;
+          else if (x == "Sepia")      e = 6;
+          s->set_special_effect(s, e);
+          ESP_LOGI("cam_ctl", "Special effect -> %s", x.c_str());
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 100
+
+# -----------------------------------------------------------------------------
+#  Numbers
+# -----------------------------------------------------------------------------
+number:
+  # --- Frame rate -------------------------------------------------------------
+  # `max_framerate` cap while the MJPEG stream is open. Written live via
+  # set_max_update_interval(); the sensor tops out well below 60 at higher
+  # resolutions, so treat 60 as the accepted ceiling, not a promise.
+  - platform: template
+    name: "Max FPS"
+    id: cam_max_fps
+    icon: mdi:speedometer
+    unit_of_measurement: fps
+    entity_category: config
+    optimistic: true
+    mode: box
+    min_value: 1
+    max_value: 60
+    step: 1
+    initial_value: 10
+    set_action:
+      - lambda: |-
+          id(my_camera)->set_max_update_interval((uint32_t) (1000.0f / x));
+          ESP_LOGI("cam_ctl", "Max FPS -> %.0f", x);
+    web_server:
+      sorting_group_id: cam_grp_framerate
+      sorting_weight: 10
+
+  # Background frame rate. This is the cadence the periodic snapshot rides on,
+  # so raising it lets "Snapshot Period" actually fire more often (down to the
+  # period you set in the Snapshots group below).
+  - platform: template
+    name: "Idle FPS"
+    id: cam_idle_fps
+    icon: mdi:timer-sand
+    unit_of_measurement: fps
+    entity_category: config
+    optimistic: true
+    mode: box
+    min_value: 0.1
+    max_value: 1
+    step: 0.1
+    initial_value: 0.1
+    set_action:
+      - lambda: |-
+          id(my_camera)->set_idle_update_interval((uint32_t) (1000.0f / x));
+          ESP_LOGI("cam_ctl", "Idle FPS -> %.1f", x);
+    web_server:
+      sorting_group_id: cam_grp_framerate
+      sorting_weight: 20
+
+  # --- Snapshots --------------------------------------------------------------
+  # Minimum spacing between scheduled snapshots. The effective rate is also
+  # bounded by "Idle FPS" above (a snapshot can't be taken faster than frames
+  # arrive), and the change gate can skip frames that are too similar.
+  - platform: template
+    name: "Snapshot Period"
+    id: cam_period
+    icon: mdi:timer-outline
+    unit_of_measurement: s
+    entity_category: config
+    optimistic: true
+    mode: box
+    min_value: 2
+    max_value: 3600
+    step: 1
+    initial_value: 10
+    web_server:
+      sorting_group_id: cam_grp_snapshots
+      sorting_weight: 50
+
+  # Mean luma difference (0..255) below which a frame is considered "the same"
+  # and not written. Watch the "Change Score" sensor to tune this.
+  - platform: template
+    name: "Change Threshold"
+    id: cam_threshold
+    icon: mdi:delta
+    entity_category: config
+    optimistic: true
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 10
+    web_server:
+      sorting_group_id: cam_grp_snapshots
+      sorting_weight: 60
+
+  # --- Retention --------------------------------------------------------------
+  # Snapshots older than this are deleted by the retention pass in [5].
+  - platform: template
+    name: "Retention Days"
+    id: cam_retention_days
+    icon: mdi:calendar-remove
+    unit_of_measurement: d
+    entity_category: config
+    optimistic: true
+    mode: box
+    min_value: 1
+    max_value: 90
+    step: 1
+    initial_value: 7
+    web_server:
+      sorting_group_id: cam_grp_retention
+      sorting_weight: 10
+
+  # --- Advanced image (rarely used) ------------------------------------------
+  # Compression (JPEG quality): higher = more compression. 12 is sharp; the
+  # low end of the range relies on the PSRAM buffer being large enough for a
+  # UXGA frame.
+  - platform: template
+    name: "Compression"
+    id: cam_compression
+    icon: mdi:image-size-select-small
+    entity_category: config
+    optimistic: true
+    mode: slider
+    min_value: 6
+    max_value: 63
+    step: 1
+    initial_value: 12
+    set_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_quality(s, (int) x);
+          ESP_LOGI("cam_ctl", "Compression -> %d", (int) x);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 10
+
+  # Image sliders (OV2640 range -2..2)
+  - platform: template
+    name: "Brightness"
+    id: cam_brightness
+    icon: mdi:brightness-6
+    entity_category: config
+    optimistic: true
+    mode: slider
+    min_value: -2
+    max_value: 2
+    step: 1
+    initial_value: 0
+    set_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_brightness(s, (int) x);
+          ESP_LOGI("cam_ctl", "Brightness -> %d", (int) x);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 20
+
+  - platform: template
+    name: "Contrast"
+    id: cam_contrast
+    icon: mdi:contrast-box
+    entity_category: config
+    optimistic: true
+    mode: slider
+    min_value: -2
+    max_value: 2
+    step: 1
+    initial_value: 0
+    set_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_contrast(s, (int) x);
+          ESP_LOGI("cam_ctl", "Contrast -> %d", (int) x);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 30
+
+  - platform: template
+    name: "Saturation"
+    id: cam_saturation
+    icon: mdi:palette
+    entity_category: config
+    optimistic: true
+    mode: slider
+    min_value: -2
+    max_value: 2
+    step: 1
+    initial_value: 0
+    set_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_saturation(s, (int) x);
+          ESP_LOGI("cam_ctl", "Saturation -> %d", (int) x);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 40
+
+  # Exposure Value / Gain only take effect when "Auto Exposure (AEC)" /
+  # "Auto Gain (AGC)" are switched OFF (see the switches below).
+  - platform: template
+    name: "Exposure Value"
+    id: cam_aec_value
+    icon: mdi:camera-iris
+    entity_category: config
+    optimistic: true
+    mode: slider
+    min_value: 0
+    max_value: 1200
+    step: 1
+    initial_value: 300
+    set_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_aec_value(s, (int) x);
+          ESP_LOGI("cam_ctl", "Exposure value -> %d", (int) x);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 50
+
+  - platform: template
+    name: "Exposure Level"
+    id: cam_ae_level
+    icon: mdi:brightness-auto
+    entity_category: config
+    optimistic: true
+    mode: slider
+    min_value: -2
+    max_value: 2
+    step: 1
+    initial_value: 0
+    set_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_ae_level(s, (int) x);
+          ESP_LOGI("cam_ctl", "AE level -> %d", (int) x);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 60
+
+  - platform: template
+    name: "Gain"
+    id: cam_agc_gain
+    icon: mdi:signal-variant
+    entity_category: config
+    optimistic: true
+    mode: slider
+    min_value: 0
+    max_value: 30
+    step: 1
+    initial_value: 0
+    set_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_agc_gain(s, (int) x);
+          ESP_LOGI("cam_ctl", "Gain -> %d", (int) x);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 70
+
+# -----------------------------------------------------------------------------
+#  Switches
+# -----------------------------------------------------------------------------
+switch:
+  # --- Basic ------------------------------------------------------------------
+  # Mirror H / V drive the sensor directly (instead of
+  # id(my_camera).update_camera_parameters()) so they don't reset the
+  # brightness/contrast/WB/... values set from the controls every time you flip.
+  - platform: template
+    name: "Mirror Horizontal"
+    id: cam_hmirror
+    icon: mdi:flip-horizontal
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF   # matches init config above
+    turn_on_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_hmirror(s, 1);
+    turn_off_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_hmirror(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_basic
+      sorting_weight: 20
+
+  - platform: template
+    name: "Mirror Vertical"
+    id: cam_vflip
+    icon: mdi:flip-vertical
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF   # matches init config above
+    turn_on_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_vflip(s, 1);
+    turn_off_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_vflip(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_basic
+      sorting_weight: 30
+
+  # --- Snapshots --------------------------------------------------------------
+  - platform: template
+    name: "Auto Snapshot"
+    id: cam_auto
+    icon: mdi:camera-timer
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: cam_grp_snapshots
+      sorting_weight: 20
+
+  # When on, frames whose "Change Score" is below "Change Threshold" are
+  # skipped instead of written, so a static scene doesn't fill the card.
+  - platform: template
+    name: "Change Gate"
+    id: cam_gate_enabled
+    icon: mdi:compare
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: cam_grp_snapshots
+      sorting_weight: 30
+
+  # --- Advanced image (rarely used) ------------------------------------------
+  # Auto exposure / gain / white balance. restore_mode defaults below mirror the
+  # OV2640 power-on defaults.
+  - platform: template
+    name: "Auto Exposure (AEC)"
+    id: cam_aec
+    icon: mdi:camera-iris
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_exposure_ctrl(s, 1);
+    turn_off_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_exposure_ctrl(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 110
+
+  - platform: template
+    name: "Auto Gain (AGC)"
+    id: cam_agc
+    icon: mdi:tune-variant
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_gain_ctrl(s, 1);
+    turn_off_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_gain_ctrl(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 120
+
+  - platform: template
+    name: "Auto White Balance (AWB)"
+    id: cam_awb
+    icon: mdi:white-balance-auto
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_whitebal(s, 1);
+    turn_off_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_whitebal(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 130
+
+  # Advanced sensor toggles (rarely needed)
+  - platform: template
+    name: "AEC DSP (AEC2)"
+    id: cam_aec2
+    icon: mdi:auto-fix
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_aec2(s, 1);
+    turn_off_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_aec2(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 140
+
+  - platform: template
+    name: "AWB Gain"
+    id: cam_awb_gain
+    icon: mdi:white-balance-sunny
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_awb_gain(s, 1);
+    turn_off_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_awb_gain(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 150
+
+  - platform: template
+    name: "Black Pixel Correction (BPC)"
+    id: cam_bpc
+    icon: mdi:circle-off-outline
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_bpc(s, 1);
+    turn_off_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_bpc(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 160
+
+  - platform: template
+    name: "White Pixel Correction (WPC)"
+    id: cam_wpc
+    icon: mdi:circle-outline
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_wpc(s, 1);
+    turn_off_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_wpc(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 170
+
+  - platform: template
+    name: "Lens Correction (LENC)"
+    id: cam_lenc
+    icon: mdi:camera-iris
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_lenc(s, 1);
+    turn_off_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_lenc(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 180
+
+  - platform: template
+    name: "Downsize (DCW)"
+    id: cam_dcw
+    icon: mdi:image-size-select-large
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_dcw(s, 1);
+    turn_off_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_dcw(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 190
+
+  - platform: template
+    name: "RAW Gamma (GMA)"
+    id: cam_raw_gma
+    icon: mdi:brightness-5
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_raw_gma(s, 1);
+    turn_off_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_raw_gma(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 200
+
+  - platform: template
+    name: "Test Pattern"
+    id: cam_test_pattern
+    icon: mdi:test-tube
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_colorbar(s, 1);
+    turn_off_action:
+      - lambda: |-
+          CAM_SENSOR_OR_RETURN();
+          s->set_colorbar(s, 0);
+    web_server:
+      sorting_group_id: cam_grp_advanced
+      sorting_weight: 210
+
+# -----------------------------------------------------------------------------
+#  On-board user LED (Basic)
+# -----------------------------------------------------------------------------
+# The XIAO ESP32S3 Sense has a single user LED on GPIO21, active LOW. On the
+# Sense expansion board GPIO21 is also the microSD card's CS line, but the card
+# runs 1-bit SDMMC above, which does not drive CS - so the LED stays usable.
+output:
+  - platform: ledc
+    pin:
+      number: GPIO21
+      inverted: true        # user LED lights when the pin is low
+    id: flash_led_pwm
+    frequency: 1000Hz
+
+light:
+  - platform: monochromatic
+    name: "User LED"
+    id: cam_flash_led
+    output: flash_led_pwm
+    icon: mdi:led-outline
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+    default_transition_length: 0s
+    web_server:
+      sorting_group_id: cam_grp_basic
+      sorting_weight: 40
