@@ -4,11 +4,44 @@
 > `esphome run cam.yaml`. (`python`/`pip` are not on PATH outside that env.)
 
 `latest_snapshot/` is the local component described below; the rest of this directory is
-the SD card driver and file server that `cam.yaml` includes.
+the SD card driver and file server that `common/cam_common.yaml` includes for both
+builds.
 
 ## Board variants: `cam.yaml` and `cam_s3.yaml`
 
-Two builds share the components in this directory:
+Two builds share the components in this directory, and share their YAML too:
+
+| File | Role |
+| --- | --- |
+| `cam.yaml` | AI-Thinker board file: substitutions + the blocks that differ |
+| `cam_s3.yaml` | XIAO board file: same shape, different values |
+| `common/cam_common.yaml` | The ~800 lines that are identical: camera logic, web UI, storage, every control |
+
+The board files import the shared one as an ESPHome **package**:
+
+```yaml
+packages:
+  - !include common/cam_common.yaml
+```
+
+Package merging is deep: mappings merge key by key, lists concatenate (package
+entries first), and the board file always wins. So `cam_s3.yaml` adds
+`esp32_camera:` pins and a buffer profile on top of the shared camera block, and
+appends a sixth `web_server` group plus its memory sensors - without restating
+anything. It lives in `common/` so the ESPHome dashboard (which only lists
+`*.yaml` at the top level) doesn't offer it as a "device" that can't build.
+
+Editing rules:
+
+- Shared behaviour (snapshot logic, controls, UI, storage) → `common/cam_common.yaml`.
+- Anything board-specific → a `${substitution}` in `cam_common.yaml`, value in
+  each board file's `substitutions:` table (identity, pins, LED, camera defaults).
+- Whole blocks that only one board has (`psram`, `on_boot`, the Diagnostics
+  group) → straight into that board file.
+
+To add a third board: copy a board file, change the substitution values, and
+override only what the new hardware really does differently. Nothing in
+`common/` needs touching.
 
 | | `cam.yaml` | `cam_s3.yaml` |
 | --- | --- | --- |
@@ -47,11 +80,11 @@ arguments to `esp_camera_init()`, i.e. fixed at boot, so a switch could only wor
 by duplicating the `esp32_camera:` values in an `on_boot` lambda and restarting
 the board - two copies of the same config that can drift apart. To get the old
 DRAM/VGA arrangement back, edit the `frame_buffer_location` / `frame_buffer_count`
-/ `resolution` / `jpeg_quality` keys in the `esp32_camera:` block directly (the
-values are listed in the `[0]` comment at the top of `cam_s3.yaml`) and keep the
-Resolution control at 640x480, since anything larger overruns the boot-sized
-buffer. A truncated frame is dropped by the driver, so it shows up as a stalled
-stream rather than a crash.
+/ `resolution` / `jpeg_quality` keys in the `esp32_camera:` block of
+`cam_s3.yaml` (the fallback values are spelled out in the comment right below
+them) and keep the Resolution control at 640x480, since anything larger overruns
+the boot-sized buffer. A truncated frame is dropped by the driver, so it shows up
+as a stalled stream rather than a crash.
 
 `PSRAM Free` / `Heap Free` in the Diagnostics group show whether PSRAM actually
 came up; the `psram` component also logs `PSRAM: Available: YES, Size: 8192 KB`
