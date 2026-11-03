@@ -1,0 +1,152 @@
+﻿# =============================================================================
+#  cam_s3.yaml - Seeed XIAO ESP32S3 Sense (8 MB octal PSRAM) + microSD snapshots
+#
+#  This is the board-specific half. Everything it shares with cam.yaml lives in
+#  common/cam_common.yaml, imported as a package below: ESPHome merges packages
+#  deeply (mappings merge, lists concatenate, this file wins), so the shared
+#  file supplies the camera logic, the web UI, the storage stack and all the
+#  controls, and this file only carries what differs.
+#
+#    substitutions   every value cam_common.yaml asks for
+#    [1] device      esphome name, esp32 target, psram
+#    [2] camera      pin map + the PSRAM memory profile
+#    [3] web         one extra UI group (Diagnostics)
+#    [5] diagnostics Heap Free / PSRAM Free
+# =============================================================================
+
+# =============================================================================
+#  SUBSTITUTIONS
+# =============================================================================
+# The board's whole personality in one place. cam_common.yaml refers to these
+# as ${...}; keep the keys and change only the values when adapting a new board.
+substitutions:
+  # --- identity ---------------------------------------------------------------
+  # Different from cam.yaml's `cam` on purpose: the old ESP32-CAM keeps running
+  # on the network, and two devices sharing a name would make OTA and mDNS
+  # ambiguous (and could send the wrong firmware to the wrong board).
+  dev_name: cam-s3
+  ap_ssid: "Cam S3 Fallback Hotspot"
+
+  # --- pin map ----------------------------------------------------------------
+  i2c_sda: GPIO40            # SCCB SDA
+  i2c_scl: GPIO39            # SCCB SCL
+  sd_clk: GPIO7              # microSD, 1-bit SDMMC
+  sd_cmd: GPIO9
+  sd_d0: GPIO8
+  led_pin: GPIO21            # on-board user LED (also the card's SPI CS, unused here)
+  led_inverted: "true"       # this LED lights when the pin is low
+  led_name: "User LED"
+  led_icon: mdi:led-outline
+
+  # --- camera defaults --------------------------------------------------------
+  # PSRAM to spare, so the controls start at their sharpest: UXGA boot buffer,
+  # JPEG quality 12, 10 fps.
+  resolution_initial: "1600x1200"
+  compression_initial: 12
+  max_fps: 10
+
+packages:
+  - !include common/cam_common.yaml
+
+# =============================================================================
+#  [1] DEVICE & NETWORK
+# =============================================================================
+esphome:
+  name: ${dev_name}
+
+esp32:
+  board: seeed_xiao_esp32s3   # ESP32-S3R8: 8 MB flash + 8 MB octal PSRAM
+  flash_size: 8MB
+  cpu_frequency: 240MHz       # gives the JPEG web server + change gate some headroom
+  framework:
+    sdkconfig_options:
+      # The camera no longer competes with lwIP for internal RAM, so this only
+      # matters for bursts (a few parallel HTTP transfers): it lets pbufs spill
+      # into PSRAM instead of failing the allocation. The old 2880-byte TCP
+      # window/buffer workaround from cam.yaml is no longer needed.
+      CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP: "y"
+      # Optional: have the camera DMA write straight into PSRAM. Left off
+      # because it is not reliable on every OV2640/PSRAM combination.
+      # CONFIG_CAMERA_PSRAM_DMA: "y"
+
+# Octal PSRAM, as fitted to the XIAO ESP32S3 (Sense). `ignore_not_found` stays
+# at its default (true) so the board still boots if PSRAM is unavailable - but
+# the camera profile in [2] then fails to allocate, so see the fallback there.
+psram:
+  mode: octal
+  speed: 80MHZ
+
+# =============================================================================
+#  [2] CAMERA
+# =============================================================================
+# Only the pin map and the memory profile are board-specific; the rest of the
+# camera block (name, id, AEC2, orientation, idle rate, on_image) arrives from
+# cam_common.yaml.
+esp32_camera:
+  external_clock:
+    pin: GPIO10
+    frequency: 20MHz
+  # D0..D7 = Y2, Y3, Y4, Y5, Y6, Y7, Y8, Y9 of the Sense expansion board.
+  data_pins: [GPIO15, GPIO17, GPIO18, GPIO16, GPIO14, GPIO12, GPIO11, GPIO48]
+  vsync_pin: GPIO38
+  href_pin: GPIO47
+  pixel_clock_pin: GPIO13
+  # The camera module has no power-down / reset line wired.
+
+  # ⚠️ These are boot-time defaults ⚠️
+  # esp_camera_init() sizes and allocates the frame buffers from these values
+  # once, at boot. The Resolution control in [6] rewrites the sensor registers
+  # live (no allocation), so it can go up to this size but not beyond it.
+  #
+  # A JPEG buffer is sized as width*height/5, so UXGA = ~384 KB, VGA = ~60 KB.
+  # Two PSRAM buffers are what this board has that the AI-Thinker doesn't: the
+  # sensor keeps capturing while the previous frame is still being streamed, and
+  # internal DRAM stays free for lwIP and the HTTP servers.
+  frame_buffer_location: PSRAM
+  frame_buffer_count: 2        # 2 + PSRAM: capture continues while streaming
+  resolution: UXGA             # buffer size only; the Resolution control changes the sensor live
+  jpeg_quality: 12             # much sharper than the old 30 now that size is free
+  max_framerate: ${max_fps} fps
+
+  # There is deliberately no runtime High/Low switch: these four values are
+  # arguments to esp_camera_init(), so a switch could only work by duplicating
+  # them in an on_boot lambda and restarting the board. To get the old
+  # DRAM/VGA arrangement back (e.g. a board whose PSRAM is dead), change them
+  # here - and keep the Resolution control at 640x480, because anything larger
+  # overruns the boot-sized buffer (the driver drops the truncated frame, which
+  # looks like a stalled stream rather than a crash).
+
+# =============================================================================
+#  [3] WEB
+# =============================================================================
+# Appended to the shared web_server block: Basic / Frame Rate / Snapshots /
+# Retention / Advanced come from cam_common.yaml, this adds a sixth group for
+# the memory counters below (list order is preserved, so weights still sort it).
+web_server:
+  sorting_groups:
+    - id: cam_grp_diagnostics
+      name: "Diagnostics"
+      sorting_weight: 60
+
+# =============================================================================
+#  [5] DIAGNOSTICS
+# =============================================================================
+# Appended to the shared `sensor:` list (Change Score). These are the numbers
+# that tell you whether PSRAM actually came up: with the camera in PSRAM, "Heap
+# Free" stays around 200 KB (internal) and "PSRAM Free" around 7.6 MB.
+sensor:
+  - platform: debug
+    free:
+      name: "Heap Free"
+      unit_of_measurement: "B" # B for Bytes
+      icon: "mdi:memory"
+      web_server:
+        sorting_group_id: cam_grp_diagnostics
+        sorting_weight: 10
+    psram:
+      name: "PSRAM Free"
+      unit_of_measurement: "B"
+      icon: "mdi:memory"
+      web_server:
+        sorting_group_id: cam_grp_diagnostics
+        sorting_weight: 20
