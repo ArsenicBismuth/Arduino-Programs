@@ -45,6 +45,13 @@ substitutions:
   compression_initial: 12
   max_fps: 10
 
+  # --- camera sensor ----------------------------------------------------------
+  # This XIAO Sense has an OV3660 fitted (not the stock OV2640), so the shared
+  # AGC gain-ceiling repair in cam_common.yaml runs for it too. OV2640 boards set
+  # this to "ov2640" and skip the repair.
+  cam_sensor: "ov3660"
+  agc_ceiling_initial: "16X"
+
 packages:
   - !include common/cam_common.yaml
 
