@@ -5,6 +5,13 @@ substitutions:
     # No battery: Auto-close on power.
     # Battery: Close on door sensor.
   servo_acceleration: 100  # Ramp speed in servo_number units per second (-100..100 scale)
+  # Servo presets (select "Servo Preset"). target = rotation amount,
+  # duration = seconds the key stays rotated. Only applied when the user picks
+  # a preset; the individual numbers keep their own value across restarts.
+  preset_fast_target: 100
+  preset_fast_duration: 6
+  preset_quiet_target: 30
+  preset_quiet_duration: 10
   # Child safety: the physical button only opens the door when double-pressed.
   double_press_window: 250ms  # Max gap between first release and second press
   press_max_length: 250ms     # Holds longer than this are not counted as a press
@@ -25,25 +32,9 @@ esphome:
               - button.press: door_close
               # If it's completely open = power disconnected.
               # If it's partially open = power connected but sensor says open.
-    - priority: 200
-      then: # Apply the selected preset (Fast/Quiet) on boot
-        - if:
-            condition:
-              lambda: 'return id(servo_preset).state == "Fast";'
-            then:
-              - number.set:
-                  id: servo_target
-                  value: 100
-              - number.set:
-                  id: servo_duration
-                  value: 6
-            else:
-              - number.set:
-                  id: servo_target
-                  value: 25
-              - number.set:
-                  id: servo_duration
-                  value: 10
+    # NOTE: Do not re-apply the servo preset here. The preset select and both
+    # numbers (servo_target/servo_duration) restore their values from flash,
+    # so writing the preset constants on boot would discard manual tweaks.
 
 esp32:
   board: nodemcu-32s
@@ -162,17 +153,17 @@ select:
             then:
               - number.set:
                   id: servo_target
-                  value: 100
+                  value: ${preset_fast_target}
               - number.set:
                   id: servo_duration
-                  value: 6
+                  value: ${preset_fast_duration}
             else:
               - number.set:
                   id: servo_target
-                  value: 25
+                  value: ${preset_quiet_target}
               - number.set:
                   id: servo_duration
-                  value: 10
+                  value: ${preset_quiet_duration}
 
 number:
   - platform: template
@@ -181,8 +172,8 @@ number:
     icon: "mdi:timer-sand"
     min_value: 1
     restore_value: true
-    initial_value: 6
-    max_value: 10
+    initial_value: ${preset_fast_duration}
+    max_value: 12
     step: 0.5
     optimistic: true
     web_server:
@@ -194,7 +185,7 @@ number:
     icon: "mdi:arrow-expand-horizontal"
     min_value: 1
     restore_value: true
-    initial_value: 100
+    initial_value: ${preset_fast_target}
     max_value: 100
     step: 1
     optimistic: true

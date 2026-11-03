@@ -47,3 +47,14 @@ announcement to the last Telegram user that interacted with it. Change
 The text is Telegram-Markdown (`*Status: ...*`), so the bridge sends it with
 `parse_mode: Markdown`. Anything that can do an HTTP GET can read it — the
 telemetry is not tied to Telegram.
+
+## Servo settings persistence
+
+`Servo Preset`, `Servo Target` and `Servo Rotation Duration` all use
+`restore_value: true`, so whatever value was last set survives a restart or a
+power loss. The preset only writes the target/duration numbers when you pick
+it, and nothing re-applies the preset on boot (by design, so manual tweaks are
+not overwritten). `Servo Control` is deliberately *not* restored and always
+comes up at `0`, so the servo never starts moving on power-up. The preset
+values themselves live in `substitutions:` (`preset_fast_*`, `preset_quiet_*`);
+if you change them, re-select the preset once after flashing to apply them.
