@@ -41,6 +41,26 @@ esphome:
     - cam_ctl.h
     - cam_snapshot.h
 
+  # Repair the AGC gain ceiling once the camera component is initialised.
+  # esp32_camera always calls set_gainceiling() with `agc_gain_ceiling:` (default
+  # "2X" = enum step 0). On the OV3660/OV5640 that step is written raw into
+  # 0x3A18/0x3A19, which is a Q4.4 ceiling there - step 0 becomes 0x0000, below
+  # unity, which pins AGC at minimum gain and underexposes every frame. Restore
+  # the sensor's own 15.5x default instead. Boards with `cam_sensor: "ov2640"`
+  # skip it: there the enum *is* the COM9 value and 2X is correct.
+  # priority -100.0 runs after every component (incl. the camera) is set up.
+  on_boot:
+    - priority: -100.0
+      then:
+        - lambda: |-
+            sensor_t *s = esp_camera_sensor_get();
+            if (s == nullptr)
+              return;
+            if (cam_sensor_uses_q44_ceiling("${cam_sensor}")) {
+              cam_gain_ceiling_q44(s, 0xF8);  // Q4.4: 15.5x
+              ESP_LOGI("cam_ctl", "AGC gain ceiling -> 15.5x (0x3A18/0x3A19)");
+            }
+
 # Only the framework wiring is shared. Each board file sets `board:` (plus
 # flash_size / cpu_frequency / psram on the S3) and adds its own sdkconfig keys
 # next to the ones below.
@@ -429,33 +449,52 @@ select:
       sorting_group_id: cam_grp_advanced
       sorting_weight: 80
 
-  # AGC gain ceiling
+  # AGC gain ceiling.
+  # The 2X..128X labels are the gainceiling_t steps ESPHome uses for its
+  # `agc_gain_ceiling:` option, but the two sensor families encode them
+  # differently:
+  #   OV2640  - the step goes into COM9 bits 5..7, so s->set_gainceiling() is
+  #             exactly right and 2X means a real 2x ceiling.
+  #   OV3660/ - 0x3A18/0x3A19 is a Q4.4 ceiling: 0x10 = 1x, 0x20 = 2x, 0xF8 =
+  #   OV5640    15.5x, and the register tops out at 0x3FF = 63.9x. Writing the raw
+  #             step there makes "2X" come out as 0x0000 - below unity - which
+  #             pins AGC at minimum gain and underexposes every frame. So map the
+  #             step to its actual gain instead: cam_gain_ceiling_q44().
+  # Which branch runs comes from the board file's `cam_sensor` substitution. The
+  # actual boot value (15.5x) comes from the on_boot hook in [1];
+  # `agc_ceiling_initial` in the board file only picks the step shown here.
   - platform: template
     name: "Gain Ceiling"
     id: cam_gain_ceiling
     icon: mdi:signal
     entity_category: config
     optimistic: true
-    initial_option: "2X"
+    initial_option: "${agc_ceiling_initial}"
     options:
-      - "2X"
-      - "4X"
-      - "8X"
-      - "16X"
-      - "32X"
-      - "64X"
-      - "128X"
+      - "2X"       # 0x020 = 2x
+      - "4X"       # 0x040 = 4x
+      - "8X"       # 0x080 = 8x
+      - "16X"      # 0x100 = 16x
+      - "32X"      # 0x200 = 32x
+      - "64X"      # 0x400 = 64x, clamped to the register max below
+      - "128X"     # same 63.9x ceiling - the sensor can't go higher
     set_action:
       - lambda: |-
           CAM_SENSOR_OR_RETURN();
-          gainceiling_t g = GAINCEILING_2X;
-          if      (x == "4X")   g = GAINCEILING_4X;
-          else if (x == "8X")   g = GAINCEILING_8X;
-          else if (x == "16X")  g = GAINCEILING_16X;
-          else if (x == "32X")  g = GAINCEILING_32X;
-          else if (x == "64X")  g = GAINCEILING_64X;
-          else if (x == "128X") g = GAINCEILING_128X;
-          s->set_gainceiling(s, g);
+          int step = 0;
+          if      (x == "4X")   step = 1;
+          else if (x == "8X")   step = 2;
+          else if (x == "16X")  step = 3;
+          else if (x == "32X")  step = 4;
+          else if (x == "64X")  step = 5;
+          else if (x == "128X") step = 6;
+
+          if (cam_sensor_uses_q44_ceiling("${cam_sensor}")) {
+            // step 0 is 2x, so the Q4.4 value is 0x10 (1x) scaled by step + 1.
+            cam_gain_ceiling_q44(s, (uint16_t) (0x10 << (step + 1)));
+          } else {
+            s->set_gainceiling(s, (gainceiling_t) step);
+          }
           ESP_LOGI("cam_ctl", "Gain ceiling -> %s", x.c_str());
     web_server:
       sorting_group_id: cam_grp_advanced

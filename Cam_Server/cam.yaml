@@ -40,6 +40,19 @@ substitutions:
   compression_initial: 30
   max_fps: 5
 
+  # --- camera sensor ----------------------------------------------------------
+  # Which sensor sits on the module. Two things depend on it, both to do with the
+  # AGC gain ceiling: the on_boot hook in cam_common.yaml [1] and the "Gain
+  # Ceiling" control in [6] there. The OV2640 encodes that ceiling as a step in
+  # COM9, the OV3660/OV5640 as a Q4.4 value in 0x3A18/0x3A19, and esp32-camera's
+  # set_gainceiling() only gets the OV2640 case right. Detection itself is
+  # automatic over SCCB - this substitution only picks the encoding.
+  cam_sensor: "ov3660"
+
+  # Value the "Gain Ceiling" control starts at. 16X (0x100 = 16x) is the closest
+  # step to the 15.5x the shared boot hook installs.
+  agc_ceiling_initial: "16X"
+
 packages:
   - !include common/cam_common.yaml
 
@@ -66,6 +79,8 @@ esphome:
             }
             s->set_framesize(s, FRAMESIZE_XGA);
             ESP_LOGI("cam_ctl", "Boot resolution -> 1024x768 (XGA)");
+            // The AGC gain-ceiling repair for the OV3660 runs from the shared
+            // on_boot hook in cam_common.yaml [1]; nothing to do here.
 
 esp32:
   board: esp32cam
