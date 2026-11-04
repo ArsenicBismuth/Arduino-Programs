@@ -13,6 +13,7 @@
 
 #ifdef USE_ESP_IDF
 #include "sdmmc_cmd.h"
+#include "esp_vfs_fat.h"
 #endif
 
 namespace esphome {
@@ -91,6 +92,8 @@ class SdMmc : public Component {
   void set_mode_1bit(bool);
   void set_format_if_mount_failed(bool);
   void set_power_ctrl_pin(GPIOPin *);
+  void set_spi_mode(bool);
+  void set_cs_pin(uint8_t);
 
  protected:
   ErrorCode init_error_;
@@ -102,6 +105,8 @@ class SdMmc : public Component {
   uint8_t data3_pin_;
   bool mode_1bit_;
   bool format_if_mount_failed_;
+  bool spi_mode_{false};
+  uint8_t cs_pin_{0};
   GPIOPin *power_ctrl_pin_{nullptr};
 
 #ifdef USE_ESP_IDF
@@ -116,6 +121,7 @@ class SdMmc : public Component {
 #endif
 #ifdef USE_ESP_IDF
   std::string sd_card_type() const;
+  esp_err_t mount_spi_(const esp_vfs_fat_mount_config_t &mount_config);
 #endif
   void list_directory_file_info_rec(const char *path, uint8_t depth,
                                     const std::function<bool(const FileInfo &)> &callback);

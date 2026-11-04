@@ -11,7 +11,9 @@
 #    [1] device      esphome name, esp32 target, psram
 #    [2] camera      pin map + the PSRAM memory profile
 #    [3] web         one extra UI group (Diagnostics)
+#    [4] storage     slot driven as SPI (SDMMC cannot identify the card here)
 #    [5] diagnostics Heap Free / PSRAM Free
+#    [6] LED         none - GPIO21 belongs to the SD slot
 # =============================================================================
 
 # =============================================================================
@@ -33,10 +35,7 @@ substitutions:
   sd_clk: GPIO7              # microSD, 1-bit SDMMC
   sd_cmd: GPIO9
   sd_d0: GPIO8
-  led_pin: GPIO21            # on-board user LED (also the card's SPI CS, unused here)
-  led_inverted: "true"       # this LED lights when the pin is low
-  led_name: "User LED"
-  led_icon: mdi:led-outline
+  # No led_* keys: GPIO21 is the SD slot's D3/CS, see common/cam_common.yaml.
 
   # --- camera defaults --------------------------------------------------------
   # PSRAM to spare, so the controls start at their sharpest: UXGA boot buffer,
@@ -134,6 +133,16 @@ web_server:
     - id: cam_grp_diagnostics
       name: "Diagnostics"
       sorting_weight: 60
+
+# =============================================================================
+#  [4] STORAGE
+# =============================================================================
+# Merged into the shared sd_mmc_card block: this expansion's slot is wired as
+# SPI, and the SDMMC path cannot identify the card on it (ACMD41 -> 0x107).
+# Same pins, CS on GPIO21 (the user LED pin, which is why this build has no LED).
+sd_mmc_card:
+  transport: spi
+  cs_pin: GPIO21
 
 # =============================================================================
 #  [5] DIAGNOSTICS

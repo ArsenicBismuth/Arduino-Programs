@@ -126,3 +126,28 @@ sensor:
       name: "Heap Free"
       unit_of_measurement: "B" # B for Bytes
       icon: "mdi:memory"
+
+# =============================================================================
+#  [6] ON-BOARD LED
+# =============================================================================
+# Board-specific: GPIO4 here is only the flash LED (see common/cam_common.yaml).
+output:
+  - platform: ledc
+    pin:
+      number: ${led_pin}
+      inverted: ${led_inverted}
+    id: flash_led_pwm
+    frequency: 1000Hz
+
+light:
+  - platform: monochromatic
+    name: "${led_name}"
+    id: cam_flash_led
+    output: flash_led_pwm
+    icon: ${led_icon}
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+    default_transition_length: 0s
+    web_server:
+      sorting_group_id: cam_grp_basic
+      sorting_weight: 40

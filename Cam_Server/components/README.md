@@ -48,8 +48,8 @@ override only what the new hardware really does differently. Nothing in
 | Board | AI-Thinker ESP32-CAM, **no PSRAM** | Seeed XIAO ESP32S3 **Sense**, 8 MB flash + 8 MB octal PSRAM |
 | ESPHome name | `cam` | `cam-s3` (deliberately different, so OTA/mDNS cannot reach the wrong board) |
 | Camera | XCLK 0, D0-D7 5/18/19/21/36/39/34/35, VSYNC 25, HREF 23, PCLK 22, PWDN 32 | XCLK 10, D0-D7 15/17/18/16/14/12/11/48, VSYNC 38, HREF 47, PCLK 13, SCCB 40/39 |
-| microSD | SDMMC 1-bit CLK 14 / CMD 15 / D0 2 | SDMMC 1-bit CLK 7 / CMD 9 / D0 8 |
-| LED | flash LED, GPIO4 | user LED, GPIO21 (active low; also the card's SPI CS, unused in SD mode) |
+| microSD | SDMMC 1-bit CLK 14 / CMD 15 / D0 2 | SPI (SDMMC cannot identify the card on this expansion): SCK 7 / MOSI 9 / MISO 8 / CS 21 |
+| LED | flash LED, GPIO4 (PWM light) | none - GPIO21 is the card's D3/CS |
 | Frame buffers | 1 x DRAM, VGA boot buffer, quality 30 | 2 x PSRAM, UXGA boot buffer, quality 12 |
 | lwIP tuning | `CONFIG_LWIP_TCP_*` halved to 2880 B | defaults; `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` lets pbufs spill into PSRAM |
 

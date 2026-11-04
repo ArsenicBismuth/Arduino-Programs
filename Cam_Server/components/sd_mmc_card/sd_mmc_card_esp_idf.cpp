@@ -3,8 +3,13 @@
 #ifdef USE_ESP_IDF
 #include "math.h"
 #include "esphome/core/log.h"
+#include "esp_err.h"
 #include "esp_vfs.h"
 #include "esp_vfs_fat.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/sdspi_host.h"
+#include "driver/spi_master.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
 #include "driver/sdmmc_types.h"
@@ -53,7 +58,22 @@ void SdMmc::setup() {
   // connected on the bus. This is for debug / example purpose only.
   slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
-  auto ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT.c_str(), &host, &slot_config, &mount_config, &this->card_);
+  // Retry: the mount identifies the card once and gives up, and the rail may still
+  // be settling when setup() runs. Each failure is logged with its IDF error name.
+  esp_err_t ret = ESP_FAIL;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    if (this->spi_mode_) {
+      ret = this->mount_spi_(mount_config);
+    } else {
+      ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT.c_str(), &host, &slot_config, &mount_config, &this->card_);
+    }
+    if (ret == ESP_OK)
+      break;
+    ESP_LOGE(TAG, "Mount %s failed (attempt %d/3): %s", MOUNT_POINT.c_str(), attempt, esp_err_to_name(ret));
+    this->card_ = nullptr;
+    if (attempt < 3)
+      vTaskDelay(pdMS_TO_TICKS(100));
+  }
 
   if (ret != ESP_OK) {
     if (ret == ESP_FAIL) {
@@ -65,12 +85,40 @@ void SdMmc::setup() {
     return;
   }
 
+  ESP_LOGI(TAG, "Mounted %s: %s", MOUNT_POINT.c_str(), sd_card_type().c_str());
+
 #ifdef USE_TEXT_SENSOR
   if (this->sd_card_type_text_sensor_ != nullptr)
     this->sd_card_type_text_sensor_->publish_state(sd_card_type());
 #endif
 
   update_sensors();
+}
+
+// SPI transport: the expansion board's slot is wired as SPI (CLK/SCK, CMD/MOSI,
+// D0/MISO, D3/CS), so the same pins work with the sdspi driver when the SDMMC
+// path cannot identify the card.
+esp_err_t SdMmc::mount_spi_(const esp_vfs_fat_mount_config_t &mount_config) {
+  spi_bus_config_t bus = {};
+  bus.mosi_io_num = this->cmd_pin_;
+  bus.miso_io_num = this->data0_pin_;
+  bus.sclk_io_num = this->clk_pin_;
+  bus.quadwp_io_num = -1;
+  bus.quadhd_io_num = -1;
+  bus.max_transfer_sz = 4096;
+
+  esp_err_t err = spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {  // INVALID_STATE: bus already up (retry)
+    ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+  host.slot = SPI2_HOST;
+  sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
+  slot.host_id = SPI2_HOST;
+  slot.gpio_cs = static_cast<gpio_num_t>(this->cs_pin_);
+  return esp_vfs_fat_sdspi_mount(MOUNT_POINT.c_str(), &host, &slot, &mount_config, &this->card_);
 }
 
 void SdMmc::write_file(const char *path, const uint8_t *buffer, size_t len, const char *mode) {
