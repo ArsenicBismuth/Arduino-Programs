@@ -189,8 +189,8 @@ std::string format_size(size_t size) {
   return std::string(buffer);
 }
 
-FileInfo::FileInfo(std::string const &path, size_t size, bool is_directory)
-    : path(path), size(size), is_directory(is_directory) {}
+FileInfo::FileInfo(std::string const &path, size_t size, bool is_directory, bool size_known)
+    : path(path), size(size), is_directory(is_directory), size_known(size_known) {}
 
 }  // namespace sd_mmc_card
 }  // namespace esphome

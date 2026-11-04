@@ -12,6 +12,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #endif
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
@@ -420,7 +422,10 @@ void SDFileServer::write_row(std::string &out, sd_mmc_card::FileInfo const &info
   }
   out += "</td><td>";
   if (!info.is_directory) {
-    out += sd_mmc_card::format_size(info.size);
+    if (info.size_known)
+      out += sd_mmc_card::format_size(info.size);
+    else
+      out += "&mdash;";
   }
   out += "</td><td><div class=\"file-actions\">";
   if (!info.is_directory) {
@@ -439,9 +444,10 @@ void SDFileServer::write_row(std::string &out, sd_mmc_card::FileInfo const &info
 }
 
 // Newest-first listing only needs the PAGE_SIZE largest names, never the whole directory:
-// 20 * 32 B. Sizes/types are read with stat() for the visible rows only (not every entry).
+// 20 * 32 B. Sizes are stat()ed for the visible rows only, and only in small folders.
 static constexpr size_t PAGE_SIZE = 20;
 static char listing[PAGE_SIZE][32];
+static bool listing_dir[PAGE_SIZE];
 
 void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string const &path) const {
   // Names are zero-padded timestamps, so the largest names are the newest. One directory
@@ -487,6 +493,7 @@ void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string cons
   std::string row;
   std::string dir_path = sd_mmc_card::build_path(path.c_str());
   size_t kept = 0;
+  size_t entries_seen = 0;
   bool has_more = false;
   DIR *dir = opendir(dir_path.c_str());
   if (dir == nullptr) {
@@ -494,6 +501,12 @@ void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string cons
   } else {
     struct dirent *entry;
     while ((entry = readdir(dir)) != nullptr) {
+      // A day folder can hold thousands of snapshots. Each readdir is a FatFs
+      // directory read over SPI, so yield regularly: a long unbranched scan starves
+      // the Wi-Fi task and the watchdogs (CONFIG_ESP_TASK_WDT_PANIC). One tick per
+      // 32 entries keeps that under ~30 ms between yields.
+      if ((++entries_seen & 0x1F) == 0)
+        vTaskDelay(1);
       const char *name = entry->d_name;
       if (name[0] == '\0' || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
         continue;
@@ -504,27 +517,46 @@ void SDFileServer::handle_index(AsyncWebServerRequest *request, std::string cons
         if (strcmp(name, listing[0]) <= 0)
           continue;  // smaller than the smallest name kept so far
         memmove(listing, listing + 1, sizeof(listing[0]) * (PAGE_SIZE - 1));
+        memmove(listing_dir, listing_dir + 1, sizeof(listing_dir[0]) * (PAGE_SIZE - 1));
         kept--;
       }
       size_t pos = kept;
       while (pos > 0 && strcmp(name, listing[pos - 1]) < 0) {
         memcpy(listing[pos], listing[pos - 1], sizeof(listing[0]));
+        listing_dir[pos] = listing_dir[pos - 1];
         pos--;
       }
       strlcpy(listing[pos], name, sizeof(listing[0]));
+      listing_dir[pos] = entry->d_type == DT_DIR;
       kept++;
     }
     closedir(dir);
   }
 
+  // Sizes cost one stat() per row, and FatFs resolves a name by walking the whole
+  // directory - 20 rescans of a large folder, each over SPI. Fine for the root, not
+  // for a day folder, so only pay for it when the directory is small. Folder-ness
+  // comes from d_type (the FatFs attribute) and needs no extra read.
+  const bool with_sizes = entries_seen <= 200;
+
   for (size_t i = kept; i > 0; i--) {
     std::string rel = Path::join(path, listing[i - 1]);
-    struct stat st;
-    bool ok = stat(sd_mmc_card::build_path(rel.c_str()).c_str(), &st) == 0;
-    bool is_dir = ok && S_ISDIR(st.st_mode);
+    bool is_dir = listing_dir[i - 1];
+    size_t size = 0;
+    bool size_known = false;
+    if (with_sizes) {
+      struct stat st;
+      if (stat(sd_mmc_card::build_path(rel.c_str()).c_str(), &st) == 0) {
+        is_dir = S_ISDIR(st.st_mode);
+        size = static_cast<size_t>(st.st_size);
+        size_known = true;
+      }
+    }
     row.clear();
-    write_row(row, sd_mmc_card::FileInfo(rel, ok ? static_cast<size_t>(st.st_size) : 0, is_dir));
+    write_row(row, sd_mmc_card::FileInfo(rel, size, is_dir, size_known));
     out.write(row.data(), row.size());
+    if ((i & 0x07) == 0)
+      vTaskDelay(1);
   }
 
   out.write(INDEX_FOOT);

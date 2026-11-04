@@ -73,8 +73,13 @@ esp32:
       include_builtin_idf_components: ["fatfs", "spiffs"]
       disable_vfs_support_dir: false
     sdkconfig_options:
-      # Long file names, needed for names like snap_20261017_141530.jpg
-      CONFIG_FATFS_LFN_STACK: "y"
+      # Long file names, needed for names like snap_20261017_141530.jpg. From the
+      # heap, not the stack: with LFN_STACK every f_open()/f_opendir()/f_stat()
+      # spends 256 bytes of its caller's stack, and the httpd task that serves
+      # /file only has ~4 KB. NONE must be cleared too - ESPHome's own default
+      # writes it, and it is the first member of the same Kconfig choice.
+      CONFIG_FATFS_LFN_NONE: "n"
+      CONFIG_FATFS_LFN_HEAP: "y"
 
 # Enable logging
 logger:

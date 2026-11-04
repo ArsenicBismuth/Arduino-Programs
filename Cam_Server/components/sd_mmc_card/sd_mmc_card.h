@@ -35,8 +35,9 @@ struct FileInfo {
   std::string path;
   size_t size;
   bool is_directory;
+  bool size_known{true};
 
-  FileInfo(std::string const &, size_t, bool);
+  FileInfo(std::string const &, size_t, bool, bool size_known = true);
 };
 
 class SdMmc : public Component {

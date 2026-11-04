@@ -379,3 +379,34 @@ Tuning: the `Change Score` sensor reports the current difference (0..255); watch
 something moves and set `Change Threshold` just below that. Turn off `Change Gate` to store
 every period.
 
+
+### 2026-11-04 - `/file` subfolders crashed the XIAO S3 build (stack overflow in the httpd task)
+
+**Symptom.** On `cam-s3`, `GET /file` worked, but `GET /file/snap` (and every nested folder)
+never answered: the browser stalled, the device dropped off the API and stayed unreachable on
+port 6053 while port 80 kept serving. The next boot reported
+`*** CRASH DETECTED ON PREVIOUS BOOT *** / Reason: Fault - IllegalInstruction` with a backtrace
+through `vApplicationStackOverflowHook` - a task stack overflow, not a brownout, and not the
+"too many files" problem from 2026-10-18.
+
+**Root cause.** FatFs was built with `CONFIG_FATFS_LFN_STACK`, which puts a 256-byte long-filename
+buffer on the stack *of every* `f_open()`/`f_opendir()`/`f_stat()` frame. The esp-idf web server
+task is 4 KB (`HTTPD_DEFAULT_CONFIG()` + 256 in ESPHome, not configurable from YAML), and by the
+time a handler runs, only ~300 B are left - measured with `uxTaskGetStackHighWaterMark()` at
+handler entry. Opening the *root* directory needs no filename parsing and fit; opening a
+subdirectory parses a name and reads through `sdspi`, and blew it.
+
+This only shows up on this board because it is the one running the card over **SPI**: the extra
+`sdspi` frames plus the LFN buffer are what push it over the edge. The ESP32-CAM drives the same
+code over SDMMC, which is shallower, and survives.
+
+**Fix.** `CONFIG_FATFS_LFN_HEAP=y` (with `CONFIG_FATFS_LFN_NONE=n`, which ESPHome's own default
+writes and which is the first member of the same Kconfig choice, so it has to be cleared
+explicitly - setting HEAP alone silently resolves to NONE). The LFN buffer is allocated once at
+mount instead of per call. Measured effect: stack headroom at handler entry went from 276 B to
+488 B and `GET /file/snap` and `GET /file/snap/<day>/` both return normally.
+
+**How to spot it again.** A stack overflow is reported on the *next* boot (the crash report in
+`esp32.crash`), never in the log at crash time, because the API connection dies with the panic.
+If a request kills the API but leaves port 80 alive and the boot counter/rollback kicks in, look
+for `vApplicationStackOverflowHook` in that report before suspecting power.

@@ -145,11 +145,10 @@ web_server:
 # Merged into the shared sd_mmc_card block: this expansion's slot is wired as
 # SPI, and the SDMMC path cannot identify the card on it (ACMD41 -> 0x107).
 # Same pins, CS on GPIO21 (the user LED pin, which is why this build has no LED).
-# 10 MHz rather than the 20 MHz default: /file drops connections at 20 MHz.
 sd_mmc_card:
   transport: spi
   cs_pin: GPIO21
-  max_frequency: 10MHz
+  max_frequency: 20MHz
 
 # =============================================================================
 #  [5] DIAGNOSTICS
