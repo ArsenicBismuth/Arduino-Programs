@@ -33,6 +33,7 @@ void SdMmc::setup() {
       .format_if_mount_failed = this->format_if_mount_failed_, .max_files = 5, .allocation_unit_size = 16 * 1024};
 
   sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+  host.max_freq_khz = this->max_freq_hz_ / 1000;
   sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
 
   if (this->mode_1bit_) {
@@ -85,7 +86,8 @@ void SdMmc::setup() {
     return;
   }
 
-  ESP_LOGI(TAG, "Mounted %s: %s", MOUNT_POINT.c_str(), sd_card_type().c_str());
+  ESP_LOGI(TAG, "Mounted %s: %s at %" PRIu32 " kHz", MOUNT_POINT.c_str(), sd_card_type().c_str(),
+           this->card_ != nullptr ? this->card_->max_freq_khz : 0);
 
 #ifdef USE_TEXT_SENSOR
   if (this->sd_card_type_text_sensor_ != nullptr)
@@ -115,6 +117,7 @@ esp_err_t SdMmc::mount_spi_(const esp_vfs_fat_mount_config_t &mount_config) {
 
   sdmmc_host_t host = SDSPI_HOST_DEFAULT();
   host.slot = SPI2_HOST;
+  host.max_freq_khz = this->max_freq_hz_ / 1000;
   sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
   slot.host_id = SPI2_HOST;
   slot.gpio_cs = static_cast<gpio_num_t>(this->cs_pin_);

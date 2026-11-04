@@ -135,6 +135,8 @@ void SdMmc::set_spi_mode(bool spi_mode) { this->spi_mode_ = spi_mode; }
 
 void SdMmc::set_cs_pin(uint8_t pin) { this->cs_pin_ = pin; }
 
+void SdMmc::set_max_frequency(uint32_t freq_hz) { this->max_freq_hz_ = freq_hz; }
+
 std::string SdMmc::error_code_to_string(SdMmc::ErrorCode code) {
   switch (code) {
     case ErrorCode::ERR_PIN_SETUP:

@@ -94,6 +94,7 @@ class SdMmc : public Component {
   void set_power_ctrl_pin(GPIOPin *);
   void set_spi_mode(bool);
   void set_cs_pin(uint8_t);
+  void set_max_frequency(uint32_t freq_hz);
 
  protected:
   ErrorCode init_error_;
@@ -107,6 +108,7 @@ class SdMmc : public Component {
   bool format_if_mount_failed_;
   bool spi_mode_{false};
   uint8_t cs_pin_{0};
+  uint32_t max_freq_hz_{20000000};
   GPIOPin *power_ctrl_pin_{nullptr};
 
 #ifdef USE_ESP_IDF
