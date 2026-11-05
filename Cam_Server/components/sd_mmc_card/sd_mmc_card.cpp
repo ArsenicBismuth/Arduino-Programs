@@ -18,12 +18,15 @@ void SdMmc::loop() {}
 
 void SdMmc::dump_config() {
   ESP_LOGCONFIG(TAG, "SD MMC Component");
+  ESP_LOGCONFIG(TAG, "  Transport: %s", this->spi_mode_ ? "SPI" : "SDMMC");
   ESP_LOGCONFIG(TAG, "  Format if mount failed: %s", TRUEFALSE(this->format_if_mount_failed_));
   ESP_LOGCONFIG(TAG, "  Mode 1 bit: %s", TRUEFALSE(this->mode_1bit_));
   ESP_LOGCONFIG(TAG, "  CLK Pin: %d", this->clk_pin_);
   ESP_LOGCONFIG(TAG, "  CMD Pin: %d", this->cmd_pin_);
   ESP_LOGCONFIG(TAG, "  DATA0 Pin: %d", this->data0_pin_);
-  if (!this->mode_1bit_) {
+  if (this->spi_mode_) {
+    ESP_LOGCONFIG(TAG, "  CS Pin: %d", this->cs_pin_);
+  } else if (!this->mode_1bit_) {
     ESP_LOGCONFIG(TAG, "  DATA1 Pin: %d", this->data1_pin_);
     ESP_LOGCONFIG(TAG, "  DATA2 Pin: %d", this->data2_pin_);
     ESP_LOGCONFIG(TAG, "  DATA3 Pin: %d", this->data3_pin_);
@@ -128,6 +131,12 @@ void SdMmc::set_format_if_mount_failed(bool b) { this->format_if_mount_failed_ =
 
 void SdMmc::set_power_ctrl_pin(GPIOPin *pin) { this->power_ctrl_pin_ = pin; }
 
+void SdMmc::set_spi_mode(bool spi_mode) { this->spi_mode_ = spi_mode; }
+
+void SdMmc::set_cs_pin(uint8_t pin) { this->cs_pin_ = pin; }
+
+void SdMmc::set_max_frequency(uint32_t freq_hz) { this->max_freq_hz_ = freq_hz; }
+
 std::string SdMmc::error_code_to_string(SdMmc::ErrorCode code) {
   switch (code) {
     case ErrorCode::ERR_PIN_SETUP:
@@ -180,8 +189,8 @@ std::string format_size(size_t size) {
   return std::string(buffer);
 }
 
-FileInfo::FileInfo(std::string const &path, size_t size, bool is_directory)
-    : path(path), size(size), is_directory(is_directory) {}
+FileInfo::FileInfo(std::string const &path, size_t size, bool is_directory, bool size_known)
+    : path(path), size(size), is_directory(is_directory), size_known(size_known) {}
 
 }  // namespace sd_mmc_card
 }  // namespace esphome

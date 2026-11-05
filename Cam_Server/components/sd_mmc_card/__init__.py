@@ -28,6 +28,9 @@ CONF_DATA3_PIN = "data3_pin"
 CONF_MODE_1BIT = "mode_1bit"
 CONF_FORMAT_IF_MOUNT_FAILED = "format_if_mount_failed"
 CONF_POWER_CTRL_PIN = "power_ctrl_pin"
+CONF_TRANSPORT = "transport"
+CONF_CS_PIN = "cs_pin"
+CONF_MAX_FREQUENCY = "max_frequency"
 
 sd_mmc_card_component_ns = cg.esphome_ns.namespace("sd_mmc_card")
 SdMmc = sd_mmc_card_component_ns.class_("SdMmc", cg.Component)
@@ -48,6 +51,11 @@ def validate_raw_data(value):
         "data must either be a string wrapped in quotes or a list of bytes"
     )
 
+def validate_transport(config):
+    if config[CONF_TRANSPORT] == "spi" and CONF_CS_PIN not in config:
+        raise cv.Invalid("cs_pin is required when transport is 'spi'")
+    return config
+
 CONFIG_SCHEMA = cv.All(
     cv.require_esphome_version(2025,7,0),
     cv.Schema(
@@ -61,13 +69,22 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_DATA3_PIN): pins.internal_gpio_pin_number,
             cv.Optional(CONF_MODE_1BIT, default=False): cv.boolean,
             cv.Optional(CONF_FORMAT_IF_MOUNT_FAILED, default=False): cv.boolean,
+            # "sdmmc" (native SD bus) or "spi" (same pins, SPI peripheral + a CS
+            # pin). SPI is the fallback for boards whose SDMMC path does not come
+            # up, e.g. the XIAO ESP32S3 Sense expansion.
+            cv.Optional(CONF_TRANSPORT, default="sdmmc"): cv.one_of("sdmmc", "spi", lower=True),
+            cv.Optional(CONF_CS_PIN): pins.internal_gpio_output_pin_number,
+            # Bus clock after identification; SPI-mode cards are often marginal at
+            # the 20 MHz default and a lower clock costs little.
+            cv.Optional(CONF_MAX_FREQUENCY, default="20MHz"): cv.frequency,
             cv.Optional(CONF_POWER_CTRL_PIN) : pins.gpio_pin_schema({
                 CONF_OUTPUT: True,
                 CONF_PULLUP: False,
                 CONF_PULLDOWN: False,
             }),
         }
-    ).extend(cv.COMPONENT_SCHEMA)
+    ).extend(cv.COMPONENT_SCHEMA),
+    validate_transport,
 )
 
 async def to_code(config):
@@ -76,6 +93,10 @@ async def to_code(config):
 
     cg.add(var.set_mode_1bit(config[CONF_MODE_1BIT]))
     cg.add(var.set_format_if_mount_failed(config[CONF_FORMAT_IF_MOUNT_FAILED]))
+    cg.add(var.set_spi_mode(config[CONF_TRANSPORT] == "spi"))
+    cg.add(var.set_max_frequency(config[CONF_MAX_FREQUENCY]))
+    if CONF_CS_PIN in config:
+        cg.add(var.set_cs_pin(config[CONF_CS_PIN]))
 
     cg.add(var.set_clk_pin(config[CONF_CLK_PIN]))
     cg.add(var.set_cmd_pin(config[CONF_CMD_PIN]))

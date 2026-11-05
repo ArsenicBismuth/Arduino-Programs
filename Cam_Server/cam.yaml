@@ -90,6 +90,16 @@ esp32:
       # 7 web sockets plus the two camera servers still fit (and sends can allocate).
       CONFIG_LWIP_TCP_WND_DEFAULT: "2880"
       CONFIG_LWIP_TCP_SND_BUF_DEFAULT: "2880"
+      # Keep FatFs's long-filename buffer on the stack here, overriding the shared
+      # LFN_HEAP: on this board the heap is the scarce resource (~4-10 KB, largest
+      # block ~1.5 KB), and HEAP turns every f_open()/f_opendir()/f_stat() into a
+      # 512-byte malloc/free - churn that fragments exactly what the page build
+      # needs. The httpd stack is the same 4 KB as on the S3, but SDMMC's call depth
+      # is shallower than sdspi's, so STACK fits (and did for months).
+      # sdkconfig defaults are applied alphabetically and the last one wins
+      # (HEAP < NONE < STACK), hence the explicit "n".
+      CONFIG_FATFS_LFN_HEAP: "n"
+      CONFIG_FATFS_LFN_STACK: "y"
 
 # =============================================================================
 #  [2] CAMERA
@@ -126,3 +136,28 @@ sensor:
       name: "Heap Free"
       unit_of_measurement: "B" # B for Bytes
       icon: "mdi:memory"
+
+# =============================================================================
+#  [6] ON-BOARD LED
+# =============================================================================
+# Board-specific: GPIO4 here is only the flash LED (see common/cam_common.yaml).
+output:
+  - platform: ledc
+    pin:
+      number: ${led_pin}
+      inverted: ${led_inverted}
+    id: flash_led_pwm
+    frequency: 1000Hz
+
+light:
+  - platform: monochromatic
+    name: "${led_name}"
+    id: cam_flash_led
+    output: flash_led_pwm
+    icon: ${led_icon}
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+    default_transition_length: 0s
+    web_server:
+      sorting_group_id: cam_grp_basic
+      sorting_weight: 40

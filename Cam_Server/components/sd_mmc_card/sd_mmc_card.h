@@ -13,6 +13,7 @@
 
 #ifdef USE_ESP_IDF
 #include "sdmmc_cmd.h"
+#include "esp_vfs_fat.h"
 #endif
 
 namespace esphome {
@@ -34,8 +35,9 @@ struct FileInfo {
   std::string path;
   size_t size;
   bool is_directory;
+  bool size_known{true};
 
-  FileInfo(std::string const &, size_t, bool);
+  FileInfo(std::string const &, size_t, bool, bool size_known = true);
 };
 
 class SdMmc : public Component {
@@ -91,6 +93,9 @@ class SdMmc : public Component {
   void set_mode_1bit(bool);
   void set_format_if_mount_failed(bool);
   void set_power_ctrl_pin(GPIOPin *);
+  void set_spi_mode(bool);
+  void set_cs_pin(uint8_t);
+  void set_max_frequency(uint32_t freq_hz);
 
  protected:
   ErrorCode init_error_;
@@ -102,6 +107,9 @@ class SdMmc : public Component {
   uint8_t data3_pin_;
   bool mode_1bit_;
   bool format_if_mount_failed_;
+  bool spi_mode_{false};
+  uint8_t cs_pin_{0};
+  uint32_t max_freq_hz_{20000000};
   GPIOPin *power_ctrl_pin_{nullptr};
 
 #ifdef USE_ESP_IDF
@@ -116,6 +124,7 @@ class SdMmc : public Component {
 #endif
 #ifdef USE_ESP_IDF
   std::string sd_card_type() const;
+  esp_err_t mount_spi_(const esp_vfs_fat_mount_config_t &mount_config);
 #endif
   void list_directory_file_info_rec(const char *path, uint8_t depth,
                                     const std::function<bool(const FileInfo &)> &callback);
