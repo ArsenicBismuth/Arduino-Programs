@@ -49,6 +49,12 @@ substitutions:
   # automatic over SCCB - this substitution only picks the encoding.
   cam_sensor: "ov3660"
 
+  # Frame-buffer budget: esp_camera_init() sizes it once as width*height/5 of
+  # the `resolution:` below, so VGA = 640*480/5. Keep the two in sync; the
+  # "Frame Size" sensor warns at 85% of this and the watchdog exists because
+  # anything larger stops the DMA for good (cam_hal: FB-OVF).
+  frame_buffer_bytes: "61440"
+
   # Value the "Gain Ceiling" control starts at. 16X (0x100 = 16x) is the closest
   # step to the 15.5x the shared boot hook installs.
   agc_ceiling_initial: "16X"

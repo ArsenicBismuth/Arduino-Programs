@@ -49,6 +49,12 @@ substitutions:
   # AGC gain-ceiling repair in cam_common.yaml runs for it too. OV2640 boards set
   # this to "ov2640" and skip the repair.
   cam_sensor: "ov3660"
+
+  # Frame-buffer budget: esp_camera_init() sizes it once as width*height/5 of the
+  # `resolution:` below, so UXGA = 1600*1200/5. Keep the two in sync; the "Frame
+  # Size" sensor warns at 85% of this and the watchdog exists because anything
+  # larger stops the DMA for good (cam_hal: FB-OVF).
+  frame_buffer_bytes: "384000"
   agc_ceiling_initial: "16X"
 
 packages:
