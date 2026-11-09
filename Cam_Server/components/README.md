@@ -410,3 +410,41 @@ mount instead of per call. Measured effect: stack headroom at handler entry went
 `esp32.crash`), never in the log at crash time, because the API connection dies with the panic.
 If a request kills the API but leaves port 80 alive and the boot counter/rollback kicks in, look
 for `vApplicationStackOverflowHook` in that report before suspecting power.
+
+### 2026-11-06 - large resolutions kill the camera silently (cam_hal: FB-OVF)
+
+**Symptom.** After switching Resolution up (e.g. 1600x1200 on the AI-Thinker), the stream and the
+snapshots work for a while and then stop for good: no frames on :8080/:8081, no `Saved ...` lines,
+no error anywhere in the ESPHome log. Only a power cycle brings it back.
+
+**Root cause.** `esp_camera_init()` sizes the frame buffer **once**, as
+`width * height / 5` of the YAML `resolution:` (VGA on `cam` = 61,440 B), and nothing reallocates it
+when the Resolution control rewrites the sensor registers. While the JPEG of a larger frame still
+fits in that buffer it works, which is why the first test looked fine. Once the scene has enough
+detail to push the JPEG over the limit, `cam_hal.c`:
+
+```c
+if (cam_obj->fb_size < (frame_buffer_event->len + pixels_per_dma)) {
+    ESP_CAMERA_ETS_PRINTF(DRAM_STR("cam_hal: FB-OVF\r\n"));
+    ll_cam_stop(cam_obj);
+    continue;
+}
+```
+
+stops the DMA and moves on. With `frame_buffer_count: 1` nothing restarts it, so the sensor runs but
+no frame is ever delivered again. The message goes through `ESP_CAMERA_ETS_PRINTF` (ROM console,
+i.e. UART0), not ESPHome's logger - hence the silence.
+
+**Mitigations.**
+
+- `Frame Size` sensor (published from `on_image`) plus a `ESP_LOGW` at 85% of the boot-time budget
+  (`frame_buffer_bytes` in the board file, must match `resolution:`). Watch it against the budget
+  instead of discovering the cliff.
+- `Compression` (higher number) shrinks the JPEG; that is the only lever that keeps an
+  over-subscribed resolution inside a fixed buffer.
+- `Frame Watchdog` switch + `Watchdog Timeout` (`common/cam_common.yaml` [6], default **off**,
+  60 s): restarts the board when no frame arrives for the timeout, turning a permanent wedge into
+  a ~1 min gap. A reboot is the only recovery - `esp32-camera` cannot restart its own DMA.
+- The buffer ceiling is hardware: UXGA needs ~384 KB contiguous internal DRAM, which the
+  AI-Thinker (no PSRAM, ~320 KB total) does not have. The S3 boots with its buffers in PSRAM and
+  is the board for large resolutions.

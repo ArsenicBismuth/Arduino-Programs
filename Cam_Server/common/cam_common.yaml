@@ -146,6 +146,20 @@ esp32_camera:
   on_image:
     then:
       - lambda: |-
+          // Frame bookkeeping first, before any early return below: a frame the change
+          // gate skips is still a frame, and the watchdog must not read that as a stall.
+          id(cam_last_frame_ms) = millis();
+          // Size and headroom warning at most once a second: streaming would otherwise
+          // publish (and log) at the full frame rate.
+          static uint32_t last_size_ms = 0;
+          if (millis() - last_size_ms >= 1000) {
+            last_size_ms = millis();
+            id(cam_frame_size)->publish_state(image.length);
+            if (image.length > ${frame_buffer_bytes} * 85 / 100)
+              ESP_LOGW("cam_snap", "Frame %u B is >85%% of the %s B frame buffer (FB-OVF risk)",
+                       (unsigned) image.length, "${frame_buffer_bytes}");
+          }
+
           const bool manual = id(cam_save_requested);
           if (manual)
             id(cam_save_requested) = false;
@@ -313,6 +327,12 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
+  # millis() of the newest frame of any kind (stream, snapshot, idle). The frame
+  # watchdog in [5] reads it; 0 means "no frame since boot".
+  - id: cam_last_frame_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
 
 # --- Manual "Save Snapshot" button -------------------------------------------
 button:
@@ -349,6 +369,25 @@ sensor:
       sorting_group_id: cam_grp_snapshots
       sorting_weight: 40
 
+  # Size of the newest JPEG, in bytes. This is the number that decides whether a
+  # large resolution is safe: esp32-camera sizes the frame buffer once at boot
+  # (width * height / 5 of the YAML `resolution:`, see ${frame_buffer_bytes}) and
+  # changing the sensor resolution later does not reallocate it. A frame that
+  # outgrows it is dropped and the DMA is left stopped (cam_hal: FB-OVF), which
+  # kills the stream and the snapshots until a reboot - so watch this against the
+  # budget rather than discovering the cliff.
+  - platform: template
+    name: "Frame Size"
+    id: cam_frame_size
+    icon: mdi:image-size-select-large
+    unit_of_measurement: B
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+    web_server:
+      sorting_group_id: cam_grp_basic
+      sorting_weight: 50
+
 # Enables the ability to read debug information.
 debug:
   update_interval: 1min # How often to check the memory.
@@ -361,6 +400,27 @@ debug:
 # of the "Auto Snapshot" switch, and (like any ESPHome interval) first fires
 # ~24 h after boot - a device rebooted more often than that never prunes.
 interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          // --- frame watchdog (see "Frame Watchdog" in [6]) ----------------------
+          // esp32-camera cannot recover from a frame-buffer overflow by itself: cam_hal
+          // stops the DMA and never restarts it, so the sensor keeps running while no
+          // frame is ever delivered again. A restart is the only way back, so make it
+          // automatic instead of needing a power cycle.
+          if (!id(cam_frame_wdt)->state)
+            return;
+          const uint32_t now = millis();
+          if (id(cam_last_frame_ms) == 0) {  // nothing since boot: start the clock
+            id(cam_last_frame_ms) = now;
+            return;
+          }
+          const uint32_t timeout_ms = static_cast<uint32_t>(id(cam_frame_wdt_s)->state * 1000.0f);
+          if (now - id(cam_last_frame_ms) < timeout_ms)
+            return;
+          ESP_LOGE("cam_wdt", "No frame for %u s (timeout %u s) - restarting",
+                   (unsigned) ((now - id(cam_last_frame_ms)) / 1000), (unsigned) (timeout_ms / 1000));
+          id(cam_restart)->press();
   - interval: 24h
     then:
       - lambda: |-
@@ -627,6 +687,25 @@ number:
       sorting_group_id: cam_grp_snapshots
       sorting_weight: 60
 
+  # How long "Frame Watchdog" waits for a frame before restarting. Idle frames
+  # arrive every 1/Idle-FPS (10 s at the 0.1 fps default), so anything below ~30 s
+  # would restart a healthy camera.
+  - platform: template
+    name: "Watchdog Timeout"
+    id: cam_frame_wdt_s
+    icon: mdi:timer-alert-outline
+    unit_of_measurement: s
+    entity_category: config
+    optimistic: true
+    mode: box
+    min_value: 20
+    max_value: 600
+    step: 10
+    initial_value: 60
+    web_server:
+      sorting_group_id: cam_grp_snapshots
+      sorting_weight: 80
+
   # --- Retention --------------------------------------------------------------
   # Snapshots older than this are deleted by the retention pass in [5].
   - platform: template
@@ -862,6 +941,22 @@ switch:
     web_server:
       sorting_group_id: cam_grp_snapshots
       sorting_weight: 30
+
+  # Restart the board when frames stop arriving ("Watchdog Timeout" below).
+  # Off by default: it is a heavy hammer, and only useful while a resolution is
+  # being pushed past what the boot-time frame buffer can hold. Watch "Frame Size"
+  # first - if it sits well under ${frame_buffer_bytes}, the watchdog will never
+  # be needed. Leave it off if the camera is ever expected to be idle.
+  - platform: template
+    name: "Frame Watchdog"
+    id: cam_frame_wdt
+    icon: mdi:camera-off
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    web_server:
+      sorting_group_id: cam_grp_snapshots
+      sorting_weight: 70
 
   # --- Advanced image (rarely used) ------------------------------------------
   # Auto exposure / gain / white balance. restore_mode defaults below mirror the
