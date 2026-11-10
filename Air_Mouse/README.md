@@ -64,6 +64,9 @@ ble=advertising as "Air Mouse" (pair from the host, HID needs an encrypted link)
 Then pair from the host: **Settings → Bluetooth → "Air Mouse"**. The console logs
 `ble=connected, pairing`, and after pairing, motion and clicks start working.
 
+The device **boots asleep** (`hid=sleep on boot, click the button to wake`) and reports nothing until the
+button is clicked, so pairing itself does not make the pointer move — see [Sleep and wake](#sleep-and-wake).
+
 The connection interval is published at **7.5 ms** (units 6/6), through the standard GAP
 characteristic `0x2A04` that hosts read during service discovery. **On Android that is only a
 request**, and a phone is entitled to overrule it — 30 ms is Android's own default band.
@@ -88,13 +91,44 @@ If motion does nothing while clicks work (or vice versa), check the link is actu
 HID reports are dropped on an unencrypted link, which is why pairing is mandatory rather than
 optional.
 
+## Sleep and wake
+
+The device **starts asleep** and stays that way until the button is clicked. Asleep it sends no reports at
+all, so a device lying on the desk, or rattling around in a bag, cannot drift the host's cursor or keep
+the host from going idle. Pairing is unaffected: the link comes up as usual, it is only the reports that
+are withheld.
+
+- **Wake:** the primary mouse button. The click that wakes it is also delivered, because it is a real
+  click — the wake is not a separate gesture.
+- **Stay awake:** a rolling timer. A click, or a pointer rate at or above `kSleepMinRateDps`, restarts it;
+  the device goes back to sleep `kSleepIdleTimeoutMs` after the last one. So it drops out one minute after
+  you actually stop using it, not one minute after you picked it up.
+- **"Real movement" is a rate, not a distance.** `kSleepMinRateDps` is in **deg/s**, the same unit as
+  `kHidDeadzoneDps` and the `ptr_dps` field in the log: aiming moves the pointer at tens of deg/s, while a
+  device on a table, in a bag, or resting under a hand sits at the deadzone's noise floor. It is measured
+  *after* the deadzone, so a still device reads exactly `0.0`. `0.0f` makes it click-only.
+- **Never asleep mid-click:** the button being held is itself activity, so a long drag cannot time out
+  and leave the host with a stuck button.
+- **Sleep drops the backlog.** Motion that accumulates while asleep is discarded rather than sent on
+  wake, which is what stops a wake from flinging the cursor across the screen.
+
+```
+hid=awake (button), idle timeout 60 s
+hid=sleep (idle), click to wake
+```
+
+State, timeout and rate are all in the sketch and listed in [Configuration](#configuration):
+`kSleepIdleTimeoutMs` and `kSleepMinRateDps`. Watch them from the log as `state=`, `idle_ms=` and
+`sleep_rate=` on the periodic line — hold the device the way you normally use it and read `sleep_rate=`
+to pick a threshold from what you actually see.
+
 ## Serial output
 
 A debug view of the pipeline, at `kPrintIntervalMs`, with `kSerialLogEnabled = true`:
 
 ```
- roll_deg= -83.6 ptr_dps= 25.7 33.8 ptr_deg= -4.1 57.6 read_err= 1245/134200 ci_ms= 7.5 tx_s= 52
- win= 257 try= 55 pace= 16 align= 98 lat= 0 miss= 0 loop_hz= 413
+ roll_deg= -83.6 ptr_dps= 25.7 33.8 ptr_deg= -4.1 57.6 state= awake idle_ms= 3142 sleep_rate= 42.6
+ read_err= 1245/134200 ci_ms= 7.5 tx_s= 52 win= 257 try= 55 pace= 16 align= 98 lat= 0 miss= 0 loop_hz= 413
 ```
 
 That capture predates the pacing margin: `try` above `tx_s` is the queue being filled, and `pace` now
@@ -106,6 +140,9 @@ parks near `1000 / tx_s + 2` instead.
 | `accel_mg` / `plane_g` / `gyro` | raw gravity, the gravity landing in the assumed plane, and raw rates. Only printed with `kPrintAxisDiag` on: they are the axis-mapping toolkit, see [Axis mapping](#axis-mapping--verified-on-hardware) |
 | `ptr_dps` | roll-compensated pointer rates, (horizontal, vertical), deg/s, after the deadzone — so `0.0` at rest is the confirmation that nothing is creeping |
 | `ptr_deg` | those rates integrated — pointer movement so far, wrapped to ±180° |
+| `state` | `awake` or `sleep`. `sleep` is the boot state and means no reports are being sent — see [Sleep and wake](#sleep-and-wake) |
+| `idle_ms` | time since the last click or real movement while awake. Sleeps at `kSleepIdleTimeoutMs` |
+| `sleep_rate` | pointer speed, deg/s, that the sleep check compares against `kSleepMinRateDps`. Printed while awake only, so the threshold can be set from a real capture |
 | `read_err` | failed I2C transactions / attempted. Hidden until it is non-zero |
 | `ci_ms` | negotiated BLE connection interval — the report period before the radio's own limits are applied. Shown once connected |
 | `tx_s` | reports the radio *accepted* per second: the pointer's real update rate. It tracks `(1000 / ci_ms) / 2.5`, **not** `1000 / ci_ms` — see [What actually sets the report rate](#what-actually-sets-the-report-rate). Measured 26–27/s at a 15 ms interval and 52/s at 7.5 ms, one report per 2.5 events at both |
@@ -431,6 +468,8 @@ compositor) adds a frame or two on top. A gyro air pointer will not feel like a 
 | `kHidReportFloorMs` / `CeilMs` | 5 / 50 | Clamp on the paced report period |
 | `kHidIdleReportEnabled` / `Ms` | false / 100 | Optional zero-motion keepalive if the host sleeps the link |
 | `kButtonDebounceMs` | 20 | Button debounce window |
+| `kSleepIdleTimeoutMs` | 60000 | How long after the last click or real movement before the device goes back to sleep. See [Sleep and wake](#sleep-and-wake) |
+| `kSleepMinRateDps` | 10.0 | Pointer rate, in deg/s, that counts as real movement and keeps the device awake — same unit as `ptr_dps`. `0.0f` = clicks only |
 | `kSerialLogEnabled` | false | Master switch for every print, including the periodic line — see [Serial output](#serial-output) |
 | `kImuI2cClockHz` | 400000 | IMU bus clock, at the part's ceiling. Slower is measurably *worse* here — see [I2C reliability](#i2c-reliability) |
 | `kLinkPollMs` / `kConnPollMs` | 50 / 100 | How often the cached link state and the connection interval are re-read. Both are polled rather than checked per pass, because each query services the whole stack |
@@ -528,6 +567,10 @@ rolls.
   acceleration as well as gravity) and is held stale when the device points steeply up or down,
   where gravity stops defining a roll.
 - The embedded FIFO and the IMU interrupt pin (`IMU_INT`, D24) are unused.
+- Sleep is a reporting state, not a power state: the IMU keeps sampling and the button keeps being
+  polled, so the device is quiet at the host but still drawing its usual current. Putting the sensor and
+  the radio to sleep would need a wake source that survives it — the button is one, but the soft device
+  has to stay up for BLE, so the saving would be the sensor's alone.
 - A single HID report carries at most ±127 counts per axis, because the report fields are signed
   8-bit. With the paced ~20 ms period and the shipped gain that is a ~400 deg/s ceiling: the fastest
   flicks saturate and drain over the following reports, arriving a little late rather than short.
