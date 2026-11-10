@@ -8,9 +8,13 @@
  * Gyro about world-vertical drives horizontal motion, about the screen-horizontal
  * axis drives vertical motion, and about the aiming axis is discarded; roll
  * compensation keeps the pointer axes on screen when the device is banked.
- * Onboard button = left click, and the only way to wake the device: it boots
- * asleep, reports nothing, and stays awake while the pointer keeps being used,
- * going quiet again after a minute without a click or real movement.
+ *
+ * A 5-way switch (common leg to GND) sits alongside the onboard button: up/down
+ * turn the wheel, centre is left click, right is the host's back button, and left
+ * is a middle click on a tap or precision mode after a 2 s hold. The onboard
+ * button and the centre contact both left-click and both wake the device: it
+ * boots asleep, reports nothing, and stays awake while the pointer keeps being
+ * used, going quiet again after a minute without a click or real movement.
  *
  * Hold the board still at power-up: it measures the gyro bias first, then pair with
  * "Air Mouse" from the host's Bluetooth settings. Wiring, diagnostics, tuning and
@@ -88,6 +92,27 @@ static LogSerial g_logSerial;
 
 // Onboard Sense IMU bus (SDA = D12, SCL = D11).
 static TwoWire& imuBus = Wire1;
+
+// 5-way navigation switch: common leg to GND, one contact per direction, all
+// INPUT_PULLUP so a pressed direction reads LOW. The mapping was measured with
+// Test_Nav_Switch, not assumed -- which contact is which direction is a property
+// of how the switch is soldered, and nothing here can know it in advance.
+//
+// Polled rather than interrupt-driven: D9/D10 are P2 pins, and this core cannot
+// attach an interrupt to port 2 (digitalPinToInterrupt() returns
+// NOT_AN_INTERRUPT, and attachInterrupt() then returns silently), so three
+// directions could raise an edge and two could not. Polling treats all five the
+// same and costs five register reads a pass.
+enum NavIndex : uint8_t {
+  kNavLeft = 0,
+  kNavRight,
+  kNavCenter,
+  kNavUp,
+  kNavDown,
+  kNavCount
+};
+static const uint8_t kNavPins[kNavCount] = {PIN_D1, PIN_D10, PIN_D2, PIN_D9, PIN_D0};
+static const char* const kNavNames[kNavCount] = {"left", "right", "centre", "up", "down"};
 
 // LSM6DS3TR-C register map (only the registers this sketch touches).
 static const uint8_t kRegWhoAmI  = 0x0F;  // WHO_AM_I, expected 0x6A
@@ -208,7 +233,9 @@ static const char kDeviceName[] = "Air Mouse";
 // Base pointer sensitivity, in HID counts per degree. Hosts add their own acceleration
 // on top, so this is the device's scale, not the feel. Never lowered to duck the 8-bit
 // report ceiling -- that only made the pointer slow (8.0f felt bad). See README,
-// "Configuration" for that arithmetic.
+// "Configuration" for that arithmetic. Precision mode multiplies it by
+// kPrecisionGainScale for fine aiming; the ceiling arithmetic below is for this base
+// value, and halving the gain doubles the headroom.
 static const float kHidCountsPerDeg = 16.0f;
 
 // Cadence: one hand-over per attempt period (see hidMaintainPace), which follows
@@ -280,6 +307,31 @@ static const float kHidDeadzoneDps = 3.0f;
 // Onboard button, active low, as left click.
 static const uint8_t  kButtonPin        = PIN_BUTTON;
 static const uint32_t kButtonDebounceMs = 20;
+
+// 5-way switch. The five contacts are one switch, so they settle together and
+// are debounced together (see navPoll), on the same window as the onboard button.
+static const uint32_t kNavDebounceMs = 20;
+
+// Up/down drive the wheel. One detent on the press, then a repeat while the
+// direction is held: a momentary switch makes exactly one step otherwise, which
+// cannot scroll a page. 400 ms before the first repeat is roughly the delay a
+// keyboard uses, so a deliberate single step is still one step.
+static const uint32_t kScrollFirstRepeatMs = 400;
+static const uint32_t kScrollRepeatMs      = 80;   // ~12 detents/s once repeating
+static const int8_t   kScrollUp            = 1;    // HID wheel: positive scrolls away from the user
+static const int8_t   kScrollDown          = -1;
+static const int8_t   kPendingWheelCap     = 8;    // detents, so a stalled link cannot dump a burst
+
+// Left contact, which has two jobs and therefore has to be timed: a tap is a
+// middle click, a hold toggles precision mode. The click is emitted on release,
+// because only then is the press known not to be a hold; the toggle fires the
+// moment the hold is reached, so the release that follows does nothing.
+static const uint32_t kPrecisionHoldMs    = 2000;
+static const float    kPrecisionGainScale = 0.5f;  // half gain while on: fine aiming
+
+// The board's single LED is otherwise unused, and a mode with no feedback is a
+// mode you cannot tell you are in. Lit while precision mode is on.
+static const bool kPrecisionLedEnabled = true;
 
 // Sleep and wake. The device boots asleep: no reports, so a device lying on the
 // desk -- or in a bag -- cannot drift the host's cursor or keep it from idling.
@@ -415,6 +467,26 @@ static uint32_t g_hidConnPollMs = 0;
 static bool     g_buttonRaw      = false;
 static bool     g_buttonStable   = false;
 static uint32_t g_buttonChangeMs = 0;
+
+// 5-way switch state (see navTask). The masks hold one bit per NavIndex, set
+// when that direction is pressed.
+static uint8_t  g_navCandidate   = 0;  // raw level being timed
+static uint8_t  g_navDown        = 0;  // debounced
+static uint32_t g_navCandidateMs = 0;
+
+// Left contact: held-timer, whether the hold has already toggled the mode, and
+// the middle click the release may still owe.
+static bool     g_leftHeld       = false;
+static uint32_t g_leftPressMs    = 0;
+static bool     g_leftConsumed   = false;
+static uint8_t  g_middlePulses   = 0;  // reports still owed a middle press
+
+// Precision mode, and the wheel detents the next reports still owe.
+static bool     g_precision      = false;
+static bool     g_scrollActive   = false;
+static int8_t   g_scrollDir      = 0;
+static uint32_t g_scrollNextMs   = 0;
+static int8_t   g_pendingWheel   = 0;
 
 // Sleep state (see hidMaintainSleep). Starts asleep and never leaves that state
 // except on a click, so the value here is the power-up behaviour as well.
@@ -1004,6 +1076,8 @@ static void printState() {
   // woke the device. idle_ms counts up to kSleepIdleTimeoutMs while awake.
   Serial.print(" state= ");
   Serial.print(g_awake ? "awake" : "sleep");
+  Serial.print(" prec= ");
+  Serial.print(g_precision ? "on" : "off");
   if (g_awake) {
     Serial.print(" idle_ms= ");
     Serial.print(millis() - g_lastActivityMs);
@@ -1175,11 +1249,23 @@ static void hidBegin() {
   blebas.write(100);
 
   // Compact Zephyr-style HID report, which is the shape Android and Sony HID
-  // hosts compare against. Note this drops the wheel and pan fields.
-  blehid.setZephyrCompatibleMouse(true);
+  // hosts compare against. It is 3 bytes -- buttons masked to three bits, no
+  // wheel -- so it cannot carry the back button or a scroll detent, and the 5-way
+  // switch needs both. The full report map costs that host shape and buys the
+  // wheel, pan and five buttons; it is the only one of the two that can express
+  // the switch at all.
+  blehid.setZephyrCompatibleMouse(false);
   blehid.begin();
 
   pinMode(kButtonPin, INPUT_PULLUP);
+  for (uint8_t i = 0; i < kNavCount; ++i) {
+    pinMode(kNavPins[i], INPUT_PULLUP);
+  }
+
+  if (kPrecisionLedEnabled) {
+    pinMode(PIN_LED_BUILTIN, OUTPUT);
+    digitalWrite(PIN_LED_BUILTIN, !LED_STATE_ON);  // off: the LED is active low
+  }
 
   hidStartAdvertising();
   Serial.print("ble=advertising as \"");
@@ -1187,8 +1273,8 @@ static void hidBegin() {
   Serial.println("\" (pair from the host, HID needs an encrypted link)");
 
   // Stated at boot because it is the one behaviour that looks like a fault: the
-  // pointer does nothing until the button has been clicked.
-  Serial.println("hid=sleep on boot, click the button to wake");
+  // pointer does nothing until the primary button has been clicked.
+  Serial.println("hid=sleep on boot, click the button or the switch centre to wake");
 }
 
 // Refreshes the cached link answer. Every query below starts by running the stack
@@ -1211,14 +1297,25 @@ static bool hidLinkReady() {
 // Degrees to HID counts, clamped to the signed 8-bit report field. Rounded rather
 // than truncated: truncation would make slow rotation build a whole count before
 // anything is sent, exactly where fine positioning happens.
-static int8_t hidCountsFor(float deg) {
-  long whole = lroundf(deg * kHidCountsPerDeg);
+//
+// The gain is passed in rather than read from the constant, because precision
+// mode changes it and the caller must subtract the same value it converted with:
+// g_pendingDeg is in degrees, so a mode change mid-flight cannot lose motion.
+static int8_t hidCountsFor(float deg, float gain) {
+  long whole = lroundf(deg * gain);
   if (whole > 127) {
     whole = 127;
   } else if (whole < -127) {
     whole = -127;
   }
   return static_cast<int8_t>(whole);
+}
+
+// The gain in force. Halving it in precision mode is the whole point: the
+// pointer moves half as far for the same hand motion, so the finest aiming the
+// sensor can resolve lands on a usable number of screen pixels.
+static float hidGain() {
+  return g_precision ? (kHidCountsPerDeg * kPrecisionGainScale) : kHidCountsPerDeg;
 }
 
 // Non-blocking debounce: PIN_BUTTON is active low with the internal pull-up.
@@ -1244,11 +1341,187 @@ static void hidNoteActivity(uint32_t nowMs) {
   g_lastActivityMs = nowMs;
 }
 
+// ---------------------------------------------------------------------------
+// 5-way switch
+// ---------------------------------------------------------------------------
+
+static bool navDown(NavIndex index) {
+  return (g_navDown & (1U << index)) != 0U;
+}
+
+// One pass over the five contacts. All low means pressed: the switch's common
+// leg is GND and every pin is pulled up.
+static uint8_t navReadMask() {
+  uint8_t mask = 0;
+  for (uint8_t i = 0; i < kNavCount; ++i) {
+    if (digitalRead(kNavPins[i]) == LOW) {
+      mask |= static_cast<uint8_t>(1U << i);
+    }
+  }
+  return mask;
+}
+
+// The onboard button and the centre contact are the same thing to the host, and
+// either one wakes the device -- the switch's other directions are not allowed
+// to, so a hand brushing the case cannot bring it out of sleep.
+static bool hidPrimaryDown() {
+  return g_buttonStable || navDown(kNavCenter);
+}
+
+// Wheel detents owed to the next reports. Capped for the same reason
+// kHidPendingCapDeg is: if the link stalls, scrolling must not continue after
+// the hand has stopped.
+static void navAddWheel(int8_t detents) {
+  int16_t pending = static_cast<int16_t>(g_pendingWheel) + detents;
+  if (pending > kPendingWheelCap) {
+    pending = kPendingWheelCap;
+  } else if (pending < -kPendingWheelCap) {
+    pending = -kPendingWheelCap;
+  }
+  g_pendingWheel = static_cast<int8_t>(pending);
+}
+
+// Up/down as the wheel. One detent on the press, then a repeat while the
+// direction is held -- so this is polled every pass rather than run on edges:
+// the repeat is a timer, and the level is the only thing that says it is still
+// wanted.
+static void navPollScroll(uint32_t nowMs) {
+  const bool up   = navDown(kNavUp);
+  const bool down = navDown(kNavDown);
+
+  // Both at once is not a direction. Treated as no scroll rather than picking
+  // one, which would make the result depend on the order of the pin table.
+  int8_t dir = 0;
+  if (up != down) {
+    dir = up ? kScrollUp : kScrollDown;
+  }
+
+  if (dir == 0) {
+    g_scrollActive = false;
+    return;
+  }
+  if (!g_scrollActive || dir != g_scrollDir) {
+    g_scrollActive = true;
+    g_scrollDir    = dir;
+    navAddWheel(dir);
+    g_scrollNextMs = nowMs + kScrollFirstRepeatMs;
+    return;
+  }
+  // Signed compare, so the deadline survives the millis() wrap.
+  if (static_cast<int32_t>(nowMs - g_scrollNextMs) < 0) {
+    return;
+  }
+  navAddWheel(dir);
+  g_scrollNextMs = nowMs + kScrollRepeatMs;
+}
+
+// The left contact's second job, and the reason it is timed at all: once the
+// press is old enough it stops being a click and becomes a mode toggle. Firing
+// on the way *into* the hold rather than on release is what makes the toggle
+// feel immediate and lets the release be silent.
+static void navPollLeftHold(uint32_t nowMs) {
+  if (!g_leftHeld || g_leftConsumed) {
+    return;
+  }
+  if ((nowMs - g_leftPressMs) < kPrecisionHoldMs) {
+    return;
+  }
+  g_leftConsumed = true;
+  g_precision    = !g_precision;
+  hidNoteActivity(nowMs);
+
+  if (kPrecisionLedEnabled) {
+    // Active low on this board.
+    digitalWrite(PIN_LED_BUILTIN, g_precision ? LED_STATE_ON : !LED_STATE_ON);
+  }
+
+  Serial.print("nav=precision ");
+  Serial.println(g_precision ? "on (half gain)" : "off (normal gain)");
+}
+
+// Debounce all five contacts as one switch: they settle together, and a press is
+// not news until the whole set has held still. Same window as the onboard button.
+static void navPoll(uint32_t nowMs) {
+  const uint8_t raw = navReadMask();
+  if (raw != g_navCandidate) {
+    // Still moving: restart the settle window. Nothing is believed until a
+    // level survives it.
+    g_navCandidate   = raw;
+    g_navCandidateMs = nowMs;
+    return;
+  }
+  if (raw == g_navDown) {
+    return;
+  }
+  if ((nowMs - g_navCandidateMs) < kNavDebounceMs) {
+    return;
+  }
+
+  const uint8_t previous = g_navDown;
+  g_navDown = raw;
+
+  if (raw != 0U) {
+    hidNoteActivity(nowMs);  // pressing the switch is use, whichever direction
+  }
+
+  for (uint8_t i = 0; i < kNavCount; ++i) {
+    const bool was = (previous & (1U << i)) != 0U;
+    const bool now = (g_navDown & (1U << i)) != 0U;
+    if (was == now) {
+      continue;
+    }
+    Serial.print("nav=");
+    Serial.print(kNavNames[i]);
+    Serial.println(now ? " down" : " up");
+  }
+
+  // Left: the press arms the hold timer, the release decides what it was.
+  if (navDown(kNavLeft) && (previous & (1U << kNavLeft)) == 0U) {
+    g_leftHeld     = true;
+    g_leftPressMs  = nowMs;
+    g_leftConsumed = false;
+  } else if (!navDown(kNavLeft) && (previous & (1U << kNavLeft)) != 0U) {
+    g_leftHeld = false;
+    if (!g_leftConsumed) {
+      // A tap, so it owes a middle click. Counted in reports rather than timed:
+      // one report carries the press and the next one ends it, whatever the link
+      // is doing, where a pulse on a timer can expire before the report is
+      // handed over and lose the click entirely.
+      g_middlePulses = 1;
+    }
+  }
+}
+
+// Everything the switch needs per pass, in one place, so hidTask stays a report
+// pump: edges, the hold timer, and the scroll repeat.
+static void navTask(uint32_t nowMs) {
+  navPoll(nowMs);
+  navPollLeftHold(nowMs);
+  navPollScroll(nowMs);
+}
+
+// The button bits the switch is asking for right now. Centre is a plain left
+// click; right is the host's back button, which is why the report is no longer
+// the compact Zephyr one -- see hidBegin.
+static uint8_t navButtonBits() {
+  uint8_t bits = 0;
+  if (navDown(kNavCenter)) {
+    bits |= MOUSE_BUTTON_LEFT;
+  }
+  if (navDown(kNavRight)) {
+    bits |= MOUSE_BUTTON_BACKWARD;
+  }
+  if (g_middlePulses != 0U) {
+    bits |= MOUSE_BUTTON_MIDDLE;
+  }
+  return bits;
+}
+
 // Wake on a click, sleep after kSleepIdleTimeoutMs without one. Runs before the
 // link is consulted, so the state is coherent whether or not a host is attached.
 static void hidMaintainSleep(uint32_t nowMs) {
   if (!g_awake) {
-    if (g_buttonStable) {
+    if (hidPrimaryDown()) {
       g_awake = true;
       hidNoteActivity(nowMs);
       Serial.print("hid=awake (button), idle timeout ");
@@ -1258,9 +1531,16 @@ static void hidMaintainSleep(uint32_t nowMs) {
     return;
   }
 
-  // Holding the button is use by itself, and it also makes a stuck button
+  // Holding a button is use by itself, and it also makes a stuck button
   // impossible: a drag cannot time out and leave the host with it held down.
-  if (g_buttonStable) {
+  if (hidPrimaryDown()) {
+    hidNoteActivity(nowMs);
+    return;
+  }
+
+  // The same for the other directions: a scroll that is still being held, or a
+  // back button, must not time out and then be released into nothing.
+  if (g_navDown != 0U) {
     hidNoteActivity(nowMs);
     return;
   }
@@ -1496,6 +1776,8 @@ static void hidMaintainConnInterval(uint32_t nowMs) {
 }
 
 static void hidTask(uint32_t nowMs) {
+  // The switch first: its edges are what the report below is composed from.
+  navTask(nowMs);
   hidPollButton(nowMs);
   hidMaintainSleep(nowMs);
   hidPollLink(nowMs);
@@ -1507,6 +1789,8 @@ static void hidTask(uint32_t nowMs) {
     // link comes back, which would fling the cursor across the screen.
     g_pendingDeg[0] = 0.0f;
     g_pendingDeg[1] = 0.0f;
+    g_pendingWheel = 0;
+    g_middlePulses = 0;
     g_hidLastButtons = 0;
     g_hidLastReportMs = nowMs;
     g_hidLastKeepaliveMs = nowMs;
@@ -1522,6 +1806,8 @@ static void hidTask(uint32_t nowMs) {
     // click that wakes it leaves at once rather than a period late.
     g_pendingDeg[0] = 0.0f;
     g_pendingDeg[1] = 0.0f;
+    g_pendingWheel = 0;
+    g_middlePulses = 0;
     g_hidLastButtons = 0;
     return;
   }
@@ -1542,17 +1828,23 @@ static void hidTask(uint32_t nowMs) {
                   (uint32_t)(timing.nowUs - g_hidLastWindowUs) >= windowSpacingUs);
   }
 
-  const uint8_t buttons = g_buttonStable ? MOUSE_BUTTON_LEFT : 0;
+  const uint8_t buttons =
+      (g_buttonStable ? MOUSE_BUTTON_LEFT : 0) | navButtonBits();
   const bool buttonChanged = (buttons != g_hidLastButtons);
   if (windowOpen) {
     ++g_hidWindowCount;
   }
-  const int8_t dx = hidCountsFor(g_pendingDeg[0]);
-  const int8_t dy = hidCountsFor(g_pendingDeg[1]);
+  // One gain for both directions of the round trip: what was converted to counts
+  // has to be subtracted as counts, or toggling precision mid-motion would leak
+  // motion into (or out of) the accumulator.
+  const float gain = hidGain();
+  const int8_t dx = hidCountsFor(g_pendingDeg[0], gain);
+  const int8_t dy = hidCountsFor(g_pendingDeg[1], gain);
+  const int8_t wheel = g_pendingWheel;
   const bool keepaliveDue =
       kHidIdleReportEnabled && ((nowMs - g_hidLastKeepaliveMs) >= kHidIdleReportMs);
 
-  if (dx == 0 && dy == 0 && !buttonChanged && !keepaliveDue) {
+  if (dx == 0 && dy == 0 && wheel == 0 && !buttonChanged && !keepaliveDue) {
     // Deliberately no g_hidLastReportMs refresh here. The period now means "since
     // the last hand-over", so letting it run out while the hand is still makes the
     // first report of the next movement leave at once instead of a period late.
@@ -1575,11 +1867,17 @@ static void hidTask(uint32_t nowMs) {
   hidRefreshReportPeriod();
   ++g_hidAttemptCount;
 
-  if (blehid.mouseReport(buttons, dx, dy, 0, 0)) {
+  if (blehid.mouseReport(buttons, dx, dy, wheel, 0)) {
     // Subtract only what was actually sent. The remainder stays pending, which
     // is what keeps slow movement smooth instead of quantised.
-    g_pendingDeg[0] -= static_cast<float>(dx) / kHidCountsPerDeg;
-    g_pendingDeg[1] -= static_cast<float>(dy) / kHidCountsPerDeg;
+    g_pendingDeg[0] -= static_cast<float>(dx) / gain;
+    g_pendingDeg[1] -= static_cast<float>(dy) / gain;
+    g_pendingWheel -= wheel;
+    if (g_middlePulses != 0U) {
+      // The press has been reported; the next report, which no longer carries the
+      // bit, is what ends it.
+      --g_middlePulses;
+    }
     g_hidLastButtons = buttons;
     g_hidLastKeepaliveMs = nowMs;
     ++g_hidReportCount;
