@@ -4,7 +4,8 @@ A Bluetooth HID air mouse for a Seeed XIAO nRF54L15 / Sense, built on the
 [`lolren/nrf54-arduino-core`](https://github.com/lolren/nrf54-arduino-core) board package.
 
 `Air_Mouse.ino` reads the board's built-in ST **LSM6DS3TR-C**, turns the gyro into roll-compensated
-pointer motion, and reports it as a standard BLE mouse. The onboard button is a left click.
+pointer motion, and reports it as a standard BLE mouse. The onboard button is a left click, and a
+5-way switch adds the wheel, the back button, a middle click and a precision mode.
 
 ## Hardware
 
@@ -14,6 +15,11 @@ pointer motion, and reports it as a standard BLE mouse. The onboard button is a 
 | IMU SCL | D11 | P0.03 | back-pad bus, exposed as `Wire1` |
 | IMU power gate | D20 / `IMU_MIC_EN` | P0.01 | shared IMU + microphone rail, must be HIGH |
 | Left click | `PIN_BUTTON` | P0.00 | onboard button, active low |
+| Switch left | D1 | P1.05 | middle click / precision mode |
+| Switch right | D10 | P2.02 | host back button |
+| Switch centre | D2 | P1.06 | left click, wakes the device |
+| Switch up | D9 | P2.04 | scroll up |
+| Switch down | D0 | P1.04 | scroll down |
 
 - The IMU is only populated on **Sense** boards. On a plain (non-Sense) XIAO the sketch reports
   `imu=not-found` and never starts BLE.
@@ -64,8 +70,9 @@ ble=advertising as "Air Mouse" (pair from the host, HID needs an encrypted link)
 Then pair from the host: **Settings → Bluetooth → "Air Mouse"**. The console logs
 `ble=connected, pairing`, and after pairing, motion and clicks start working.
 
-The device **boots asleep** (`hid=sleep on boot, click the button to wake`) and reports nothing until the
-button is clicked, so pairing itself does not make the pointer move — see [Sleep and wake](#sleep-and-wake).
+The device **boots asleep** (`hid=sleep on boot, click the button or the switch centre to wake`) and
+reports nothing until it is woken, so pairing itself does not make the pointer move — see
+[Sleep and wake](#sleep-and-wake).
 
 The connection interval is published at **7.5 ms** (units 6/6), through the standard GAP
 characteristic `0x2A04` that hosts read during service discovery. **On Android that is only a
@@ -98,19 +105,22 @@ all, so a device lying on the desk, or rattling around in a bag, cannot drift th
 the host from going idle. Pairing is unaffected: the link comes up as usual, it is only the reports that
 are withheld.
 
-- **Wake:** the primary mouse button. The click that wakes it is also delivered, because it is a real
-  click — the wake is not a separate gesture.
-- **Stay awake:** a rolling timer. A click, or a pointer rate at or above `kSleepMinRateDps`, restarts it;
-  the device goes back to sleep `kSleepIdleTimeoutMs` after the last one. So it drops out one minute after
-  you actually stop using it, not one minute after you picked it up.
+- **Wake:** the primary mouse button — the onboard button **or** the switch's centre contact. The click
+  that wakes it is also delivered, because it is a real click; the wake is not a separate gesture. The
+  switch's other four directions deliberately do **not** wake it, so a hand brushing the case cannot
+  bring it out of sleep.
+- **Stay awake:** a rolling timer. A click, any switch direction, or a pointer rate at or above
+  `kSleepMinRateDps`, restarts it; the device goes back to sleep `kSleepIdleTimeoutMs` after the last one.
+  So it drops out one minute after you actually stop using it, not one minute after you picked it up.
 - **"Real movement" is a rate, not a distance.** `kSleepMinRateDps` is in **deg/s**, the same unit as
   `kHidDeadzoneDps` and the `ptr_dps` field in the log: aiming moves the pointer at tens of deg/s, while a
   device on a table, in a bag, or resting under a hand sits at the deadzone's noise floor. It is measured
   *after* the deadzone, so a still device reads exactly `0.0`. `0.0f` makes it click-only.
-- **Never asleep mid-click:** the button being held is itself activity, so a long drag cannot time out
-  and leave the host with a stuck button.
+- **Never asleep mid-click:** a button being held is itself activity, so a long drag cannot time out
+  and leave the host with a stuck button. The same holds for a held scroll or back button.
 - **Sleep drops the backlog.** Motion that accumulates while asleep is discarded rather than sent on
-  wake, which is what stops a wake from flinging the cursor across the screen.
+  wake, which is what stops a wake from flinging the cursor across the screen. Wheel detents and a
+  pending middle click are dropped with it.
 
 ```
 hid=awake (button), idle timeout 60 s
@@ -122,12 +132,61 @@ State, timeout and rate are all in the sketch and listed in [Configuration](#con
 `sleep_rate=` on the periodic line — hold the device the way you normally use it and read `sleep_rate=`
 to pick a threshold from what you actually see.
 
+## 5-way switch
+
+A 5-way tactile switch sits alongside the onboard button: common leg to GND, one contact per direction,
+each pin pulled up internally so a pressed direction reads LOW. The mapping is a property of how the
+switch is wired, so it was measured with [`Test_Nav_Switch`](../Test_Nav_Switch/Test_Nav_Switch.ino)
+rather than assumed:
+
+| Direction | Pin | Does |
+| --- | --- | --- |
+| up | D9 | wheel up — one detent, then repeats while held |
+| down | D0 | wheel down |
+| centre | D2 | left click, and wakes the device |
+| right | D10 | host back button (`MOUSE_BUTTON_BACKWARD`) |
+| left | D1 | middle click on a tap, **precision mode** on a 2 s hold |
+
+The five contacts are debounced as one switch (20 ms, the same window as the onboard button), because
+they settle together and a press is not news until the whole set has held still. They are **polled**,
+not interrupt-driven: D9/D10 are P2 pins, and this core cannot attach an interrupt to port 2 —
+`digitalPinToInterrupt()` returns `NOT_AN_INTERRUPT` and `attachInterrupt()` then returns silently — so
+three directions could raise an edge and two could not. Five register reads a pass is cheaper than the
+asymmetry.
+
+**Scroll repeats, because a momentary switch cannot.** One detent on the press, then `kScrollFirstRepeatMs`
+(400 ms) before the first repeat and `kScrollRepeatMs` (80 ms, ~12 detents/s) after it. Without the repeat
+a press is a single line and a page cannot be scrolled. Both directions at once is not a direction, so it
+scrolls nothing rather than picking one.
+
+**Precision mode** halves the pointer gain (`kPrecisionGainScale`), which is what makes fine aiming
+possible: an air pointer's weakness is not speed but the last few pixels, and half the gain halves the
+smallest motion that can land on one. It is a **toggle**, triggered by holding the left contact for
+`kPrecisionHoldMs` (2 s), and the board's otherwise-unused LED is lit while it is on — a mode with no
+feedback is a mode you cannot tell you are in.
+
+Two details of that timing are deliberate:
+
+- The toggle fires when the hold *completes*, not on release, so the mode changes while you are still
+  holding the button.
+- The middle click fires on **release**, because only then is the press known not to be a hold. It is
+  emitted as one report with the middle button down and the next one without, counted rather than timed,
+  so a slow link cannot swallow it the way a fixed-width pulse can.
+
+```cpp
+kPrecisionGainScale = 0.5f;   // half gain; 1.0f disables the feature's effect
+kPrecisionHoldMs    = 2000;   // shorter = easier to trigger by accident
+```
+
+Because the gain is only used at report time and the accumulator is in degrees, the mode can be toggled
+mid-motion without losing or duplicating movement.
+
 ## Serial output
 
 A debug view of the pipeline, at `kPrintIntervalMs`, with `kSerialLogEnabled = true`:
 
 ```
- roll_deg= -83.6 ptr_dps= 25.7 33.8 ptr_deg= -4.1 57.6 state= awake idle_ms= 3142 sleep_rate= 42.6
+ roll_deg= -83.6 ptr_dps= 25.7 33.8 ptr_deg= -4.1 57.6 state= awake prec= off idle_ms= 3142 sleep_rate= 42.6
  read_err= 1245/134200 ci_ms= 7.5 tx_s= 52 win= 257 try= 55 pace= 16 align= 98 lat= 0 miss= 0 loop_hz= 413
 ```
 
@@ -141,6 +200,7 @@ parks near `1000 / tx_s + 2` instead.
 | `ptr_dps` | roll-compensated pointer rates, (horizontal, vertical), deg/s, after the deadzone — so `0.0` at rest is the confirmation that nothing is creeping |
 | `ptr_deg` | those rates integrated — pointer movement so far, wrapped to ±180° |
 | `state` | `awake` or `sleep`. `sleep` is the boot state and means no reports are being sent — see [Sleep and wake](#sleep-and-wake) |
+| `prec` | `on` or `off` — precision mode (half gain), toggled by a 2 s hold on the switch's left contact |
 | `idle_ms` | time since the last click or real movement while awake. Sleeps at `kSleepIdleTimeoutMs` |
 | `sleep_rate` | pointer speed, deg/s, that the sleep check compares against `kSleepMinRateDps`. Printed while awake only, so the threshold can be set from a real capture |
 | `read_err` | failed I2C transactions / attempted. Hidden until it is non-zero |
@@ -274,6 +334,12 @@ The rules that shape the code, all of them from the core's own HID example:
 
 - **Reports require an encrypted link.** `mouseReport()` returns `false` until the link is paired, so
   the sketch is a no-op until then.
+- **The full report descriptor, not the compact Zephyr one** (`setZephyrCompatibleMouse(false)`). The
+  Zephyr-compatible report is 3 bytes — `{buttons & 0x07, x, y}` — which drops the wheel byte and masks
+  the button bitmap down to three bits, so it can carry neither a scroll detent nor
+  `MOUSE_BUTTON_BACKWARD`. The switch needs both. The full map is 5 buttons + X/Y/wheel/pan; the cost
+  is the report shape that Android and Sony HID hosts compare against, and it is why changing this
+  needs a re-pair (the host caches the descriptor it was told about).
 - **Sampling and reporting are decoupled.** Motion accumulates in degrees at 416 Hz and is converted
   to counts only when a report is actually sent. Reporting at the IMU rate would just queue
   notifications and add latency.
@@ -468,6 +534,13 @@ compositor) adds a frame or two on top. A gyro air pointer will not feel like a 
 | `kHidReportFloorMs` / `CeilMs` | 5 / 50 | Clamp on the paced report period |
 | `kHidIdleReportEnabled` / `Ms` | false / 100 | Optional zero-motion keepalive if the host sleeps the link |
 | `kButtonDebounceMs` | 20 | Button debounce window |
+| `kNavDebounceMs` | 20 | Debounce window for the 5-way switch. All five contacts are one switch, so they are settled together |
+| `kScrollFirstRepeatMs` | 400 | Delay before a held up/down starts repeating, so a deliberate single step stays a single step |
+| `kScrollRepeatMs` | 80 | Repeat period while held — ~12 detents/s. `0` disables the repeat |
+| `kPendingWheelCap` | 8 | Ceiling on unreported detents, so a stalled link cannot dump a burst of scroll after the hand stops |
+| `kPrecisionHoldMs` | 2000 | How long the left contact must be held to toggle precision mode. Below the tap/hold boundary the release is a middle click |
+| `kPrecisionGainScale` | 0.5 | Gain multiplier while precision mode is on. `1.0f` makes the mode a no-op |
+| `kPrecisionLedEnabled` | true | Light the onboard LED while precision mode is on |
 | `kSleepIdleTimeoutMs` | 60000 | How long after the last click or real movement before the device goes back to sleep. See [Sleep and wake](#sleep-and-wake) |
 | `kSleepMinRateDps` | 10.0 | Pointer rate, in deg/s, that counts as real movement and keeps the device awake — same unit as `ptr_dps`. `0.0f` = clicks only |
 | `kSerialLogEnabled` | false | Master switch for every print, including the periodic line — see [Serial output](#serial-output) |
@@ -575,6 +648,11 @@ rolls.
   8-bit. With the paced ~20 ms period and the shipped gain that is a ~400 deg/s ceiling: the fastest
   flicks saturate and drain over the following reports, arriving a little late rather than short.
   Raising it means a 16-bit report, which is a change to the core's HID descriptor, not to this sketch.
+- The full HID report map costs the compact Zephyr-compatible report shape, which is what Android and
+  Sony hosts look for when deciding a device is a mouse. Everything works with the full map, but a host
+  that insists on the Zephyr shape cannot be served at the same time as the wheel and the back button:
+  the compact report is 3 bytes and has room for neither. The sketch takes the full map because the
+  switch is useless without them.
 - One connection interval of transmission delay is unavoidable, and the host's input pipeline adds
   more. `ci_ms=` in the log is the part of it this sketch can see. What the host settles on is its own
   decision: Android's default for a GATT client is `CONNECTION_PRIORITY_BALANCED` (30–50 ms), and the
