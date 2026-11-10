@@ -8,7 +8,9 @@
  * Gyro about world-vertical drives horizontal motion, about the screen-horizontal
  * axis drives vertical motion, and about the aiming axis is discarded; roll
  * compensation keeps the pointer axes on screen when the device is banked.
- * Onboard button = left click.
+ * Onboard button = left click, and the only way to wake the device: it boots
+ * asleep, reports nothing, and stays awake while the pointer keeps being used,
+ * going quiet again after a minute without a click or real movement.
  *
  * Hold the board still at power-up: it measures the gyro bias first, then pair with
  * "Air Mouse" from the host's Bluetooth settings. Wiring, diagnostics, tuning and
@@ -279,6 +281,21 @@ static const float kHidDeadzoneDps = 3.0f;
 static const uint8_t  kButtonPin        = PIN_BUTTON;
 static const uint32_t kButtonDebounceMs = 20;
 
+// Sleep and wake. The device boots asleep: no reports, so a device lying on the
+// desk -- or in a bag -- cannot drift the host's cursor or keep it from idling.
+// A click is the only way in; motion never wakes it, because motion is exactly
+// what it is asleep to ignore. Once awake it stays awake while the hand keeps
+// using it, and goes back to sleep kSleepIdleTimeoutMs after the last use.
+static const uint32_t kSleepIdleTimeoutMs = 60000;  // 1 min of quiet
+
+// What "using it" means besides a click: the pointer rate, in deg/s, the same
+// quantity and unit as kHidDeadzoneDps and kGyroFilterTauMs -- read it as ptr_dps
+// in the log. Aiming moves the pointer at tens of deg/s, so anything resting on a
+// table, being carried, or drifting through the deadzone stays well under it.
+// Raise it if the device sits awake when it should not; lower it if a slow,
+// precise pan lets it fall asleep mid-use. 0.0f = clicks only.
+static const float kSleepMinRateDps = 10.0f;
+
 // Some hosts like a periodic zero-motion report to stay awake.
 static const bool     kHidIdleReportEnabled = false;
 static const uint32_t kHidIdleReportMs      = 100;
@@ -398,6 +415,11 @@ static uint32_t g_hidConnPollMs = 0;
 static bool     g_buttonRaw      = false;
 static bool     g_buttonStable   = false;
 static uint32_t g_buttonChangeMs = 0;
+
+// Sleep state (see hidMaintainSleep). Starts asleep and never leaves that state
+// except on a click, so the value here is the power-up behaviour as well.
+static bool     g_awake          = false;
+static uint32_t g_lastActivityMs = 0;  // last click or deliberate move
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -978,6 +1000,21 @@ static void printState() {
   Serial.print(' ');
   Serial.print(g_ptrDeg[1], 1);
 
+  // Sleep is the boot state, so this is also how you tell whether a click actually
+  // woke the device. idle_ms counts up to kSleepIdleTimeoutMs while awake.
+  Serial.print(" state= ");
+  Serial.print(g_awake ? "awake" : "sleep");
+  if (g_awake) {
+    Serial.print(" idle_ms= ");
+    Serial.print(millis() - g_lastActivityMs);
+    // The rate the sleep check is reading, so the threshold can be set from data
+    // rather than guessed: this is the number that has to clear kSleepMinRateDps.
+    Serial.print(" sleep_rate= ");
+    Serial.print(sqrtf(g_ptrRateDps[0] * g_ptrRateDps[0] +
+                       g_ptrRateDps[1] * g_ptrRateDps[1]),
+                 1);
+  }
+
   // Only shown once the bus has actually misbehaved: 0/4823 means the sensor
   // is talking cleanly, a rising count means it is not.
   if (g_imuReadErrors != 0) {
@@ -1148,6 +1185,10 @@ static void hidBegin() {
   Serial.print("ble=advertising as \"");
   Serial.print(kDeviceName);
   Serial.println("\" (pair from the host, HID needs an encrypted link)");
+
+  // Stated at boot because it is the one behaviour that looks like a fault: the
+  // pointer does nothing until the button has been clicked.
+  Serial.println("hid=sleep on boot, click the button to wake");
 }
 
 // Refreshes the cached link answer. Every query below starts by running the stack
@@ -1194,6 +1235,50 @@ static void hidPollButton(uint32_t nowMs) {
   if (g_buttonStable != g_buttonRaw) {
     g_buttonStable = g_buttonRaw;
     Serial.println(g_buttonStable ? "button=down" : "button=up");
+  }
+}
+
+// Anything that should hold the device open restarts the idle window. One value,
+// because there is one question: when was the hand last demonstrably working?
+static void hidNoteActivity(uint32_t nowMs) {
+  g_lastActivityMs = nowMs;
+}
+
+// Wake on a click, sleep after kSleepIdleTimeoutMs without one. Runs before the
+// link is consulted, so the state is coherent whether or not a host is attached.
+static void hidMaintainSleep(uint32_t nowMs) {
+  if (!g_awake) {
+    if (g_buttonStable) {
+      g_awake = true;
+      hidNoteActivity(nowMs);
+      Serial.print("hid=awake (button), idle timeout ");
+      Serial.print(kSleepIdleTimeoutMs / 1000U);
+      Serial.println(" s");
+    }
+    return;
+  }
+
+  // Holding the button is use by itself, and it also makes a stuck button
+  // impossible: a drag cannot time out and leave the host with it held down.
+  if (g_buttonStable) {
+    hidNoteActivity(nowMs);
+    return;
+  }
+
+  // Aiming is use. Measured after the deadzone, so a device at rest reads exactly
+  // 0.0 and a hand merely resting on it stays in the noise the deadzone removes.
+  if (kSleepMinRateDps > 0.0f) {
+    const float rateDps = sqrtf(g_ptrRateDps[0] * g_ptrRateDps[0] +
+                                g_ptrRateDps[1] * g_ptrRateDps[1]);
+    if (rateDps >= kSleepMinRateDps) {
+      hidNoteActivity(nowMs);
+      return;
+    }
+  }
+
+  if ((nowMs - g_lastActivityMs) >= kSleepIdleTimeoutMs) {
+    g_awake = false;
+    Serial.println("hid=sleep (idle), click to wake");
   }
 }
 
@@ -1412,6 +1497,7 @@ static void hidMaintainConnInterval(uint32_t nowMs) {
 
 static void hidTask(uint32_t nowMs) {
   hidPollButton(nowMs);
+  hidMaintainSleep(nowMs);
   hidPollLink(nowMs);
   hidMaintainConnInterval(nowMs);
   hidMaintainPace(nowMs);
@@ -1425,6 +1511,18 @@ static void hidTask(uint32_t nowMs) {
     g_hidLastReportMs = nowMs;
     g_hidLastKeepaliveMs = nowMs;
     g_hidLastWindowUs = 0;
+    return;
+  }
+
+  if (!g_awake) {
+    // Asleep: silence, not merely zero motion. The backlog is dropped every pass so
+    // the first report after a wake starts from rest instead of flinging the cursor
+    // across the screen with motion that piled up while the device was idle.
+    // g_hidLastReportMs is deliberately left stale (see the note below), so the
+    // click that wakes it leaves at once rather than a period late.
+    g_pendingDeg[0] = 0.0f;
+    g_pendingDeg[1] = 0.0f;
+    g_hidLastButtons = 0;
     return;
   }
 
