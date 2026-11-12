@@ -11,6 +11,8 @@
 #    [1] device      esphome name, esp32 target, lwIP tuning
 #    [2] camera      pin map + the non-PSRAM memory profile + XGA boot frame
 #    [5] diagnostics Heap Free
+#    [6] LED         flash LED on GPIO4
+#    [7] web UI      drops the advanced controls this board cannot afford
 # =============================================================================
 
 # =============================================================================
@@ -56,7 +58,10 @@ substitutions:
   frame_buffer_bytes: "61440"
 
   # Value the "Gain Ceiling" control starts at. 16X (0x100 = 16x) is the closest
-  # step to the 15.5x the shared boot hook installs.
+  # step to the 15.5x the shared boot hook installs. The control itself is
+  # removed from this build's UI in [7], so the binding is only what the shared
+  # entity would show on the builds that keep it - keep it, because the shared
+  # YAML still references ${agc_ceiling_initial}.
   agc_ceiling_initial: "16X"
 
 packages:
@@ -167,3 +172,42 @@ light:
     web_server:
       sorting_group_id: cam_grp_basic
       sorting_weight: 40
+
+# =============================================================================
+#  [7] TRIMMED WEB UI
+# =============================================================================
+# cam_common.yaml declares every camera control, but this board has only a few
+# KB of free heap and the web server builds one ArduinoJson document per entity
+# when the page loads (the `state_detail_all` SSE queue). With all 39 entities
+# that exhausts the heap - "JSON document overflow" - and the page renders only
+# partially. `!remove` subtracts list entries by id after the package merge, so
+# the controls that are rarely touched here disappear from the UI, the entity
+# list and the /events stream (39 -> 26 entities) while cam_s3.yaml, which has
+# PSRAM to spare, keeps them all.
+#
+# Removed:
+#   White Balance Mode, Gain Ceiling, Special Effect (selects)
+#   Auto Exposure / Gain / White Balance, AWB Gain, BPC, WPC, LENC, DCW,
+#   RAW Gamma, Test Pattern (switches)
+# Kept in the Advanced group: Compression, the image sliders (Brightness,
+# Contrast, Saturation, Exposure Value/Level, Gain) and AEC2.
+#
+# Note the removal only affects the UI/entity list: the sensor keeps the
+# power-on defaults, and the shared on_boot hook still applies the AGC gain
+# ceiling fix. To restore one control, drop its line here.
+select:
+  - id: !remove cam_wb_mode           # White Balance Mode
+  - id: !remove cam_gain_ceiling      # Gain Ceiling (boot-time value still applied)
+  - id: !remove cam_special_effect    # Special Effect
+
+switch:
+  - id: !remove cam_aec               # Auto Exposure (AEC) - sensor default: on
+  - id: !remove cam_agc               # Auto Gain (AGC) - sensor default: on
+  - id: !remove cam_awb               # Auto White Balance (AWB) - sensor default: on
+  - id: !remove cam_awb_gain          # AWB Gain - sensor default: on
+  - id: !remove cam_bpc               # Black Pixel Correction
+  - id: !remove cam_wpc               # White Pixel Correction
+  - id: !remove cam_lenc              # Lens Correction
+  - id: !remove cam_dcw               # Downsize
+  - id: !remove cam_raw_gma           # RAW Gamma
+  - id: !remove cam_test_pattern      # Test Pattern

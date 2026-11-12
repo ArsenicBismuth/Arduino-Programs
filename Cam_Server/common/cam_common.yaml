@@ -1176,5 +1176,7 @@ switch:
 # -----------------------------------------------------------------------------
 # GPIO4 on the AI-Thinker is only the flash LED; GPIO21 on the XIAO is also the
 # microSD slot's D3/CS, and a card that sees that line low during reset latches
-# into SPI protocol mode instead of answering SD commands. Packages merge lists,
-# they cannot subtract an entry, so the LED lives in the board file that wants it.
+# into SPI protocol mode instead of answering SD commands. Packages merge lists
+# rather than replacing them, so the LED lives in the board file that wants it.
+# (cam.yaml uses `!remove` in [7] to hide shared controls, but that only drops
+# an entity by id - it cannot move a block from one file to another.)
