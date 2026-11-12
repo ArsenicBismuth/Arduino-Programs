@@ -448,3 +448,57 @@ i.e. UART0), not ESPHome's logger - hence the silence.
 - The buffer ceiling is hardware: UXGA needs ~384 KB contiguous internal DRAM, which the
   AI-Thinker (no PSRAM, ~320 KB total) does not have. The S3 boots with its buffers in PSRAM and
   is the board for large resolutions.
+
+### 2026-11-13 - cam.yaml now exposes a smaller control set ("JSON document overflow")
+
+**Symptom.** The AI-Thinker's web UI (`/`) regularly loaded only partially - some groups never
+rendered - and the serial log showed `[E][json:111] JSON document overflow` around it.
+
+**Cause.** As in the 2026-10-18 (c) entry, that message is ArduinoJson failing to allocate its
+pool, i.e. heap exhaustion. `web_server` v3 does not send one entity list: on page load it queues
+a `state_detail_all` SSE message per entity (name, icon, group, ...), each built in its own
+ArduinoJson document. This board has ~4-10 KB free heap, so a page load that fans out ~40 small
+allocations is where the heap runs out; the failed document aborts the queue and the page stops
+half-way. The register-level camera controls contributed most of those entities but are almost
+never used on this board.
+
+**Fix.** `cam.yaml` [7] subtracts them with ESPHome's `!remove` (list entries by id, applied after
+the package merge), so only that build changes:
+
+- removed: `White Balance Mode`, `Gain Ceiling`, `Special Effect`; the `Auto Exposure (AEC)`,
+  `Auto Gain (AGC)`, `Auto White Balance (AWB)`, `AWB Gain`, `BPC`, `WPC`, `LENC`, `DCW`,
+  `RAW Gamma` and `Test Pattern` switches.
+- kept in the Advanced group: `Compression`, `Brightness`, `Contrast`, `Saturation`,
+  `Exposure Value`, `Exposure Level`, `Gain`, `AEC DSP (AEC2)`.
+
+That is 39 -> 26 entities on `cam`. `cam_s3.yaml` still shows all of them (PSRAM plus a much
+larger heap). Everything removed keeps its sensor power-on default, and the shared `on_boot` AGC
+gain-ceiling repair still runs - `Gain Ceiling` was only the manual override.
+
+**If it still happens**, the remaining levers are the 2026-10-18 (c) / 2026-10-21 ones (one
+browser tab, no open `:8080` stream) plus removing more entities the same way in `cam.yaml` [7].
+
+### 2026-11-13 (b) - Resolution and Compression survive a restart
+
+**Change.** Both builds now remember the `Resolution` select and the `Compression` slider across
+reboots, OTA updates and power cuts: the entities carry `restore_value: true`, so their last value
+lives in the ESPHome preferences partition (the `esphome` preference blob, not the SD card).
+
+**Why it needs two pieces.** `restore_value` on a template select/number only restores the
+*published state* in `setup()` - it does not replay `set_action`, and the camera registers are
+rewritten with the YAML defaults by `esp32_camera` setup. So `common/cam_common.yaml` [1] adds an
+`on_boot` hook at priority **-101** that feeds the restored values back through the entities' own
+`make_call()...perform()` path. That reuses the string-to-`framesize_t` mapping (and the quality
+call) instead of a second copy, and -101 runs after every -100 hook - including `cam.yaml`'s
+"boot into XGA" lambda - so the stored choice is always the last writer.
+
+**Notes.**
+
+- Nothing is stored until the control is changed once; until then the boot behaviour is unchanged
+  (XGA on the AI-Thinker, UXGA on the S3, `compression_initial` from the board file).
+- The select stores the option *index*, so reordering the `options:` list shifts old saved values
+  (the range is checked, the meaning is not). The number stores the raw float, clamped by the
+  schema's min/max.
+- Each change is one small preference write; that is a UI action, not a per-frame cost.
+- A full-chip erase (`esptool erase_flash`, or a clean install) clears them, as with any ESPHome
+  preference.
