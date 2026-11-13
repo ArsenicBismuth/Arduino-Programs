@@ -61,6 +61,20 @@ esphome:
               ESP_LOGI("cam_ctl", "AGC gain ceiling -> 15.5x (0x3A18/0x3A19)");
             }
 
+    # Re-apply the persisted Resolution / Compression choices once everything is
+    # set up. A template select/number with `restore_value: true` only restores
+    # its *published state* in setup() - it does not replay its set_action - so
+    # without this the sensor would be back at the boot defaults while the UI
+    # showed the stored value. Priority -101 runs after every -100 hook,
+    # including cam.yaml's "boot into XGA" lambda, so the stored choice is always
+    # the last writer. Going through make_call() reuses the entities' own value
+    # mapping instead of duplicating it here.
+    - priority: -101.0
+      then:
+        - lambda: |-
+            id(cam_resolution)->make_call().set_index(id(cam_resolution)->active_index().value_or(0)).perform();
+            id(cam_compression)->make_call().set_value(id(cam_compression)->state).perform();
+
 # Only the framework wiring is shared. Each board file sets `board:` (plus
 # flash_size / cpu_frequency / psram on the S3) and adds its own sdkconfig keys
 # next to the ones below.
@@ -458,6 +472,10 @@ select:
     icon: mdi:aspect-ratio
     entity_category: config
     optimistic: true
+    # Survive a reboot: the chosen index is kept in the preferences partition.
+    # `restore_value` only restores the published state, so the -101 on_boot
+    # hook in [1] re-applies it to the sensor.
+    restore_value: true
     initial_option: ${resolution_initial}
     options:
       - "160x120"    # QQVGA
@@ -739,6 +757,8 @@ number:
     min_value: 6
     max_value: 63
     step: 1
+    # Survive a reboot (see the -101 on_boot hook in [1], which re-applies it).
+    restore_value: true
     initial_value: ${compression_initial}
     set_action:
       - lambda: |-
@@ -1176,5 +1196,7 @@ switch:
 # -----------------------------------------------------------------------------
 # GPIO4 on the AI-Thinker is only the flash LED; GPIO21 on the XIAO is also the
 # microSD slot's D3/CS, and a card that sees that line low during reset latches
-# into SPI protocol mode instead of answering SD commands. Packages merge lists,
-# they cannot subtract an entry, so the LED lives in the board file that wants it.
+# into SPI protocol mode instead of answering SD commands. Packages merge lists
+# rather than replacing them, so the LED lives in the board file that wants it.
+# (cam.yaml uses `!remove` in [7] to hide shared controls, but that only drops
+# an entity by id - it cannot move a block from one file to another.)
