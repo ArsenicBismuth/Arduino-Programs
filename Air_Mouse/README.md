@@ -144,7 +144,7 @@ Sleep is a power state, not just a reporting one — it is where nearly all of t
 | Connection interval | 7.5 ms (133 events/s) | 7.5 ms — unchanged, see below |
 | Slave latency | 0 | 0 |
 | IMU | 416 Hz, both sections on | rail off (`IMU_MIC_EN` low) |
-| CPU | running the sample loop | asleep between 10 ms polls |
+| CPU | running the sample loop | stopped — waiting for a click interrupt |
 | LED | lit if precision is on | blanked |
 
 The link is **kept**. A disconnect is itself a host event, and a reconnecting HID device is exactly
@@ -165,17 +165,22 @@ on the first click. What changes is what the two ends of the device are doing fo
   term in the budget. The cost is a ~20 ms rail settle on wake, paid before the first sample. The startup
   bias is kept — it describes the part — so a sleep/wake cycle never asks you to hold the board still again.
 - **The LED is blanked.** Precision mode is remembered, but a lit LED on a sleeping device is pure drain.
-- **The CPU sleeps between polls.** Asleep there is no sensor to sample, so the loop's only job is the
-  button and switch, polled every `kSleepPollMs` (10 ms — below the 20 ms debounce window, or a tap could
-  start and end inside one sample). `delay()` in this core is a real low-power wait, so the CPU is off
-  between polls and wakes for its own connection events.
+- **The CPU stops.** Asleep there is no sensor to sample and no host to report to, so the loop stops
+  outright: it waits in `yield()`, which services the stack and executes one `WFI`. Nothing polls, no
+  timer fires, no button or switch is read. The only way out is an interrupt — the two click contacts
+  (onboard button, P1.13, and centre, D2/P1.06), armed with `attachInterrupt(..., CHANGE)`, plus the
+  radio's own connection events, which the core services on the way through and immediately sleeps on.
+  A raw edge is enough to wake; whether it was a click is decided afterwards by the normal debounce,
+  so a contact that never produced a stable press costs one idle timeout and reports nothing.
+  The other three switch directions are port-2 pins, which this core cannot attach an interrupt to —
+  and they are not wake sources anyway.
 
 Two of those depend on the build being silent: `kSerialLogEnabled = true` configures the USB bridge UART,
-which makes the core deny the yield-path WFI and stops the CPU sleeping between events. **A debug build is
-not a battery measurement.**
+and the core then **refuses the yield-path WFI entirely**, so the asleep loop spins at full speed instead
+of stopping. **A debug build is not the sleep behaviour, and not a battery measurement.** Turn the log off
+to get what is described above.
 
 ```cpp
-kSleepPollMs       = 10;    // button/switch poll period asleep; keep below the debounce window
 kSleepImuPowerDown = true;  // cut the sensor rail; false leaves it powered down but supplied
 ```
 
@@ -600,7 +605,6 @@ compositor) adds a frame or two on top. A gyro air pointer will not feel like a 
 | `kPrecisionLedEnabled` | true | Light the onboard LED while precision mode is on |
 | `kSleepIdleTimeoutMs` | 60000 | How long after the last click or real movement before the device goes back to sleep. See [Sleep and wake](#sleep-and-wake) |
 | `kSleepMinRateDps` | 10.0 | Pointer rate, in deg/s, that counts as real movement and keeps the device awake — same unit as `ptr_dps`. `0.0f` = clicks only |
-| `kSleepPollMs` | 10 | Button/switch poll period while asleep. Keep it below the 20 ms debounce window |
 | `kSleepImuPowerDown` | true | Cut the sensor rail (`IMU_MIC_EN`) while asleep, not just its ODRs. Costs a ~20 ms rail settle on wake |
 | `kSerialLogEnabled` | true | Master switch for every print, including the periodic line — set to `false` for battery measurement. See [Serial output](#serial-output) |
 | `kImuI2cClockHz` | 400000 | IMU bus clock, at the part's ceiling. Slower is measurably *worse* here — see [I2C reliability](#i2c-reliability) |
@@ -700,7 +704,7 @@ rolls.
   where gravity stops defining a roll.
 - The embedded FIFO and the IMU interrupt pin (`IMU_INT`, D24) are unused.
 - Sleep is still not the lowest power this part can reach. It cuts the sensor's rail, blanks the LED
-  and lets the CPU sleep between polls, but the BLE link keeps its 7.5 ms interval (see
+  and the CPU stops dead, but the BLE link keeps its 7.5 ms interval (see
   [Sleep power](#sleep-power)): slowing it was measured to be a one-way trip on Android, and the link
   is deliberately left up because a disconnect is itself a host event. System OFF would be the only
   deeper state, and it would cost a re-advertisement and a slow first click.

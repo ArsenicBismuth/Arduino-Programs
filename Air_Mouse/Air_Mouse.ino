@@ -16,9 +16,10 @@
  * boots asleep, reports nothing, and stays awake while the pointer keeps being
  * used, going quiet again after a minute without a click or real movement.
  * Asleep is also the low-power state: the IMU's rail is cut, the LED is blanked and
- * the loop sleeps between button polls, while the connection itself is kept so a
- * click is not a reconnect. The link interval is deliberately left fast -- see the
- * note above kSleepPollMs for why slowing it is a one-way trip on Android.
+ * the loop stops outright, leaving only the two click contacts armed as interrupts,
+ * while the connection itself is kept so a click is not a reconnect. The link interval
+ * is deliberately left fast -- see the note above kSleepImuPowerDown for why slowing
+ * it is a one-way trip on Android.
  *
  * Hold the board still at power-up: it measures the gyro bias first, then pair with
  * "Air Mouse" from the host's Bluetooth settings. Wiring, diagnostics, tuning and
@@ -317,11 +318,9 @@ static const uint32_t kConnFastThresholdMs = 8;   // only 7.5 ms counts as settl
 // so asking for it would buy no current at all -- and it would add up to
 // latency * interval of delay to the first report after a wake, for nothing.
 
-// How often the button and switch are polled while asleep. Nothing else is running, so
-// the loop sleeps between polls and this is its only clock. It has to stay below
-// kNavDebounceMs / kButtonDebounceMs or a tap could start and end inside one sample and
-// never be seen.
-static const uint32_t kSleepPollMs = 10;
+// Sleep has no poll period at all: the loop stops and only an interrupt leaves it. The
+// two click contacts are armed as edges (see hidArmWakeInterrupts), so a press costs one
+// wake, not a wake per millisecond.
 
 // Cut the sensor's supply, not just its ODRs. The rail gate (shared with the microphone)
 // takes the part from its few microamps of power-down to zero, at the cost of a ~20 ms
@@ -534,6 +533,15 @@ static int8_t   g_pendingWheel   = 0;
 // except on a click, so the value here is the power-up behaviour as well.
 static bool     g_awake          = false;
 static uint32_t g_lastActivityMs = 0;  // last click or deliberate move
+
+// Set by the wake interrupt -- the onboard button or the switch's centre contact -- and
+// consumed by the asleep wait in loop(). volatile because the ISR writes it; it is one
+// byte, so no critical section is needed around the flag itself.
+static volatile bool g_wakeEdge = false;
+
+static void wakeIsr() {
+  g_wakeEdge = true;
+}
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -1596,11 +1604,23 @@ static uint8_t navButtonBits() {
   return bits;
 }
 
+// The two contacts that mean "left click" are the only wake sources: the onboard button
+// (P1.13) and the switch's centre contact (D2, P1.06). Both are port 1, so both can take
+// an interrupt -- the other three directions are port 2, which this core cannot attach
+// (digitalPinToInterrupt returns NOT_AN_INTERRUPT) and which must not wake the device
+// anyway.
+//
+// CHANGE, not FALLING: the wake itself is not debounced -- a raw edge is enough -- and
+// the normal poll path decides whether it was really a click as soon as the loop runs.
+static void hidArmWakeInterrupts() {
+  attachInterrupt(digitalPinToInterrupt(kButtonPin), wakeIsr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(kNavPins[kNavCenter]), wakeIsr, CHANGE);
+}
+
 // The only place the power state changes, so the two halves of it -- what the sensor
 // is doing and what the link is doing -- can never disagree. Sleep is a reporting state
-// in name only: with the sensor unpowered and the CPU idle between polls it is where
-// almost all of the battery is actually saved, while the link stays up so a click is
-// not a reconnect.
+// in name only: with the sensor unpowered and the CPU stopped it is where almost all of
+// the battery is actually saved, while the link stays up so a click is not a reconnect.
 static void hidSetAwake(bool awake) {
   if (awake == g_awake) {
     return;
@@ -1863,8 +1883,9 @@ static void hidMaintainConnInterval(uint32_t nowMs) {
   }
 
   // No asleep special case: the link always wants 7.5 ms, awake or not. See the note
-  // above kSleepPollMs for why the interval is never slowed -- and note that asking
-  // while asleep is what makes the first click after a sleep land on a fast event.
+  // above kSleepImuPowerDown for why the interval is never slowed -- and note that
+  // asking while asleep is what makes the first click after a sleep land on a fast
+  // event.
 
   if (ciMs != 0U && ciMs <= kConnFastThresholdMs) {
     if (!g_hidConnFastSeen) {
@@ -2123,24 +2144,41 @@ void setup() {
   hidBegin();
   g_hidLastReportMs = millis();
 
+  // Armed before the first sleep, and left armed: the asleep loop does nothing but
+  // wait for one of these two edges.
+  hidArmWakeInterrupts();
+
   // The device boots asleep, so the sensor must not be left sampling from power-up
   // until the first click: this is the state it will spend most of its life in.
   imuSuspend();
 }
 
 void loop() {
-  // Both tasks run from one loop. The IMU side never blocks on the radio, and
-  // the HID side is a no-op until a host pairs.
+  // Asleep is a wait, not a poll: nothing runs. yield() is the core's idle call -- it
+  // services the stack and executes one WFI, which the CPU leaves only on an interrupt:
+  // a click edge, or the radio's own connection events, after which the core services
+  // that event and sleeps again. No timer, no button reads, no loop work.
+  if (!g_awake) {
+    while (!g_awake && !g_wakeEdge) {
+      yield();
+    }
+    g_wakeEdge = false;
+    if (!g_awake) {
+      // A raw edge is the wake source; whether it was really a click is settled by the
+      // normal debounce below, in the awake loop. Waking on the edge alone is
+      // deliberate -- a contact that never made a stable press costs one idle timeout.
+      hidSetAwake(true);
+      hidNoteActivity(millis());
+    }
+  } else {
+    // Edges only matter to the wait above: drop them while awake, or the click that
+    // woke the device would latch and make the next sleep exit immediately.
+    g_wakeEdge = false;
+  }
+
   ++g_loopCount;
   if (g_awake) {
     imuTask();  // asleep, the sensor is unpowered: there is nothing to sample
   }
   hidTask(millis());
-
-  if (!g_awake) {
-    // Asleep the loop's only job is the button and switch poll, which is a handful of
-    // GPIO reads. Sleeping between polls is what makes the slow connection interval
-    // worth having: the CPU is off except for its own events and these samples.
-    delay(kSleepPollMs);
-  }
 }
