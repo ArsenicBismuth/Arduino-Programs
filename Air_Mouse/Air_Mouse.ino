@@ -543,6 +543,12 @@ static void wakeIsr() {
   g_wakeEdge = true;
 }
 
+// The core's per-pass idle pump (cores/nrf54l15/idle_service.cpp). loop() takes over
+// main()'s pass while asleep, so it has to make the same call: this one is what runs
+// foreground advertising events and the connection-edge callbacks. Without it a device
+// that boots asleep never advertises -- which is exactly "not findable from the phone".
+extern "C" void nrf54l15_clean_idle_service(void);
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -2154,12 +2160,14 @@ void setup() {
 }
 
 void loop() {
-  // Asleep is a wait, not a poll: nothing runs. yield() is the core's idle call -- it
-  // services the stack and executes one WFI, which the CPU leaves only on an interrupt:
-  // a click edge, or the radio's own connection events, after which the core services
-  // that event and sleeps again. No timer, no button reads, no loop work.
+  // Asleep is a wait, not a poll: nothing of this sketch runs. Two calls only, the same
+  // pair main() makes between loop() passes -- the idle pump (foreground advertising,
+  // connection edges, stack housekeeping) and yield(), which executes one WFI. The CPU
+  // leaves that WFI only on an interrupt: a click edge, or the radio's own event, after
+  // which the core services it and stops again. No timer, no button reads, no report.
   if (!g_awake) {
     while (!g_awake && !g_wakeEdge) {
+      nrf54l15_clean_idle_service();
       yield();
     }
     g_wakeEdge = false;

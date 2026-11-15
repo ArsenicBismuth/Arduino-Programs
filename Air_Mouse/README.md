@@ -166,19 +166,25 @@ on the first click. What changes is what the two ends of the device are doing fo
   bias is kept — it describes the part — so a sleep/wake cycle never asks you to hold the board still again.
 - **The LED is blanked.** Precision mode is remembered, but a lit LED on a sleeping device is pure drain.
 - **The CPU stops.** Asleep there is no sensor to sample and no host to report to, so the loop stops
-  outright: it waits in `yield()`, which services the stack and executes one `WFI`. Nothing polls, no
-  timer fires, no button or switch is read. The only way out is an interrupt — the two click contacts
-  (onboard button, P1.13, and centre, D2/P1.06), armed with `attachInterrupt(..., CHANGE)`, plus the
-  radio's own connection events, which the core services on the way through and immediately sleeps on.
+  doing anything of its own: it only pumps the core (the same two calls `main()` makes between passes,
+  `nrf54l15_clean_idle_service()` + `yield()`) and executes one `WFI` per iteration. Nothing polls, no
+  timer of the sketch fires, no button or switch is read. The only way out is an interrupt — the two
+  click contacts (onboard button, P1.13, and centre, D2/P1.06), armed with `attachInterrupt(..., CHANGE)`,
+  plus the radio's own events, which the core services and immediately sleeps on again.
   A raw edge is enough to wake; whether it was a click is decided afterwards by the normal debounce,
   so a contact that never produced a stable press costs one idle timeout and reports nothing.
   The other three switch directions are port-2 pins, which this core cannot attach an interrupt to —
   and they are not wake sources anyway.
 
-Two of those depend on the build being silent: `kSerialLogEnabled = true` configures the USB bridge UART,
-and the core then **refuses the yield-path WFI entirely**, so the asleep loop spins at full speed instead
-of stopping. **A debug build is not the sleep behaviour, and not a battery measurement.** Turn the log off
-to get what is described above.
+**Why the pump stays:** this core runs *connectable* advertising from the foreground loop, so an asleep
+device that skipped `nrf54l15_clean_idle_service()` would never advertise and could not be found from the
+phone. The pump is not sketch polling — it is the same call `main()` would have made.
+
+Two things stop the WFI and leave the CPU spinning instead: `kSerialLogEnabled = true` (an open USB bridge
+UART makes the core refuse the yield-path WFI), and advertising while not connected (the core only permits
+WFI during background advertising or once a connection's background service is armed). Neither is sketch
+polling, and the case that matters — connected and idle — is a real `WFI`. **A debug build is not the sleep
+behaviour, and not a battery measurement.**
 
 ```cpp
 kSleepImuPowerDown = true;  // cut the sensor rail; false leaves it powered down but supplied
