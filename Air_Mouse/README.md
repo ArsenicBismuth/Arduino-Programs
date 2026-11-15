@@ -14,6 +14,8 @@ pointer motion, and reports it as a standard BLE mouse. The onboard button is a 
 | IMU SDA | D12 | P0.04 | back-pad bus, exposed as `Wire1` |
 | IMU SCL | D11 | P0.03 | back-pad bus, exposed as `Wire1` |
 | IMU power gate | D20 / `IMU_MIC_EN` | P0.01 | shared IMU + microphone rail, must be HIGH |
+| Battery divider enable | `VBAT_EN` | P1.15 | load switch for the VBAT divider, active high — kept LOW except while reading |
+| Battery divider sense | `VBAT_READ` (A7) | P1.14 | `AIN7`, behind a 2:1 divider |
 | Left click | `PIN_BUTTON` | P0.00 | onboard button, active low |
 | Switch left | D1 | P1.05 | middle click / precision mode |
 | Switch right | D10 | P2.02 | host back button |
@@ -165,6 +167,8 @@ on the first click. What changes is what the two ends of the device are doing fo
   term in the budget. The cost is a ~20 ms rail settle on wake, paid before the first sample. The startup
   bias is kept — it describes the part — so a sleep/wake cycle never asks you to hold the board still again.
 - **The LED is blanked.** Precision mode is remembered, but a lit LED on a sleeping device is pure drain.
+- **The pack is measured on the way in.** The battery reading is taken as the device goes quiet rather than
+  on wake, and the level is pushed to the host there — see [Battery reporting](#battery-reporting).
 - **The CPU stops.** Asleep there is no sensor to sample and no host to report to, so the loop stops
   doing anything of its own: it only pumps the core (the same two calls `main()` makes between passes,
   `nrf54l15_clean_idle_service()` + `yield()`) and executes one `WFI` per iteration. Nothing polls, no
@@ -193,6 +197,82 @@ kSleepImuPowerDown = true;  // cut the sensor rail; false leaves it powered down
 The saving is the sensor (~0.6 mA to zero) and the CPU (a 400 Hz loop to sleeping) — against a previous
 sleep that changed nothing but the reporting flag. The radio is unchanged: it still answers every 7.5 ms
 event, which is the floor this design accepts.
+
+## Battery reporting
+
+The host's own Bluetooth page shows the pack, with no app on either side, because the sketch reports the
+**standard Battery Service** — service `0x180F`, characteristic `0x2A19` (Battery Level, one byte, 0–100 %,
+Read + Notify + CCCD). Nothing custom is involved, and there is nothing to add to the GATT table: this core
+builds `0x180F`/`0x2A19` into the radio's database at fixed handles and answers a read from it even while
+the sketch's loop is parked asleep. `BLEDis`/`BLEBas` are already carried for advertising shape reasons;
+`BLEBas` is what writes the value.
+
+Advertising the service is **load-bearing on Android**, not decoration: AOSP's BAS client
+(`com.android.bluetooth.bas.BatteryService`) only connects to a bonded LE device whose advertised UUIDs
+contain the Battery Service, then connects GATT opportunistically over the existing HID link, **reads**
+`0x2A19`, and subscribes to the CCCD to follow later changes. That read becomes
+`BluetoothDevice.getBatteryLevel()` and `ACTION_BATTERY_LEVEL_CHANGED`, which is what Settings renders.
+Two caveats worth knowing before blaming the sketch:
+
+- The whole client is gated by the `bluetooth.profile.bas.client.enabled` sysprop. It is `true` on
+  Pixel/near-AOSP builds and `false` on several OEM ones. **Samsung One UI is one of them**, and that was
+  measured rather than assumed: the same phone shows no battery in Settings for a commercial BLE keyboard
+  either, while Windows shows it for both, so the phone — not the accessory — is the variable. On those
+  builds the number exists in GATT and any app reads it (`nRF Connect`: connect → Battery Service →
+  `0x2A19`); the system UI simply never starts the client.
+- Pre-Android-13 has no such client at all.
+
+**Windows** takes the same route, and it is Microsoft's documented one for LE-only accessories: a paired
+device exposing BAS gets its percentage in **Settings → Bluetooth & devices**, plus a low-battery
+notification at ≤5 %. Microsoft asks for at least 11 steps of resolution (so 0/50/100 is not enough) and for
+a level that only *decreases* unless the pack is charging. Windows 11 24H2 additionally understands BAS 1.1
+(`0x2BED` Battery Level Status, accessory-initiated low/critical alerts and a charging state) — this core
+does not implement that characteristic, so only the plain percentage is available.
+
+**How it is measured here.** The read is the core's own `BoardControl::sampleBatteryMilliVolts()` — not
+hand-rolled ADC code — because that path is the one the core maintains for a board with a switched sense
+divider: it switches the divider on, settles, samples the SAADC at **12 bits** against the 1/4-gain
+reference, applies the board's **2:1** divider, and switches the divider off again. One count is therefore
+1.76 mV of pack, and the level is the **highest of `kBatSamples`** reads — load only ever pulls a cell's
+voltage down, so the highest sample is the one least corrupted by the radio's own bursts, and the one
+`kBatCurve` describes.
+
+Just as important is what it does *not* do. Under `NRF54L15_CLEAN_POWER_LOW` every `delay()` enters the
+core's low-power board state: the RF switch's supply is power-cycled and the IMU bus is put high-Z for the
+duration. The first version of this measurement used a 10 ms `delay()` as its settle plus eight `delay(1)`s
+as its samples — nine of those entries, and sixteen 10-bit `analogRead()` conversions, twice per session, on
+a live 7.5 ms link. That version made the pointer stutter; this one takes one entry and one conversion per
+sample, three in total.
+
+A reading below `kBatNoCellMv` means **no cell on the pad** (the divider reads a few millivolts), and is
+reported as 100 %, not 0 %: a red empty battery and a low-battery notification in front of someone running
+the board on USB would be worse than useless, and the part browns out around 3.3 V, so a pack the board can
+run from never reads that low. A *failed* read is not empty either: it keeps the last good level.
+
+**When it is published.** Once at boot (`write`, since there is no link yet) and once on every transition
+*into* sleep (`notify`). Sleep is the right edge to measure on: the queues have just been cleared, the level
+will not change again until the next wake, and the wake path has to reach the button poll as fast as possible
+because the click that woke the device is a real click. The measurement costs tens of milliseconds, which is
+invisible once per idle timeout and would be a stall if it ran per report or on wake.
+`notify()` stores the byte *before* it checks for a subscriber, so its `false` return only means nobody was
+listening — the value is still there for the next read — and the notification is queued behind anything
+already pending, then sent from the radio's own connection-event handler, so it goes out even though the loop
+parks immediately afterwards. A device that sits asleep for days keeps serving its last reading, which is
+what a reconnecting host sees.
+
+To check it: `bat= 4012mV 83%` in the periodic line is the last reading to compare against a meter, nRF
+Connect shows `0x2A19` directly, `bluetoothctl` reads it with `select-attribute /org/bluez/hci0/…` and
+`read`, and `adb shell dumpsys bluetooth_manager` shows whether the phone's BAS client is running for the
+device. Expect a few percent of jitter between reads — the pack sags under load and the curve is flat in the
+middle, so this is a voltmeter, not a fuel gauge.
+
+**If the pointer feels worse after enabling this.** Nothing in the pointer path changed — the measurement
+runs at boot and again as the device goes to sleep, and the report loop is still the same code — so the two
+numbers that explain a stutter are in the periodic line, not in this section. `loop_hz=` below the link's own
+rate means the *loop* is the limit; `ci_ms=` above 7.5 means the *host* picked a slower interval, and that is
+its decision (see [HID transport](#hid-transport) — reconnect, or forget and re-pair, to get the 7.5 ms
+request granted again). If `ci_ms` is back at 7.5 and `loop_hz` is still ~350, the battery path is not the
+cause, and `kBatteryReportEnabled = false` will prove it in one flash.
 
 ## 5-way switch
 
@@ -612,6 +692,10 @@ compositor) adds a frame or two on top. A gyro air pointer will not feel like a 
 | `kSleepIdleTimeoutMs` | 60000 | How long after the last click or real movement before the device goes back to sleep. See [Sleep and wake](#sleep-and-wake) |
 | `kSleepMinRateDps` | 10.0 | Pointer rate, in deg/s, that counts as real movement and keeps the device awake — same unit as `ptr_dps`. `0.0f` = clicks only |
 | `kSleepImuPowerDown` | true | Cut the sensor rail (`IMU_MIC_EN`) while asleep, not just its ODRs. Costs a ~20 ms rail settle on wake |
+| `kBatSettleUs` | 5000 | Load switch turn-on plus divider RC before the battery sample. See [Battery reporting](#battery-reporting) |
+| `kBatSamples` | 3 | Reads taken per measurement; the highest is used, because load only pulls a cell down |
+| `kBatNoCellMv` | 500 | Below this the battery pad is empty and the level is reported as 100 %, so a USB-powered board does not show an empty battery |
+| `kBatteryReportEnabled` | true | `false` makes the whole feature a no-op (level stays at the old placeholder) — the A/B switch for a performance complaint, not a tuning knob |
 | `kSerialLogEnabled` | true | Master switch for every print, including the periodic line — set to `false` for battery measurement. See [Serial output](#serial-output) |
 | `kImuI2cClockHz` | 400000 | IMU bus clock, at the part's ceiling. Slower is measurably *worse* here — see [I2C reliability](#i2c-reliability) |
 | `kLinkPollMs` / `kConnPollMs` | 50 / 100 | How often the cached link state and the connection interval are re-read. Both are polled rather than checked per pass, because each query services the whole stack |
@@ -732,6 +816,14 @@ rolls.
 - A gyro cannot separate a small bias from a very slow rotation. Motion below roughly 1 °/s is therefore
   partly absorbed by the bias tracker and the deadzone. That is the sensor's precision floor, not a
   tuning failure: getting below it needs a different sensor, not a different constant.
+- The reported battery percentage is a voltmeter, not a fuel gauge: the pack sags under the link's load,
+  the LiPo curve is flat around 3.8 V, and one 12-bit count is 1.8 mV of pack, so a few percent of jitter
+  between reads is the floor. The level is not forced to be decrease-only the way Microsoft recommends,
+  because a board on USB genuinely rises while it charges and this samples too rarely to tell ripple from
+  charging. Charging state and BAS 1.1 are not reported at all.
+- Whether the phone's own settings page shows the battery is a vendor decision: AOSP's BAS client is gated
+  by `bluetooth.profile.bas.client.enabled`, off on several OEM builds. The service and the value are
+  there regardless — see [Battery reporting](#battery-reporting).
 
 ## Next steps
 

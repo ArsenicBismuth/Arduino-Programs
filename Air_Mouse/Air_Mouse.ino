@@ -22,8 +22,10 @@
  * it is a one-way trip on Android.
  *
  * Hold the board still at power-up: it measures the gyro bias first, then pair with
- * "Air Mouse" from the host's Bluetooth settings. Wiring, diagnostics, tuning and
- * the reasoning behind all of it: README.md.
+ * "Air Mouse" from the host's Bluetooth settings. The pack is measured from the
+ * board's gated divider and reported through the standard Bluetooth Battery Service,
+ * so the host's own settings page shows it without an app. Wiring, diagnostics,
+ * tuning and the reasoning behind all of it: README.md.
  */
 
 #include <Arduino.h>
@@ -35,6 +37,9 @@
 // report gets aligned with the connection event. bluefruit.h only forward
 // declares the radio, so the definition has to be pulled in explicitly.
 #include <nrf54l15_hal.h>
+
+// The board-control HAL, for its own gated battery read (see batteryReadMv).
+using xiao_nrf54l15::BoardControl;
 
 // ---------------------------------------------------------------------------
 // Serial log
@@ -394,6 +399,59 @@ static const bool     kHidIdleReportEnabled = false;
 static const uint32_t kHidIdleReportMs      = 100;
 
 // ---------------------------------------------------------------------------
+// Battery reporting
+// ---------------------------------------------------------------------------
+
+// The host shows this in its own Bluetooth UI because it is the standard Battery
+// Service -- 0x180F with the Battery Level characteristic 0x2A19 -- and not anything
+// custom. The core already carries that service in its GATT table and
+// hidStartAdvertising already advertises it, and the value byte is answered straight
+// from the radio, loop running or not: the only thing left to this sketch is to keep
+// that byte right. Rationale and what each host does with it: README, "Battery
+// reporting".
+
+// Set false to make battery reporting a no-op: the level stays at the placeholder it
+// used to be, nothing is measured and nothing is notified. It exists so this feature
+// can be ruled in or out of a performance complaint with one edit -- it is not a
+// tuning knob.
+static const bool kBatteryReportEnabled = true;
+
+// The read is the core's BoardControl::sampleBatteryMilliVolts, not a hand-rolled ADC
+// path: it switches the divider's load switch on, waits, samples the SAADC at 12 bits
+// against the 1/4-gain reference, applies the board's 2:1 divider and switches the
+// divider off again. That matters on a live link. Under NRF54L15_CLEAN_POWER_LOW every
+// delay() enters the core's low-power board state, which power-cycles the RF switch's
+// supply and puts the IMU bus high-Z; the first version of this measurement used a
+// 10 ms delay() as its settle plus eight delay(1)s as its samples -- nine of those
+// entries, and sixteen 10-bit analogRead conversions, twice per session. This does one
+// entry per sample and one 12-bit conversion per entry. The only choices left are the
+// settle and how many samples to take.
+static const uint32_t kBatSettleUs = 5000;  // load switch turn-on plus divider RC
+static const uint8_t  kBatSamples  = 3;     // the link only ever pulls the reading down
+
+// An unpopulated battery pad reads the bottom of the divider range, a few millivolts.
+// A cell the board can run from never reads this low, even a flat one -- the part
+// browns out around 3.3 V -- so this threshold is unambiguous, and "no cell" must not
+// be reported as 0 %: that would put a low-battery notification in front of someone
+// running the board on USB.
+static const uint16_t kBatNoCellMv = 500;
+
+// Single-cell LiPo, resting voltage against state of charge, the usual 0.2 C
+// discharge curve. Not linear, and its middle is flat -- around 3.8 V a whole
+// percentage point is worth only a few millivolts -- so a number derived from a
+// voltmeter is coarse by nature. Measured under the link's load, which is why the
+// host's number sits a little under the resting curve.
+struct BatCurvePoint {
+  uint16_t mv;
+  uint8_t  percent;
+};
+static const BatCurvePoint kBatCurve[] = {
+    {4200, 100}, {4100, 92}, {3980, 80}, {3920, 70}, {3870, 60},
+    {3820, 50},  {3790, 40}, {3770, 30}, {3740, 20}, {3680, 10},
+    {3550, 4},   {3300, 0},
+};
+
+// ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
@@ -435,7 +493,10 @@ static bool  g_stillDirValid = false;
 // ---------------------------------------------------------------------------
 
 // BLEDis and BLEBas are carried because the core's own HID example advertises
-// HIDS alongside them, and strict Android hosts compare against that shape.
+// HIDS alongside them, and strict Android hosts compare against that shape. BLEBas
+// is not just decoration: it is the handle for the battery level the host shows, and
+// advertising it (see hidStartAdvertising) is what makes a stock Android connect to
+// it at all.
 BLEDis       bledis;
 BLEBas       blebas;
 BLEHidAdafruit blehid;
@@ -534,6 +595,14 @@ static int8_t   g_pendingWheel   = 0;
 static bool     g_awake          = false;
 static uint32_t g_lastActivityMs = 0;  // last click or deliberate move
 
+// Last battery reading and what the host was told. The log prints these rather than
+// re-reading the pack: a measurement costs tens of milliseconds, and the periodic
+// line runs at 10 Hz. Known is separate from the values because zero is a valid
+// reading on a board with no cell on the pad.
+static bool     g_batteryKnown   = false;
+static uint16_t g_batteryMv      = 0;
+static uint8_t  g_batteryPercent = 0;
+
 // Set by the wake interrupt -- the onboard button or the switch's centre contact -- and
 // consumed by the asleep wait in loop(). volatile because the ISR writes it; it is one
 // byte, so no critical section is needed around the flag itself.
@@ -592,6 +661,80 @@ static void hidLedWrite(bool on) {
     return;
   }
   digitalWrite(PIN_LED_BUILTIN, on ? LED_STATE_ON : !LED_STATE_ON);
+}
+
+// ---------------------------------------------------------------------------
+// Battery measurement
+// ---------------------------------------------------------------------------
+
+// The pack, in millivolts, or 0 if the read failed. Load only ever pulls the reading
+// down, so the highest of a few samples is the one least corrupted by the radio's own
+// bursts -- and therefore the one the resting-voltage curve describes.
+static uint16_t batteryReadMv() {
+  int32_t best = 0;
+  for (uint8_t i = 0; i < kBatSamples; ++i) {
+    int32_t mv = 0;
+    if (BoardControl::sampleBatteryMilliVolts(&mv, kBatSettleUs) && mv > best) {
+      best = mv;
+    }
+  }
+  return (best > 0 && best < 10000) ? static_cast<uint16_t>(best) : 0U;
+}
+
+// Linear interpolation over kBatCurve, with the ends held: above the top point the
+// pack is being charged, below the bottom one the board could not run from it.
+static uint8_t batteryPercentForMv(uint16_t mv) {
+  const size_t last = sizeof(kBatCurve) / sizeof(kBatCurve[0]) - 1;
+
+  if (mv >= kBatCurve[0].mv) {
+    return kBatCurve[0].percent;
+  }
+  if (mv <= kBatCurve[last].mv) {
+    return kBatCurve[last].percent;
+  }
+
+  for (size_t i = 0; i < last; ++i) {
+    const uint16_t hiMv = kBatCurve[i].mv;      // higher voltage
+    const uint16_t loMv = kBatCurve[i + 1].mv;
+    if (mv <= hiMv && mv >= loMv) {
+      const float pos = static_cast<float>(mv - loMv) /
+                        static_cast<float>(hiMv - loMv);
+      const float hiPct = static_cast<float>(kBatCurve[i].percent);
+      const float loPct = static_cast<float>(kBatCurve[i + 1].percent);
+      return static_cast<uint8_t>(loPct + pos * (hiPct - loPct) + 0.5f);
+    }
+  }
+  return kBatCurve[last].percent;
+}
+
+// Measures the pack and hands the level to the radio. push = notify, which is what a
+// host that has subscribed wants; notify() stores the byte before it checks for a
+// subscriber, so its false return only means "nobody listening", never that the value
+// was lost. The notification itself is deferred behind anything already queued, so it
+// cannot delay a report on the 7.5 ms link.
+static void hidPublishBattery(bool push) {
+  if (!kBatteryReportEnabled) {
+    if (!push) {
+      blebas.write(100);  // the placeholder this replaced, for the switched-off case
+    }
+    return;
+  }
+
+  const uint16_t mv = batteryReadMv();
+  if (mv == 0) {
+    return;  // a failed read is not "empty": keep the last good level
+  }
+
+  g_batteryMv = mv;
+  g_batteryPercent =
+      (g_batteryMv < kBatNoCellMv) ? 100 : batteryPercentForMv(g_batteryMv);
+  g_batteryKnown = true;
+
+  if (push) {
+    blebas.notify(g_batteryPercent);
+  } else {
+    blebas.write(g_batteryPercent);  // boot: no link yet, so there is nothing to notify
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1171,6 +1314,16 @@ static void printState() {
   Serial.print(g_awake ? "awake" : "sleep");
   Serial.print(" prec= ");
   Serial.print(g_precision ? "on" : "off");
+  // Last measured pack voltage and the level published to the host. Printed, not
+  // re-measured: this is the number to compare against a meter when checking the
+  // divider arithmetic, and it costs nothing here.
+  if (g_batteryKnown) {
+    Serial.print(" bat= ");
+    Serial.print(g_batteryMv);
+    Serial.print("mV ");
+    Serial.print(g_batteryPercent);
+    Serial.print('%');
+  }
   if (g_awake) {
     Serial.print(" idle_ms= ");
     Serial.print(millis() - g_lastActivityMs);
@@ -1339,7 +1492,10 @@ static void hidBegin() {
   bledis.setModel("XIAO nRF54L15");
   bledis.begin();
   blebas.begin();
-  blebas.write(100);
+  // Boot value for the Battery Service, measured rather than assumed. The host reads
+  // it after pairing, so this is the number it starts from; hidSetAwake refreshes and
+  // pushes it again on the way into sleep. See "Battery reporting" in the README.
+  hidPublishBattery(false);
 
   // Compact Zephyr-style HID report, which is the shape Android and Sony HID
   // hosts compare against. It is 3 bytes -- buttons masked to three bits, no
@@ -1656,6 +1812,14 @@ static void hidSetAwake(bool awake) {
   g_pendingWheel = 0;
   g_middlePulses = 0;
   g_hidLastButtons = 0;
+
+  // Battery goes last, and on this side of the transition rather than on wake. The
+  // measurement costs tens of milliseconds, and the wake path has to reach the button
+  // poll as fast as possible: the click that woke the device is a real click, and the
+  // poll is what turns it into a report. Here nothing is pending -- the queues were just
+  // cleared -- and going quiet is the last moment the level will change before the next
+  // wake. The notification is queued, so the radio still sends it while the loop parks.
+  hidPublishBattery(true);
 }
 
 // Wake on a click, sleep after kSleepIdleTimeoutMs without one. Runs before the
@@ -2123,6 +2287,11 @@ void setup() {
   Serial.println();
   Serial.println("Air_Mouse - BLE HID air mouse");
   Serial.println("bus=Wire1 (SDA=D12, SCL=D11)  target=LSM6DS3TR-C @ 0x6A/0x6B");
+
+  // The battery divider's load switch is off except while a reading is being taken,
+  // and its enable pin must not be left floating through the slow startup below.
+  pinMode(VBAT_EN, OUTPUT);
+  digitalWrite(VBAT_EN, LOW);
 
   imuPowerRailOn();
   imuBus.begin();
