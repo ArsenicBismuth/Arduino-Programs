@@ -15,9 +15,10 @@
  * button and the centre contact both left-click and both wake the device: it
  * boots asleep, reports nothing, and stays awake while the pointer keeps being
  * used, going quiet again after a minute without a click or real movement.
- * Asleep is also the low-power state: the link drops to a 200 ms interval, the
- * IMU's rail is cut, the LED is blanked and the loop sleeps between button polls,
- * while the connection itself is kept so a click is not a reconnect.
+ * Asleep is also the low-power state: the IMU's rail is cut, the LED is blanked and
+ * the loop sleeps between button polls, while the connection itself is kept so a
+ * click is not a reconnect. The link interval is deliberately left fast -- see the
+ * note above kSleepPollMs for why slowing it is a one-way trip on Android.
  *
  * Hold the board still at power-up: it measures the gyro bias first, then pair with
  * "Air Mouse" from the host's Bluetooth settings. Wiring, diagnostics, tuning and
@@ -294,20 +295,22 @@ static const uint8_t  kConnAttempts        = 8;
 static const uint32_t kConnRetryGapMs      = 1000;
 static const uint32_t kConnFastThresholdMs = 8;   // only 7.5 ms counts as settled
 
-// Sleep profile: the interval the link runs at while nothing is being reported, in
-// 1.25 ms units. A sleeping BLE device still has to answer the central every interval,
-// so 7.5 ms costs 133 radio events a second -- and both ends' batteries -- for a report
-// that will never be sent. 200 ms is 27x fewer wakeups, and the radio is the largest
-// remaining load once the sensor is off. Raise it for more saving (500 ms is 2 events a
-// second) at the cost of up to one interval of delay on the click that wakes the device;
-// the click is still delivered, just up to that much later.
-static const uint16_t kSleepConnIntervalUnits = 160;  // 200 ms
+// The link is deliberately left at 7.5 ms while asleep. A slow interval was tried --
+// 200 ms when idle, 7.5 ms again on wake -- and it does not work on this host: the
+// increase is granted, the decrease never is. Android only accelerates a link when its
+// own app asks for it, so once the link is at 200 ms it stays there and the pointer is
+// pinned to a 200 ms event rate (~5 reports/s) across every later wake. Reconnecting
+// would restore 7.5 ms, but a disconnect is itself a host event, so the slow interval is
+// not worth having.
+//
+// That leaves the sensor and the CPU as the sleep saving: the rail cut is the largest
+// single term (the part is ~0.6 mA awake), and the loop no longer spins at 400 Hz. The
+// radio keeps its 133 events/s, which is the floor this design accepts.
 
-// Supervision timeout, in 10 ms units, for both profiles. Only matters for the slow one:
-// it has to exceed 2 * interval (the link must tolerate one lost event), so 2 s against
-// 200 ms is a tenfold margin -- and it is the core's own default, which matters because a
-// value picked here has to match the one the fast request carries.
-static const uint16_t kConnTimeoutUnits = 200;  // 2 s
+// The link's supervision timeout is the core's default, 2 s. The sketch never sends it --
+// the timeout only matters because it must stay above 2 * interval, and the interval is
+// 7.5 ms. Worth writing down rather than assuming: a link that drops on a slow host is
+// this value, not the sketch.
 
 // Slave latency is deliberately not used. This core's link layer records the negotiated
 // latency and reports it (lat_ in the log) but keeps listening at every connection event,
@@ -531,11 +534,6 @@ static int8_t   g_pendingWheel   = 0;
 // except on a click, so the value here is the power-up behaviour as well.
 static bool     g_awake          = false;
 static uint32_t g_lastActivityMs = 0;  // last click or deliberate move
-
-// Whether the idle link profile has been asked for on this link. One request is enough:
-// the radio's parameter update is a round trip, and repeating it would wake both ends to
-// say nothing. Cleared on a connect and on a wake.
-static bool     g_sleepParamsAsked = false;
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -1259,7 +1257,6 @@ static void hidConnectCallback(uint16_t connHandle) {
   g_hidConnRetries  = 0;
   g_hidConnRetryMs  = 0;
   g_hidConnFastSeen = false;
-  g_sleepParamsAsked = false;
   g_hidLastWindowUs = 0;
   // Force the pacing to relearn: the ceiling belongs to the link, not the sketch.
   // Left alone it would carry the previous connection's rate into this one.
@@ -1599,47 +1596,31 @@ static uint8_t navButtonBits() {
   return bits;
 }
 
-// One link-parameter request, all four fields at once: the radio's update request
-// carries the interval range, latency and timeout together, so two calls would queue
-// two updates. Latency is always 0 -- see kSleepConnIntervalUnits for why.
-static void hidRequestLinkParams(uint16_t intervalUnits, uint16_t timeoutUnits) {
-  if (!Bluefruit.connected()) {
-    return;  // nothing to update; the next connection asks again
-  }
-  Bluefruit.rawRadio().setPreferredConnectionParameters(
-      intervalUnits, intervalUnits, 0U, timeoutUnits);
-}
-
 // The only place the power state changes, so the two halves of it -- what the sensor
 // is doing and what the link is doing -- can never disagree. Sleep is a reporting state
-// in name only: with the interval slow and the sensor unpowered it is where almost all
-// of the battery is actually saved, while the link stays up so a click is not a
-// reconnect.
+// in name only: with the sensor unpowered and the CPU idle between polls it is where
+// almost all of the battery is actually saved, while the link stays up so a click is
+// not a reconnect.
 static void hidSetAwake(bool awake) {
   if (awake == g_awake) {
     return;
   }
+  g_awake = awake;
 
   if (awake) {
     imuResume();
-    // Reset the retry state instead of asking here: hidMaintainConnInterval runs later
-    // in this same pass and asks for the fast interval, so one code path places it.
+    // Reset the retry state so the fast interval is asked for again on the next poll.
     g_hidConnRetries  = 0;
     g_hidConnRetryMs  = 0;
     g_hidConnFastSeen = false;
     g_hidConnPollMs   = millis() - kConnPollMs;
-    g_sleepParamsAsked = false;
     hidLedWrite(g_precision);
     return;
   }
 
   imuSuspend();
   hidLedWrite(false);
-  // The slow profile is asked for by hidMaintainConnInterval, which runs later in this
-  // same pass: one code path means a link that was already settled is still asked, and
-  // the request is never queued twice.
-  g_sleepParamsAsked = false;
-  g_hidConnPollMs    = millis() - kConnPollMs;
+  g_hidConnPollMs = millis() - kConnPollMs;
 
   // Nothing queued survives into sleep, and nothing may survive out of it either: the
   // backlog would fling the cursor, and a stale button state would be reported as a
@@ -1881,20 +1862,9 @@ static void hidMaintainConnInterval(uint32_t nowMs) {
     return;
   }
 
-  // Asleep, the fast interval is exactly what is not wanted: the slow one is the whole
-  // basis of the sleep budget. Asked once per link and per sleep rather than every poll,
-  // because a refused request would otherwise be retried forever at 10 Hz.
-  if (!g_awake) {
-    if (!g_sleepParamsAsked && hidConnIntervalUnits() != kSleepConnIntervalUnits) {
-      g_sleepParamsAsked = true;
-      hidRequestLinkParams(kSleepConnIntervalUnits, kConnTimeoutUnits);
-      Serial.print("hid=sleep link profile, asking for conn interval ");
-      Serial.print(static_cast<float>(kSleepConnIntervalUnits) * 1.25f, 1);
-      Serial.println(" ms");
-    }
-    return;
-  }
-  g_sleepParamsAsked = false;
+  // No asleep special case: the link always wants 7.5 ms, awake or not. See the note
+  // above kSleepPollMs for why the interval is never slowed -- and note that asking
+  // while asleep is what makes the first click after a sleep land on a fast event.
 
   if (ciMs != 0U && ciMs <= kConnFastThresholdMs) {
     if (!g_hidConnFastSeen) {
@@ -1914,7 +1884,7 @@ static void hidMaintainConnInterval(uint32_t nowMs) {
 
   g_hidConnRetryMs = nowMs;
   ++g_hidConnRetries;
-  hidRequestLinkParams(kConnIntervalMin, kConnTimeoutUnits);
+  Bluefruit.Periph.setConnInterval(kConnIntervalMin, kConnIntervalMax);
   Serial.print("hid=asking for conn interval ");
   Serial.print(static_cast<float>(kConnIntervalMin) * 1.25f, 1);
   Serial.print('-');

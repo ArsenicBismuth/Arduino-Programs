@@ -37,13 +37,16 @@ nrf54l15clean:nrf54l15clean:xiao_nrf54l15
 BLE must be enabled, which is the default (`BLE Support: Enabled`). Other menu options can stay at
 their defaults.
 
-The serial log is **off by default** (`kSerialLogEnabled`), so the shipped sketch is silent and
-nothing in the pointer path depends on a serial port. Every log excerpt below assumes the switch has
-been turned back on:
+The serial log is **on in the sketch as it stands** (`kSerialLogEnabled`): it is the fastest way to see
+what the device is doing, and turning it off costs nothing but a one-line edit. Every log excerpt below
+assumes the switch is on:
 
 ```cpp
-static const bool kSerialLogEnabled = false;  // false as shipped
+static const bool kSerialLogEnabled = true;  // false for battery measurement
 ```
+
+It is also a power switch: an open USB bridge UART makes the core deny the yield-path WFI, so the CPU
+stops sleeping between connection events. Measure battery life with it off — see [Sleep power](#sleep-power).
 
 ## Startup sequence
 
@@ -138,7 +141,7 @@ Sleep is a power state, not just a reporting one — it is where nearly all of t
 
 | | Awake | Asleep |
 | --- | --- | --- |
-| Connection interval | 7.5 ms (133 events/s) | 200 ms (5 events/s) |
+| Connection interval | 7.5 ms (133 events/s) | 7.5 ms — unchanged, see below |
 | Slave latency | 0 | 0 |
 | IMU | 416 Hz, both sections on | rail off (`IMU_MIC_EN` low) |
 | CPU | running the sample loop | asleep between 10 ms polls |
@@ -146,19 +149,21 @@ Sleep is a power state, not just a reporting one — it is where nearly all of t
 
 The link is **kept**. A disconnect is itself a host event, and a reconnecting HID device is exactly
 what makes a phone's screen flash — deeper sleep would buy a few microamps and cost a second of latency
-on the first click. What changes is how often both ends have to wake for it:
+on the first click. What changes is what the two ends of the device are doing for it:
 
-- **The interval is the whole lever.** A sleeping peripheral still answers every connection event, so
-  7.5 ms costs 133 radio wakeups a second for a report that will never be sent. `kSleepConnIntervalUnits`
-  asks for 200 ms instead, and the sketch re-asks 7.5 ms on the same pass it wakes, so the fast interval
-  is back before the next motion report needs it.
+- **The link interval is not slowed, and that is deliberate.** Slowing it was tried and measured: 200 ms
+  while idle, 7.5 ms again on wake. The **increase is granted, the decrease never is** — Android only
+  accelerates a link when its own app requests it, so once the interval is 200 ms it stays there, and the
+  pointer is pinned to ~5 reports/s across every later wake. Reconnecting would restore 7.5 ms, and a
+  disconnect is a host event. So the asleep state keeps the fast link and gives up the 133 events/s.
+  Getting it back would need a host that honours the reverse request; there is nothing the sketch can do.
 - **No slave latency, deliberately.** This core's link layer records the negotiated latency and reports it
   as `lat=` in the log, but it keeps the receiver on at every connection event regardless, so latency would
   save nothing and would add up to `latency × interval` of delay to the first report after a wake.
 - **The sensor's rail is cut, not just its ODRs.** `kSleepImuPowerDown` drops `IMU_MIC_EN`, taking the part
-  from its few microamps of power-down to zero. The cost is a ~20 ms rail settle on wake, paid before the
-  first sample (the interval wait dominates the wake either way). The startup bias is kept — it describes
-  the part — so a sleep/wake cycle never asks you to hold the board still again.
+  from its few microamps of power-down to zero, and the part is ~0.6 mA while sampling — the largest single
+  term in the budget. The cost is a ~20 ms rail settle on wake, paid before the first sample. The startup
+  bias is kept — it describes the part — so a sleep/wake cycle never asks you to hold the board still again.
 - **The LED is blanked.** Precision mode is remembered, but a lit LED on a sleeping device is pure drain.
 - **The CPU sleeps between polls.** Asleep there is no sensor to sample, so the loop's only job is the
   button and switch, polled every `kSleepPollMs` (10 ms — below the 20 ms debounce window, or a tap could
@@ -170,14 +175,13 @@ which makes the core deny the yield-path WFI and stops the CPU sleeping between 
 not a battery measurement.**
 
 ```cpp
-kSleepConnIntervalUnits = 160;   // 200 ms while asleep; 400 (500 ms) saves more, wakes slower
-kSleepPollMs            = 10;    // button/switch poll period asleep; keep below the debounce window
-kSleepImuPowerDown      = true;  // cut the sensor rail; false leaves it powered down but supplied
+kSleepPollMs       = 10;    // button/switch poll period asleep; keep below the debounce window
+kSleepImuPowerDown = true;  // cut the sensor rail; false leaves it powered down but supplied
 ```
 
-The numbers are datasheet-and-code reasoning, not a measurement: the radio's idle event rate is 27× lower,
-the sensor goes from ~0.6 mA to zero, and the CPU from a spinning loop to sleeping — against a previous
-sleep that changed nothing but the reporting flag.
+The saving is the sensor (~0.6 mA to zero) and the CPU (a 400 Hz loop to sleeping) — against a previous
+sleep that changed nothing but the reporting flag. The radio is unchanged: it still answers every 7.5 ms
+event, which is the floor this design accepts.
 
 ## 5-way switch
 
@@ -443,8 +447,9 @@ not ours to remove:
 | Connection interval | 30–50 ms | the host decides; 7.5 ms here, 30 ms is Android's default |
 | **Sketch-side total** | **~100 ms** | **~20–35 ms** |
 
-Printing is *not* on that list, but it is not free either — see [Serial output](#serial-output). It is
-off by default precisely so it cannot become part of the pointer's timing.
+Printing is *not* on that list, but it is not free either — see [Serial output](#serial-output). Turning it
+off is the first thing to do when the pointer's timing matters, and the only thing to do before a battery
+measurement.
 
 The rules that produce the "Now" column:
 
@@ -595,11 +600,9 @@ compositor) adds a frame or two on top. A gyro air pointer will not feel like a 
 | `kPrecisionLedEnabled` | true | Light the onboard LED while precision mode is on |
 | `kSleepIdleTimeoutMs` | 60000 | How long after the last click or real movement before the device goes back to sleep. See [Sleep and wake](#sleep-and-wake) |
 | `kSleepMinRateDps` | 10.0 | Pointer rate, in deg/s, that counts as real movement and keeps the device awake — same unit as `ptr_dps`. `0.0f` = clicks only |
-| `kSleepConnIntervalUnits` | 160 | Connection interval while asleep, in 1.25 ms units → 200 ms. The main sleep power lever; raise it for more saving, at up to one interval of delay on the waking click |
-| `kConnTimeoutUnits` | 200 | Supervision timeout in 10 ms units → 2 s, for both profiles. Must stay above `2 × interval` |
 | `kSleepPollMs` | 10 | Button/switch poll period while asleep. Keep it below the 20 ms debounce window |
 | `kSleepImuPowerDown` | true | Cut the sensor rail (`IMU_MIC_EN`) while asleep, not just its ODRs. Costs a ~20 ms rail settle on wake |
-| `kSerialLogEnabled` | false | Master switch for every print, including the periodic line — see [Serial output](#serial-output) |
+| `kSerialLogEnabled` | true | Master switch for every print, including the periodic line — set to `false` for battery measurement. See [Serial output](#serial-output) |
 | `kImuI2cClockHz` | 400000 | IMU bus clock, at the part's ceiling. Slower is measurably *worse* here — see [I2C reliability](#i2c-reliability) |
 | `kLinkPollMs` / `kConnPollMs` | 50 / 100 | How often the cached link state and the connection interval are re-read. Both are polled rather than checked per pass, because each query services the whole stack |
 
@@ -640,7 +643,7 @@ Gotcha: the LSM6DS3 family encodes `FS_XL` as `00`=±2 g, `01`=±16 g, `10`=±4 
 | `kGravityFilterTauMs` | 50 ms | LPF on the roll reference (~3 Hz). Higher = steadier roll, more lag |
 | `kBiasTrackingAlpha` | 0.005 | Continuous re-zero while still. Set to 0 to disable |
 | `kStillMinDot` / `kStillAccelTolG` | 0.999945 / 0.08 | How still the gravity direction and magnitude must be before re-zeroing |
-| `kSerialLogEnabled` | false | Master switch for **all** serial output. Off, the sketch is silent and the periodic line's link queries do not run — see [Serial output](#serial-output) |
+| `kSerialLogEnabled` | true | Master switch for **all** serial output. Off, the sketch is silent and the periodic line's link queries do not run — see [Serial output](#serial-output) |
 | `kPrintIntervalMs` | 100 | Line rate, when the log is on |
 | `kPrintAxisDiag` | false | Adds `accel_mg`, `plane_g` and `gyro` to the line — for identifying `kPointAxis`, see [Axis mapping](#axis-mapping--verified-on-hardware) |
 
@@ -696,12 +699,11 @@ rolls.
   acceleration as well as gravity) and is held stale when the device points steeply up or down,
   where gravity stops defining a roll.
 - The embedded FIFO and the IMU interrupt pin (`IMU_INT`, D24) are unused.
-- Sleep is still not the lowest power this part can reach. It drops the link's event rate to 200 ms,
-  cuts the sensor's rail, blanks the LED and lets the CPU sleep between polls (see
-  [Sleep power](#sleep-power)), but the BLE link is deliberately left up: reconnecting is a host
-  event, and a HID device that disconnects and reconnects is worse for the phone than the idle
-  events themselves. System OFF would be the only deeper state, and it would cost a
-  re-advertisement and a slow first click.
+- Sleep is still not the lowest power this part can reach. It cuts the sensor's rail, blanks the LED
+  and lets the CPU sleep between polls, but the BLE link keeps its 7.5 ms interval (see
+  [Sleep power](#sleep-power)): slowing it was measured to be a one-way trip on Android, and the link
+  is deliberately left up because a disconnect is itself a host event. System OFF would be the only
+  deeper state, and it would cost a re-advertisement and a slow first click.
 - A single HID report carries at most ±127 counts per axis, because the report fields are signed
   8-bit. With the paced ~20 ms period and the shipped gain that is a ~400 deg/s ceiling: the fastest
   flicks saturate and drain over the following reports, arriving a little late rather than short.
