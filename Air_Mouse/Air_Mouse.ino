@@ -15,6 +15,9 @@
  * button and the centre contact both left-click and both wake the device: it
  * boots asleep, reports nothing, and stays awake while the pointer keeps being
  * used, going quiet again after a minute without a click or real movement.
+ * Asleep is also the low-power state: the link drops to a 200 ms interval, the
+ * IMU's rail is cut, the LED is blanked and the loop sleeps between button polls,
+ * while the connection itself is kept so a click is not a reconnect.
  *
  * Hold the board still at power-up: it measures the gyro bias first, then pair with
  * "Air Mouse" from the host's Bluetooth settings. Wiring, diagnostics, tuning and
@@ -38,7 +41,11 @@
 // Master switch for every print in this sketch. Off by default, so the pointer path
 // touches no serial port and the periodic line's link queries do not run. Set true to
 // bring the whole log back. Cost and reasoning: README, "Serial output".
-static const bool kSerialLogEnabled = true;
+//
+// It also matters for power: while the USB bridge UART is configured the core denies the
+// yield-path WFI, so the CPU stops sleeping between connection events. A debug build is
+// therefore not a battery measurement.
+static const bool kSerialLogEnabled = false;
 
 // Prints are routed through this rather than the port itself, so every call site still
 // reads Serial.print(...) and the compiler removes the lot when the switch is off.
@@ -287,6 +294,38 @@ static const uint8_t  kConnAttempts        = 8;
 static const uint32_t kConnRetryGapMs      = 1000;
 static const uint32_t kConnFastThresholdMs = 8;   // only 7.5 ms counts as settled
 
+// Sleep profile: the interval the link runs at while nothing is being reported, in
+// 1.25 ms units. A sleeping BLE device still has to answer the central every interval,
+// so 7.5 ms costs 133 radio events a second -- and both ends' batteries -- for a report
+// that will never be sent. 200 ms is 27x fewer wakeups, and the radio is the largest
+// remaining load once the sensor is off. Raise it for more saving (500 ms is 2 events a
+// second) at the cost of up to one interval of delay on the click that wakes the device;
+// the click is still delivered, just up to that much later.
+static const uint16_t kSleepConnIntervalUnits = 160;  // 200 ms
+
+// Supervision timeout, in 10 ms units, for both profiles. Only matters for the slow one:
+// it has to exceed 2 * interval (the link must tolerate one lost event), so 2 s against
+// 200 ms is a tenfold margin -- and it is the core's own default, which matters because a
+// value picked here has to match the one the fast request carries.
+static const uint16_t kConnTimeoutUnits = 200;  // 2 s
+
+// Slave latency is deliberately not used. This core's link layer records the negotiated
+// latency and reports it (lat_ in the log) but keeps listening at every connection event,
+// so asking for it would buy no current at all -- and it would add up to
+// latency * interval of delay to the first report after a wake, for nothing.
+
+// How often the button and switch are polled while asleep. Nothing else is running, so
+// the loop sleeps between polls and this is its only clock. It has to stay below
+// kNavDebounceMs / kButtonDebounceMs or a tap could start and end inside one sample and
+// never be seen.
+static const uint32_t kSleepPollMs = 10;
+
+// Cut the sensor's supply, not just its ODRs. The rail gate (shared with the microphone)
+// takes the part from its few microamps of power-down to zero, at the cost of a ~20 ms
+// rail settle before the first sample on wake. The startup bias is kept either way: it
+// describes the part, so a rail cycle must not ask the user to hold still again.
+static const bool kSleepImuPowerDown = true;
+
 // Every Bluefruit connection or security query starts by running the stack service
 // routine, a few hundred microseconds on a live link. Per pass at 350 passes/s that
 // was most of the loop. The core still services the stack once per pass in main(),
@@ -493,6 +532,11 @@ static int8_t   g_pendingWheel   = 0;
 static bool     g_awake          = false;
 static uint32_t g_lastActivityMs = 0;  // last click or deliberate move
 
+// Whether the idle link profile has been asked for on this link. One request is enough:
+// the radio's parameter update is a round trip, and repeating it would wake both ends to
+// say nothing. Cleared on a connect and on a wake.
+static bool     g_sleepParamsAsked = false;
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -527,6 +571,15 @@ static float alphaFor(float tauMs, float dtSec) {
     alpha = 1.0f;
   }
   return alpha;
+}
+
+// The board's single LED, active low. Blanked while asleep: precision mode is a
+// remembered setting, but a lit LED on a sleeping device is pure drain.
+static void hidLedWrite(bool on) {
+  if (!kPrecisionLedEnabled) {
+    return;
+  }
+  digitalWrite(PIN_LED_BUILTIN, on ? LED_STATE_ON : !LED_STATE_ON);
 }
 
 // ---------------------------------------------------------------------------
@@ -737,6 +790,34 @@ static bool imuConfigure() {
     return false;
   }
   return imuWrite(kRegCtrl2G, kCtrl2GValue);
+}
+
+// Sleep: stop the sensor, then cut its supply. The registers are powered down
+// first so the part is not left mid-conversion while the rail collapses, and the
+// rail is dropped because a powered-down LSM6DS3 still draws a few microamps --
+// on a device that otherwise sits in the tens, that is worth a 20 ms wake.
+//
+// g_imuAddress is cleared so imuTask runs its existing discovery path on wake,
+// which is also what keeps the bias: that path only calibrates when there is no
+// bias yet, and the continuous re-zero absorbs whatever a rail cycle shifts.
+static void imuSuspend() {
+  if (g_imuAddress != 0) {
+    imuWrite(kRegCtrl1Xl, 0x00);  // accel power-down
+    imuWrite(kRegCtrl2G, 0x00);   // gyro power-down
+  }
+  if (kSleepImuPowerDown) {
+    digitalWrite(IMU_MIC_EN, LOW);
+  }
+  g_imuAddress = 0;
+}
+
+// Wake: rail up and let imuTask find and configure the part again. The bus itself
+// was never torn down, so only the rail needs re-enabling.
+static void imuResume() {
+  imuPowerRailOn();
+  g_imuAddress = 0;
+  g_filtersPrimed = false;
+  g_lastSampleUs = micros();
 }
 
 // Recovery, and only recovery. Called once the failures stop looking like
@@ -1178,6 +1259,7 @@ static void hidConnectCallback(uint16_t connHandle) {
   g_hidConnRetries  = 0;
   g_hidConnRetryMs  = 0;
   g_hidConnFastSeen = false;
+  g_sleepParamsAsked = false;
   g_hidLastWindowUs = 0;
   // Force the pacing to relearn: the ceiling belongs to the link, not the sketch.
   // Left alone it would carry the previous connection's rate into this one.
@@ -1432,7 +1514,7 @@ static void navPollLeftHold(uint32_t nowMs) {
 
   if (kPrecisionLedEnabled) {
     // Active low on this board.
-    digitalWrite(PIN_LED_BUILTIN, g_precision ? LED_STATE_ON : !LED_STATE_ON);
+    hidLedWrite(g_precision);
   }
 
   Serial.print("nav=precision ");
@@ -1517,12 +1599,64 @@ static uint8_t navButtonBits() {
   return bits;
 }
 
+// One link-parameter request, all four fields at once: the radio's update request
+// carries the interval range, latency and timeout together, so two calls would queue
+// two updates. Latency is always 0 -- see kSleepConnIntervalUnits for why.
+static void hidRequestLinkParams(uint16_t intervalUnits, uint16_t timeoutUnits) {
+  if (!Bluefruit.connected()) {
+    return;  // nothing to update; the next connection asks again
+  }
+  Bluefruit.rawRadio().setPreferredConnectionParameters(
+      intervalUnits, intervalUnits, 0U, timeoutUnits);
+}
+
+// The only place the power state changes, so the two halves of it -- what the sensor
+// is doing and what the link is doing -- can never disagree. Sleep is a reporting state
+// in name only: with the interval slow and the sensor unpowered it is where almost all
+// of the battery is actually saved, while the link stays up so a click is not a
+// reconnect.
+static void hidSetAwake(bool awake) {
+  if (awake == g_awake) {
+    return;
+  }
+
+  if (awake) {
+    imuResume();
+    // Reset the retry state instead of asking here: hidMaintainConnInterval runs later
+    // in this same pass and asks for the fast interval, so one code path places it.
+    g_hidConnRetries  = 0;
+    g_hidConnRetryMs  = 0;
+    g_hidConnFastSeen = false;
+    g_hidConnPollMs   = millis() - kConnPollMs;
+    g_sleepParamsAsked = false;
+    hidLedWrite(g_precision);
+    return;
+  }
+
+  imuSuspend();
+  hidLedWrite(false);
+  // The slow profile is asked for by hidMaintainConnInterval, which runs later in this
+  // same pass: one code path means a link that was already settled is still asked, and
+  // the request is never queued twice.
+  g_sleepParamsAsked = false;
+  g_hidConnPollMs    = millis() - kConnPollMs;
+
+  // Nothing queued survives into sleep, and nothing may survive out of it either: the
+  // backlog would fling the cursor, and a stale button state would be reported as a
+  // press on the first report after the wake.
+  g_pendingDeg[0] = 0.0f;
+  g_pendingDeg[1] = 0.0f;
+  g_pendingWheel = 0;
+  g_middlePulses = 0;
+  g_hidLastButtons = 0;
+}
+
 // Wake on a click, sleep after kSleepIdleTimeoutMs without one. Runs before the
 // link is consulted, so the state is coherent whether or not a host is attached.
 static void hidMaintainSleep(uint32_t nowMs) {
   if (!g_awake) {
     if (hidPrimaryDown()) {
-      g_awake = true;
+      hidSetAwake(true);
       hidNoteActivity(nowMs);
       Serial.print("hid=awake (button), idle timeout ");
       Serial.print(kSleepIdleTimeoutMs / 1000U);
@@ -1557,7 +1691,7 @@ static void hidMaintainSleep(uint32_t nowMs) {
   }
 
   if ((nowMs - g_lastActivityMs) >= kSleepIdleTimeoutMs) {
-    g_awake = false;
+    hidSetAwake(false);
     Serial.println("hid=sleep (idle), click to wake");
   }
 }
@@ -1747,6 +1881,21 @@ static void hidMaintainConnInterval(uint32_t nowMs) {
     return;
   }
 
+  // Asleep, the fast interval is exactly what is not wanted: the slow one is the whole
+  // basis of the sleep budget. Asked once per link and per sleep rather than every poll,
+  // because a refused request would otherwise be retried forever at 10 Hz.
+  if (!g_awake) {
+    if (!g_sleepParamsAsked && hidConnIntervalUnits() != kSleepConnIntervalUnits) {
+      g_sleepParamsAsked = true;
+      hidRequestLinkParams(kSleepConnIntervalUnits, kConnTimeoutUnits);
+      Serial.print("hid=sleep link profile, asking for conn interval ");
+      Serial.print(static_cast<float>(kSleepConnIntervalUnits) * 1.25f, 1);
+      Serial.println(" ms");
+    }
+    return;
+  }
+  g_sleepParamsAsked = false;
+
   if (ciMs != 0U && ciMs <= kConnFastThresholdMs) {
     if (!g_hidConnFastSeen) {
       g_hidConnFastSeen = true;
@@ -1765,7 +1914,7 @@ static void hidMaintainConnInterval(uint32_t nowMs) {
 
   g_hidConnRetryMs = nowMs;
   ++g_hidConnRetries;
-  Bluefruit.Periph.setConnInterval(kConnIntervalMin, kConnIntervalMax);
+  hidRequestLinkParams(kConnIntervalMin, kConnTimeoutUnits);
   Serial.print("hid=asking for conn interval ");
   Serial.print(static_cast<float>(kConnIntervalMin) * 1.25f, 1);
   Serial.print('-');
@@ -2003,12 +2152,25 @@ void setup() {
   // device becomes connectable.
   hidBegin();
   g_hidLastReportMs = millis();
+
+  // The device boots asleep, so the sensor must not be left sampling from power-up
+  // until the first click: this is the state it will spend most of its life in.
+  imuSuspend();
 }
 
 void loop() {
   // Both tasks run from one loop. The IMU side never blocks on the radio, and
   // the HID side is a no-op until a host pairs.
   ++g_loopCount;
-  imuTask();
+  if (g_awake) {
+    imuTask();  // asleep, the sensor is unpowered: there is nothing to sample
+  }
   hidTask(millis());
+
+  if (!g_awake) {
+    // Asleep the loop's only job is the button and switch poll, which is a handful of
+    // GPIO reads. Sleeping between polls is what makes the slow connection interval
+    // worth having: the CPU is off except for its own events and these samples.
+    delay(kSleepPollMs);
+  }
 }
