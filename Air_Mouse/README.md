@@ -37,13 +37,16 @@ nrf54l15clean:nrf54l15clean:xiao_nrf54l15
 BLE must be enabled, which is the default (`BLE Support: Enabled`). Other menu options can stay at
 their defaults.
 
-The serial log is **off by default** (`kSerialLogEnabled`), so the shipped sketch is silent and
-nothing in the pointer path depends on a serial port. Every log excerpt below assumes the switch has
-been turned back on:
+The serial log is **on in the sketch as it stands** (`kSerialLogEnabled`): it is the fastest way to see
+what the device is doing, and turning it off costs nothing but a one-line edit. Every log excerpt below
+assumes the switch is on:
 
 ```cpp
-static const bool kSerialLogEnabled = false;  // false as shipped
+static const bool kSerialLogEnabled = true;  // false for battery measurement
 ```
+
+It is also a power switch: an open USB bridge UART makes the core deny the yield-path WFI, so the CPU
+stops sleeping between connection events. Measure battery life with it off — see [Sleep power](#sleep-power).
 
 ## Startup sequence
 
@@ -131,6 +134,65 @@ State, timeout and rate are all in the sketch and listed in [Configuration](#con
 `kSleepIdleTimeoutMs` and `kSleepMinRateDps`. Watch them from the log as `state=`, `idle_ms=` and
 `sleep_rate=` on the periodic line — hold the device the way you normally use it and read `sleep_rate=`
 to pick a threshold from what you actually see.
+
+### Sleep power
+
+Sleep is a power state, not just a reporting one — it is where nearly all of the battery is saved:
+
+| | Awake | Asleep |
+| --- | --- | --- |
+| Connection interval | 7.5 ms (133 events/s) | 7.5 ms — unchanged, see below |
+| Slave latency | 0 | 0 |
+| IMU | 416 Hz, both sections on | rail off (`IMU_MIC_EN` low) |
+| CPU | running the sample loop | stopped — waiting for a click interrupt |
+| LED | lit if precision is on | blanked |
+
+The link is **kept**. A disconnect is itself a host event, and a reconnecting HID device is exactly
+what makes a phone's screen flash — deeper sleep would buy a few microamps and cost a second of latency
+on the first click. What changes is what the two ends of the device are doing for it:
+
+- **The link interval is not slowed, and that is deliberate.** Slowing it was tried and measured: 200 ms
+  while idle, 7.5 ms again on wake. The **increase is granted, the decrease never is** — Android only
+  accelerates a link when its own app requests it, so once the interval is 200 ms it stays there, and the
+  pointer is pinned to ~5 reports/s across every later wake. Reconnecting would restore 7.5 ms, and a
+  disconnect is a host event. So the asleep state keeps the fast link and gives up the 133 events/s.
+  Getting it back would need a host that honours the reverse request; there is nothing the sketch can do.
+- **No slave latency, deliberately.** This core's link layer records the negotiated latency and reports it
+  as `lat=` in the log, but it keeps the receiver on at every connection event regardless, so latency would
+  save nothing and would add up to `latency × interval` of delay to the first report after a wake.
+- **The sensor's rail is cut, not just its ODRs.** `kSleepImuPowerDown` drops `IMU_MIC_EN`, taking the part
+  from its few microamps of power-down to zero, and the part is ~0.6 mA while sampling — the largest single
+  term in the budget. The cost is a ~20 ms rail settle on wake, paid before the first sample. The startup
+  bias is kept — it describes the part — so a sleep/wake cycle never asks you to hold the board still again.
+- **The LED is blanked.** Precision mode is remembered, but a lit LED on a sleeping device is pure drain.
+- **The CPU stops.** Asleep there is no sensor to sample and no host to report to, so the loop stops
+  doing anything of its own: it only pumps the core (the same two calls `main()` makes between passes,
+  `nrf54l15_clean_idle_service()` + `yield()`) and executes one `WFI` per iteration. Nothing polls, no
+  timer of the sketch fires, no button or switch is read. The only way out is an interrupt — the two
+  click contacts (onboard button, P1.13, and centre, D2/P1.06), armed with `attachInterrupt(..., CHANGE)`,
+  plus the radio's own events, which the core services and immediately sleeps on again.
+  A raw edge is enough to wake; whether it was a click is decided afterwards by the normal debounce,
+  so a contact that never produced a stable press costs one idle timeout and reports nothing.
+  The other three switch directions are port-2 pins, which this core cannot attach an interrupt to —
+  and they are not wake sources anyway.
+
+**Why the pump stays:** this core runs *connectable* advertising from the foreground loop, so an asleep
+device that skipped `nrf54l15_clean_idle_service()` would never advertise and could not be found from the
+phone. The pump is not sketch polling — it is the same call `main()` would have made.
+
+Two things stop the WFI and leave the CPU spinning instead: `kSerialLogEnabled = true` (an open USB bridge
+UART makes the core refuse the yield-path WFI), and advertising while not connected (the core only permits
+WFI during background advertising or once a connection's background service is armed). Neither is sketch
+polling, and the case that matters — connected and idle — is a real `WFI`. **A debug build is not the sleep
+behaviour, and not a battery measurement.**
+
+```cpp
+kSleepImuPowerDown = true;  // cut the sensor rail; false leaves it powered down but supplied
+```
+
+The saving is the sensor (~0.6 mA to zero) and the CPU (a 400 Hz loop to sleeping) — against a previous
+sleep that changed nothing but the reporting flag. The radio is unchanged: it still answers every 7.5 ms
+event, which is the floor this design accepts.
 
 ## 5-way switch
 
@@ -224,6 +286,11 @@ The line is ~150 bytes, which is ~13 ms of wire time at 115200 baud, ten times a
 loop blocking on the port or a TX ring buffer filling does not need to be argued about: the switch
 exists so it can be measured. `printState()` is also gated on it, because the last thing that
 function does is two Bluefruit link queries and each of those services the whole stack.
+
+It is also a power switch, not only a log switch: while the USB bridge UART is configured the core
+refuses the yield-path WFI, so a debug build never idles the CPU between connection events. Measure
+battery life with the log off — see [Sleep power](#sleep-power). And a periodic line inside `imuTask`
+means there is no line at all while asleep, which is the state worth measuring anyway.
 
 ## I2C reliability
 
@@ -391,8 +458,9 @@ not ours to remove:
 | Connection interval | 30–50 ms | the host decides; 7.5 ms here, 30 ms is Android's default |
 | **Sketch-side total** | **~100 ms** | **~20–35 ms** |
 
-Printing is *not* on that list, but it is not free either — see [Serial output](#serial-output). It is
-off by default precisely so it cannot become part of the pointer's timing.
+Printing is *not* on that list, but it is not free either — see [Serial output](#serial-output). Turning it
+off is the first thing to do when the pointer's timing matters, and the only thing to do before a battery
+measurement.
 
 The rules that produce the "Now" column:
 
@@ -543,7 +611,8 @@ compositor) adds a frame or two on top. A gyro air pointer will not feel like a 
 | `kPrecisionLedEnabled` | true | Light the onboard LED while precision mode is on |
 | `kSleepIdleTimeoutMs` | 60000 | How long after the last click or real movement before the device goes back to sleep. See [Sleep and wake](#sleep-and-wake) |
 | `kSleepMinRateDps` | 10.0 | Pointer rate, in deg/s, that counts as real movement and keeps the device awake — same unit as `ptr_dps`. `0.0f` = clicks only |
-| `kSerialLogEnabled` | false | Master switch for every print, including the periodic line — see [Serial output](#serial-output) |
+| `kSleepImuPowerDown` | true | Cut the sensor rail (`IMU_MIC_EN`) while asleep, not just its ODRs. Costs a ~20 ms rail settle on wake |
+| `kSerialLogEnabled` | true | Master switch for every print, including the periodic line — set to `false` for battery measurement. See [Serial output](#serial-output) |
 | `kImuI2cClockHz` | 400000 | IMU bus clock, at the part's ceiling. Slower is measurably *worse* here — see [I2C reliability](#i2c-reliability) |
 | `kLinkPollMs` / `kConnPollMs` | 50 / 100 | How often the cached link state and the connection interval are re-read. Both are polled rather than checked per pass, because each query services the whole stack |
 
@@ -584,7 +653,7 @@ Gotcha: the LSM6DS3 family encodes `FS_XL` as `00`=±2 g, `01`=±16 g, `10`=±4 
 | `kGravityFilterTauMs` | 50 ms | LPF on the roll reference (~3 Hz). Higher = steadier roll, more lag |
 | `kBiasTrackingAlpha` | 0.005 | Continuous re-zero while still. Set to 0 to disable |
 | `kStillMinDot` / `kStillAccelTolG` | 0.999945 / 0.08 | How still the gravity direction and magnitude must be before re-zeroing |
-| `kSerialLogEnabled` | false | Master switch for **all** serial output. Off, the sketch is silent and the periodic line's link queries do not run — see [Serial output](#serial-output) |
+| `kSerialLogEnabled` | true | Master switch for **all** serial output. Off, the sketch is silent and the periodic line's link queries do not run — see [Serial output](#serial-output) |
 | `kPrintIntervalMs` | 100 | Line rate, when the log is on |
 | `kPrintAxisDiag` | false | Adds `accel_mg`, `plane_g` and `gyro` to the line — for identifying `kPointAxis`, see [Axis mapping](#axis-mapping--verified-on-hardware) |
 
@@ -640,10 +709,11 @@ rolls.
   acceleration as well as gravity) and is held stale when the device points steeply up or down,
   where gravity stops defining a roll.
 - The embedded FIFO and the IMU interrupt pin (`IMU_INT`, D24) are unused.
-- Sleep is a reporting state, not a power state: the IMU keeps sampling and the button keeps being
-  polled, so the device is quiet at the host but still drawing its usual current. Putting the sensor and
-  the radio to sleep would need a wake source that survives it — the button is one, but the soft device
-  has to stay up for BLE, so the saving would be the sensor's alone.
+- Sleep is still not the lowest power this part can reach. It cuts the sensor's rail, blanks the LED
+  and the CPU stops dead, but the BLE link keeps its 7.5 ms interval (see
+  [Sleep power](#sleep-power)): slowing it was measured to be a one-way trip on Android, and the link
+  is deliberately left up because a disconnect is itself a host event. System OFF would be the only
+  deeper state, and it would cost a re-advertisement and a slow first click.
 - A single HID report carries at most ±127 counts per axis, because the report fields are signed
   8-bit. With the paced ~20 ms period and the shipped gain that is a ~400 deg/s ceiling: the fastest
   flicks saturate and drain over the following reports, arriving a little late rather than short.
