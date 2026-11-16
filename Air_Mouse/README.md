@@ -436,6 +436,29 @@ I2C has no checksum, so a burst corrupted *without* NACKing is accepted and land
 sample. That is why the error free rate is worth caring about beyond tidiness, and why 3.47 % is a much
 worse trade than it looks.
 
+### Silence is a fault too
+
+Every rule above watches for a sensor that *answers badly*. The failure that actually strands a device is
+the opposite: a part that still answers `WHO_AM_I` but has stopped producing samples — a lost configuration,
+a wedged bus, a part that browned out. No data-ready ever rises and no read error is logged, and the old
+recovery could not help either way:
+
+- with the address still valid, discovery never ran, so nothing re-initialised the part;
+- once discovery *did* fail, it never called `imuBusRecover()` and blocked the loop for a second per attempt.
+
+Both states are permanent until the battery is pulled, and clicks keep working throughout because they never
+touch the sensor — a dead pointer with a live mouse. The sketch now walks a ladder instead:
+
+| Rung | When | Log line |
+| --- | --- | --- |
+| Reconfigure in place | no sample for `kImuStallTimeoutMs` (250 ms ≈ 100 missed samples) | `imu=stalled <ms> ms, reconfiguring (n)` |
+| Drop to discovery | after `kImuStallReconfigLimit` failed reconfigures | `imu=stalled, dropping to discovery` |
+| Reset the bus | every `kImuRecoverEveryTries` discovery misses — a slave holding SDA low needs clocks before anything can answer it | `imu=bus recovery (still not found)` |
+| Power-cycle the part | every `kImuPowerCycleEveryTries` misses — nothing else cycles the rail outside a sleep/wake, so a part wedged mid-session stays wedged | `imu=power cycle` |
+
+Discovery is rate limited (`kImuRetryMs`) rather than blocking, so the loop keeps running the whole time and
+a dead sensor no longer makes the clicks sluggish as well. The gyro bias is still never re-measured.
+
 ## Gyro zero and creep
 
 The bias is measured once at startup and then re-zeroed continuously, because the sensor's zero-rate
@@ -697,7 +720,10 @@ compositor) adds a frame or two on top. A gyro air pointer will not feel like a 
 | `kBatNoCellMv` | 500 | Below this the battery pad is empty and the level is reported as 100 %, so a USB-powered board does not show an empty battery |
 | `kBatteryReportEnabled` | true | `false` makes the whole feature a no-op (level stays at the old placeholder) — the A/B switch for a performance complaint, not a tuning knob |
 | `kSerialLogEnabled` | true | Master switch for every print, including the periodic line — set to `false` for battery measurement. See [Serial output](#serial-output) |
-| `kImuI2cClockHz` | 400000 | IMU bus clock, at the part's ceiling. Slower is measurably *worse* here — see [I2C reliability](#i2c-reliability) |
+| `kImuI2cClockHz` | 400000 | IMU bus clock, at the part's ceiling. Slower is measurably *worse* here - see [I2C reliability](#i2c-reliability) |
+| `kImuStallTimeoutMs` / `kImuStallReconfigLimit` | 250 / 3 | Silence before the sensor counts as stalled, and reconfigures tried before dropping to discovery. See [Silence is a fault too](#silence-is-a-fault-too) |
+| `kImuRetryMs` | 1000 | Retry pacing while the sensor is missing. Non-blocking, so the loop (and clicks) keep running |
+| `kImuRecoverEveryTries` / `kImuPowerCycleEveryTries` | 3 / 6 | Discovery misses before the bus is clocked out, and before the part's supply is cycled |
 | `kLinkPollMs` / `kConnPollMs` | 50 / 100 | How often the cached link state and the connection interval are re-read. Both are polled rather than checked per pass, because each query services the whole stack |
 
 `kHidCountsPerDeg` is bounded from above by the report format, not by feel. One report carries at most

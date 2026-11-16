@@ -183,6 +183,24 @@ static const uint32_t kImuRetryBudgetUs = 3000;
 static const uint16_t kImuConsecFaultLimit = 32;
 static const uint8_t  kImuRecoverLimit     = 8;
 
+// Silence is a fault too, and it is the one the error counters cannot see: a part that
+// still answers WHO_AM_I but has stopped producing samples -- a lost configuration, a
+// wedged bus, a part that browned out -- raises no data-ready and logs no read error.
+// Without a watchdog that state is permanent: the address stays valid, so nothing ever
+// re-runs discovery, and the pointer stays dead until the battery is pulled. 250 ms is
+// ~100 missed samples at 416 Hz, so it cannot fire on a good part.
+static const uint32_t kImuStallTimeoutMs     = 250;
+static const uint8_t  kImuStallReconfigLimit = 3;  // reconfigures before discovery
+
+// Retry pacing for the "not found" state, and the escalation ladder under it: reset the
+// bus every kImuRecoverEveryTries misses (a slave holding SDA low needs clocks, and
+// nothing can answer it before that), and cycle the part's supply every
+// kImuPowerCycleEveryTries. Blocking here -- it used to be delay(1000) -- stalls the
+// whole loop once a second, clicks included, and leaves no room for either recovery.
+static const uint32_t kImuRetryMs              = 1000;
+static const uint8_t  kImuRecoverEveryTries    = 3;
+static const uint8_t  kImuPowerCycleEveryTries = 6;
+
 // ---------------------------------------------------------------------------
 // Axis mapping - measured on this board
 // ---------------------------------------------------------------------------
@@ -467,6 +485,13 @@ static uint32_t g_imuReads        = 0;  // transactions attempted
 static uint32_t g_imuReadErrors   = 0;  // transactions that failed every retry
 static uint16_t g_imuConsecErrors = 0;  // consecutive failures, cleared by a success
 static uint8_t  g_imuRecoveries   = 0;  // failed bus resets since the last clean reply
+
+// Silence and retry bookkeeping (see imuTask): when a sample last arrived, how many
+// reconfigures have been tried without one, and how far the discovery ladder has got.
+static uint32_t g_imuLastSampleMs   = 0;
+static uint8_t  g_imuStallReconfigs = 0;
+static uint32_t g_imuRetryMs        = 0;
+static uint8_t  g_imuNotFoundTries  = 0;
 
 static uint32_t g_lastSampleUs = 0;
 static uint32_t g_lastPrintMs  = 0;
@@ -973,6 +998,17 @@ static void imuResume() {
   g_imuAddress = 0;
   g_filtersPrimed = false;
   g_lastSampleUs = micros();
+}
+
+// Last resort for a part that has stopped answering: give it its supply back. Nothing
+// else cycles the rail outside a sleep/wake, so a sensor that wedges mid-session stays
+// wedged until the idle timeout expires. Same 20 ms settle the wake path uses, paid only
+// after discovery has already failed for several seconds.
+static void imuPowerCycle() {
+  digitalWrite(IMU_MIC_EN, LOW);
+  delay(50);  // let the rail actually collapse rather than sag
+  imuPowerRailOn();
+  g_imuAddress = 0;
 }
 
 // Recovery, and only recovery. Called once the failures stop looking like
@@ -2215,27 +2251,81 @@ static void announceSensor() {
 }
 
 static void imuTask() {
+  const uint32_t nowMs = millis();
+
   // Recover from a missing or wedged sensor without needing a reset.
   if (g_imuAddress == 0) {
+    // Rate limited rather than blocking. This used to end in delay(1000), which stopped
+    // the whole loop -- clicks included -- once per attempt, and it never ran the bus
+    // recovery: once discovery started failing, a wedged bus could never be freed, so
+    // the pointer stayed dead for good even though the recovery routine existed.
+    if (nowMs - g_imuRetryMs < kImuRetryMs) {
+      delay(1);  // yield to the radio rather than spin on a sensor that is not there
+      return;
+    }
+    g_imuRetryMs = nowMs;
+
+    // Escalation, cheapest first: clocks for a bus that a slave is holding down, then
+    // the part's supply for one that has stopped answering altogether.
+    if (g_imuNotFoundTries < 255U) {
+      ++g_imuNotFoundTries;
+    }
+    if ((g_imuNotFoundTries % kImuPowerCycleEveryTries) == 0U) {
+      Serial.println("imu=power cycle");
+      imuPowerCycle();
+    } else if ((g_imuNotFoundTries % kImuRecoverEveryTries) == 0U) {
+      Serial.println("imu=bus recovery (still not found)");
+      imuBusRecover();
+    }
+
     if (imuFind() && imuConfigure()) {
+      g_imuNotFoundTries  = 0;
+      g_imuStallReconfigs = 0;
       announceSensor();
       if (!g_biasValid) {
-        calibrateGyroBias();
+        calibrateGyroBias();  // blocks for up to ~2 s: stamp the watchdog after it
       }
-      g_lastSampleUs = micros();
-      g_lastPrintMs  = millis();
-      g_filtersPrimed = false;
+      g_lastSampleUs    = micros();
+      g_lastPrintMs     = nowMs;
+      g_imuLastSampleMs = millis();
+      g_filtersPrimed   = false;
     } else {
       g_imuAddress = 0;
       // Rate-limited: a sensor that is truly absent should say so once in a
       // while rather than every second forever.
-      static uint8_t notFoundTries = 0;
-      if ((notFoundTries++ % 5) == 0) {
+      static uint8_t logTries = 0;
+      if ((logTries++ % 5) == 0) {
         Serial.println("imu=not-found, retrying");
       }
-      delay(1000);
-      return;
     }
+    return;
+  }
+
+  // The part answers on the bus but has stopped producing samples: a configuration that
+  // was lost without an error to report. Reconfigure first -- that is the cheap
+  // explanation and the common one -- and only after a few failures assume the part is
+  // gone and go back to discovery, which escalates from there.
+  if (nowMs - g_imuLastSampleMs >= kImuStallTimeoutMs) {
+    if (g_imuStallReconfigs < kImuStallReconfigLimit) {
+      ++g_imuStallReconfigs;
+      Serial.print("imu=stalled ");
+      Serial.print(nowMs - g_imuLastSampleMs);
+      Serial.print(" ms, reconfiguring (");
+      Serial.print(g_imuStallReconfigs);
+      Serial.println(')');
+      if (imuConfigure()) {
+        g_imuLastSampleMs = nowMs;
+        g_lastSampleUs    = micros();
+        g_filtersPrimed   = false;
+      }
+    } else {
+      Serial.println("imu=stalled, dropping to discovery");
+      g_imuStallReconfigs = 0;
+      g_imuAddress        = 0;
+      g_imuRetryMs        = nowMs - kImuRetryMs;  // retry on the next pass
+      g_imuNotFoundTries  = 0;                    // start the ladder at the bus reset
+    }
+    return;
   }
 
   if (!imuDataReady()) {
@@ -2255,6 +2345,9 @@ static void imuTask() {
     return;
   }
 
+  g_imuLastSampleMs   = nowMs;
+  g_imuStallReconfigs = 0;
+
   // dt is measured, not assumed, so the integration stays correct even when
   // the loop is delayed by a long serial write.
   const uint32_t nowUs = micros();
@@ -2267,7 +2360,6 @@ static void imuTask() {
 
   updateMotion(gyroRaw, accelRaw, dtSec);
 
-  const uint32_t nowMs = millis();
   // Gated on the switch, not just the interval: printState ends with two stack-servicing
   // link queries, and there is no point paying for those ten times a second when nobody
   // is reading the line.
@@ -2314,6 +2406,8 @@ void setup() {
 
   g_lastSampleUs = micros();
   g_lastPrintMs  = millis();
+  // Start the silence watchdog from here: the part is configured now, so a sample is due.
+  g_imuLastSampleMs = g_lastPrintMs;
 
   // BLE starts last so the calibration instructions are on screen before the
   // device becomes connectable.
