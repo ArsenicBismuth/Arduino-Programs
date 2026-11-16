@@ -5,7 +5,7 @@ A Bluetooth HID air mouse for a Seeed XIAO nRF54L15 / Sense, built on the
 
 `Air_Mouse.ino` reads the board's built-in ST **LSM6DS3TR-C**, turns the gyro into roll-compensated
 pointer motion, and reports it as a standard BLE mouse. The onboard button is a left click, and a
-5-way switch adds the wheel, the back button, a middle click and a precision mode.
+5-way switch adds the wheel, a second left click, the back button, a middle click and a precision mode.
 
 ## Hardware
 
@@ -17,9 +17,9 @@ pointer motion, and reports it as a standard BLE mouse. The onboard button is a 
 | Battery divider enable | `VBAT_EN` | P1.15 | load switch for the VBAT divider, active high — kept LOW except while reading |
 | Battery divider sense | `VBAT_READ` (A7) | P1.14 | `AIN7`, behind a 2:1 divider |
 | Left click | `PIN_BUTTON` | P0.00 | onboard button, active low |
-| Switch left | D1 | P1.05 | middle click / precision mode |
+| Switch left | D1 | P1.05 | left click, wakes the device |
 | Switch right | D10 | P2.02 | host back button |
-| Switch centre | D2 | P1.06 | left click, wakes the device |
+| Switch centre | D2 | P1.06 | middle click / precision mode |
 | Switch up | D9 | P2.04 | scroll up |
 | Switch down | D0 | P1.04 | scroll down |
 
@@ -75,7 +75,7 @@ ble=advertising as "Air Mouse" (pair from the host, HID needs an encrypted link)
 Then pair from the host: **Settings → Bluetooth → "Air Mouse"**. The console logs
 `ble=connected, pairing`, and after pairing, motion and clicks start working.
 
-The device **boots asleep** (`hid=sleep on boot, click the button or the switch centre to wake`) and
+The device **boots asleep** (`hid=sleep on boot, click the button or the switch left to wake`) and
 reports nothing until it is woken, so pairing itself does not make the pointer move — see
 [Sleep and wake](#sleep-and-wake).
 
@@ -110,7 +110,7 @@ all, so a device lying on the desk, or rattling around in a bag, cannot drift th
 the host from going idle. Pairing is unaffected: the link comes up as usual, it is only the reports that
 are withheld.
 
-- **Wake:** the primary mouse button — the onboard button **or** the switch's centre contact. The click
+- **Wake:** the primary mouse button — the onboard button **or** the switch's left contact. The click
   that wakes it is also delivered, because it is a real click; the wake is not a separate gesture. The
   switch's other four directions deliberately do **not** wake it, so a hand brushing the case cannot
   bring it out of sleep.
@@ -173,12 +173,12 @@ on the first click. What changes is what the two ends of the device are doing fo
   doing anything of its own: it only pumps the core (the same two calls `main()` makes between passes,
   `nrf54l15_clean_idle_service()` + `yield()`) and executes one `WFI` per iteration. Nothing polls, no
   timer of the sketch fires, no button or switch is read. The only way out is an interrupt — the two
-  click contacts (onboard button, P1.13, and centre, D2/P1.06), armed with `attachInterrupt(..., CHANGE)`,
+  click contacts (onboard button, P1.13, and left, D1/P1.05), armed with `attachInterrupt(..., CHANGE)`,
   plus the radio's own events, which the core services and immediately sleeps on again.
   A raw edge is enough to wake; whether it was a click is decided afterwards by the normal debounce,
   so a contact that never produced a stable press costs one idle timeout and reports nothing.
-  The other three switch directions are port-2 pins, which this core cannot attach an interrupt to —
-  and they are not wake sources anyway.
+  The switch's other directions are not wake sources, and the two that are port-2 pins (D9/D10) could
+  not take an interrupt from this core anyway.
 
 **Why the pump stays:** this core runs *connectable* advertising from the foreground loop, so an asleep
 device that skipped `nrf54l15_clean_idle_service()` would never advertise and could not be found from the
@@ -285,9 +285,9 @@ rather than assumed:
 | --- | --- | --- |
 | up | D9 | wheel up — one detent, then repeats while held |
 | down | D0 | wheel down |
-| centre | D2 | left click, and wakes the device |
+| centre | D2 | middle click on a tap, **precision mode** on a 2 s hold |
 | right | D10 | host back button (`MOUSE_BUTTON_BACKWARD`) |
-| left | D1 | middle click on a tap, **precision mode** on a 2 s hold |
+| left | D1 | left click, and wakes the device |
 
 The five contacts are debounced as one switch (20 ms, the same window as the onboard button), because
 they settle together and a press is not news until the whole set has held still. They are **polled**,
@@ -303,7 +303,7 @@ scrolls nothing rather than picking one.
 
 **Precision mode** halves the pointer gain (`kPrecisionGainScale`), which is what makes fine aiming
 possible: an air pointer's weakness is not speed but the last few pixels, and half the gain halves the
-smallest motion that can land on one. It is a **toggle**, triggered by holding the left contact for
+smallest motion that can land on one. It is a **toggle**, triggered by holding the centre contact for
 `kPrecisionHoldMs` (2 s), and the board's otherwise-unused LED is lit while it is on — a mode with no
 feedback is a mode you cannot tell you are in.
 
@@ -342,7 +342,7 @@ parks near `1000 / tx_s + 2` instead.
 | `ptr_dps` | roll-compensated pointer rates, (horizontal, vertical), deg/s, after the deadzone — so `0.0` at rest is the confirmation that nothing is creeping |
 | `ptr_deg` | those rates integrated — pointer movement so far, wrapped to ±180° |
 | `state` | `awake` or `sleep`. `sleep` is the boot state and means no reports are being sent — see [Sleep and wake](#sleep-and-wake) |
-| `prec` | `on` or `off` — precision mode (half gain), toggled by a 2 s hold on the switch's left contact |
+| `prec` | `on` or `off` — precision mode (half gain), toggled by a 2 s hold on the switch's centre contact |
 | `idle_ms` | time since the last click or real movement while awake. Sleeps at `kSleepIdleTimeoutMs` |
 | `sleep_rate` | pointer speed, deg/s, that the sleep check compares against `kSleepMinRateDps`. Printed while awake only, so the threshold can be set from a real capture |
 | `read_err` | failed I2C transactions / attempted. Hidden until it is non-zero |
@@ -686,7 +686,7 @@ compositor) adds a frame or two on top. A gyro air pointer will not feel like a 
 | `kScrollFirstRepeatMs` | 400 | Delay before a held up/down starts repeating, so a deliberate single step stays a single step |
 | `kScrollRepeatMs` | 80 | Repeat period while held — ~12 detents/s. `0` disables the repeat |
 | `kPendingWheelCap` | 8 | Ceiling on unreported detents, so a stalled link cannot dump a burst of scroll after the hand stops |
-| `kPrecisionHoldMs` | 2000 | How long the left contact must be held to toggle precision mode. Below the tap/hold boundary the release is a middle click |
+| `kPrecisionHoldMs` | 2000 | How long the centre contact must be held to toggle precision mode. Below the tap/hold boundary the release is a middle click |
 | `kPrecisionGainScale` | 0.5 | Gain multiplier while precision mode is on. `1.0f` makes the mode a no-op |
 | `kPrecisionLedEnabled` | true | Light the onboard LED while precision mode is on |
 | `kSleepIdleTimeoutMs` | 60000 | How long after the last click or real movement before the device goes back to sleep. See [Sleep and wake](#sleep-and-wake) |

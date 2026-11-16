@@ -10,9 +10,9 @@
  * compensation keeps the pointer axes on screen when the device is banked.
  *
  * A 5-way switch (common leg to GND) sits alongside the onboard button: up/down
- * turn the wheel, centre is left click, right is the host's back button, and left
+ * turn the wheel, left is left click, right is the host's back button, and centre
  * is a middle click on a tap or precision mode after a 2 s hold. The onboard
- * button and the centre contact both left-click and both wake the device: it
+ * button and the left contact both left-click and both wake the device: it
  * boots asleep, reports nothing, and stays awake while the pointer keeps being
  * used, going quiet again after a minute without a click or real movement.
  * Asleep is also the low-power state: the IMU's rail is cut, the LED is blanked and
@@ -125,8 +125,8 @@ enum NavIndex : uint8_t {
   kNavDown,
   kNavCount
 };
-static const uint8_t kNavPins[kNavCount] = {PIN_D1, PIN_D10, PIN_D2, PIN_D9, PIN_D0};
-static const char* const kNavNames[kNavCount] = {"left", "right", "centre", "up", "down"};
+static const uint8_t kNavPins[kNavCount] = {PIN_D2, PIN_D10, PIN_D1, PIN_D9, PIN_D0};
+static const char* const kNavNames[kNavCount] = {"centre", "right", "left", "up", "down"};
 
 // LSM6DS3TR-C register map (only the registers this sketch touches).
 static const uint8_t kRegWhoAmI  = 0x0F;  // WHO_AM_I, expected 0x6A
@@ -368,7 +368,7 @@ static const int8_t   kScrollUp            = 1;    // HID wheel: positive scroll
 static const int8_t   kScrollDown          = -1;
 static const int8_t   kPendingWheelCap     = 8;    // detents, so a stalled link cannot dump a burst
 
-// Left contact, which has two jobs and therefore has to be timed: a tap is a
+// Centre contact, which has two jobs and therefore has to be timed: a tap is a
 // middle click, a hold toggles precision mode. The click is emitted on release,
 // because only then is the press known not to be a hold; the toggle fires the
 // moment the hold is reached, so the release that follows does nothing.
@@ -576,7 +576,7 @@ static uint8_t  g_navCandidate   = 0;  // raw level being timed
 static uint8_t  g_navDown        = 0;  // debounced
 static uint32_t g_navCandidateMs = 0;
 
-// Left contact: held-timer, whether the hold has already toggled the mode, and
+// Centre contact: held-timer, whether the hold has already toggled the mode, and
 // the middle click the release may still owe.
 static bool     g_leftHeld       = false;
 static uint32_t g_leftPressMs    = 0;
@@ -603,7 +603,7 @@ static bool     g_batteryKnown   = false;
 static uint16_t g_batteryMv      = 0;
 static uint8_t  g_batteryPercent = 0;
 
-// Set by the wake interrupt -- the onboard button or the switch's centre contact -- and
+// Set by the wake interrupt -- the onboard button or the switch's left contact -- and
 // consumed by the asleep wait in loop(). volatile because the ISR writes it; it is one
 // byte, so no critical section is needed around the flag itself.
 static volatile bool g_wakeEdge = false;
@@ -1523,7 +1523,7 @@ static void hidBegin() {
 
   // Stated at boot because it is the one behaviour that looks like a fault: the
   // pointer does nothing until the primary button has been clicked.
-  Serial.println("hid=sleep on boot, click the button or the switch centre to wake");
+  Serial.println("hid=sleep on boot, click the button or the switch left to wake");
 }
 
 // Refreshes the cached link answer. Every query below starts by running the stack
@@ -1610,7 +1610,7 @@ static uint8_t navReadMask() {
   return mask;
 }
 
-// The onboard button and the centre contact are the same thing to the host, and
+// The onboard button and the left contact are the same thing to the host, and
 // either one wakes the device -- the switch's other directions are not allowed
 // to, so a hand brushing the case cannot bring it out of sleep.
 static bool hidPrimaryDown() {
@@ -1664,7 +1664,7 @@ static void navPollScroll(uint32_t nowMs) {
   g_scrollNextMs = nowMs + kScrollRepeatMs;
 }
 
-// The left contact's second job, and the reason it is timed at all: once the
+// The centre contact's second job, and the reason it is timed at all: once the
 // press is old enough it stops being a click and becomes a mode toggle. Firing
 // on the way *into* the hold rather than on release is what makes the toggle
 // feel immediate and lets the release be silent.
@@ -1724,7 +1724,7 @@ static void navPoll(uint32_t nowMs) {
     Serial.println(now ? " down" : " up");
   }
 
-  // Left: the press arms the hold timer, the release decides what it was.
+  // Centre: the press arms the hold timer, the release decides what it was.
   if (navDown(kNavLeft) && (previous & (1U << kNavLeft)) == 0U) {
     g_leftHeld     = true;
     g_leftPressMs  = nowMs;
@@ -1749,9 +1749,10 @@ static void navTask(uint32_t nowMs) {
   navPollScroll(nowMs);
 }
 
-// The button bits the switch is asking for right now. Centre is a plain left
-// click; right is the host's back button, which is why the report is no longer
-// the compact Zephyr one -- see hidBegin.
+// The button bits the switch is asking for right now. The kNavCenter slot is the
+// switch's left direction (see kNavPins): a plain left click. Right is the host's
+// back button, which is why the report is no longer the compact Zephyr one -- see
+// hidBegin.
 static uint8_t navButtonBits() {
   uint8_t bits = 0;
   if (navDown(kNavCenter)) {
@@ -1767,10 +1768,10 @@ static uint8_t navButtonBits() {
 }
 
 // The two contacts that mean "left click" are the only wake sources: the onboard button
-// (P1.13) and the switch's centre contact (D2, P1.06). Both are port 1, so both can take
-// an interrupt -- the other three directions are port 2, which this core cannot attach
-// (digitalPinToInterrupt returns NOT_AN_INTERRUPT) and which must not wake the device
-// anyway.
+// (P1.13) and the switch's left contact (D1, P1.05). Both are port 1, so both can take
+// an interrupt. The switch's other directions deliberately do not wake it, and the two
+// that are D9/D10 are port 2, which this core cannot attach to anyway
+// (digitalPinToInterrupt returns NOT_AN_INTERRUPT).
 //
 // CHANGE, not FALLING: the wake itself is not debounced -- a raw edge is enough -- and
 // the normal poll path decides whether it was really a click as soon as the loop runs.
