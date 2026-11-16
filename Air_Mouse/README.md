@@ -5,7 +5,7 @@ A Bluetooth HID air mouse for a Seeed XIAO nRF54L15 / Sense, built on the
 
 `Air_Mouse.ino` reads the board's built-in ST **LSM6DS3TR-C**, turns the gyro into roll-compensated
 pointer motion, and reports it as a standard BLE mouse. The onboard button is a left click, and a
-5-way switch adds the wheel, the back button, a middle click and a precision mode.
+5-way switch adds the wheel, a second left click, the back button, a middle click and a precision mode.
 
 ## Hardware
 
@@ -14,10 +14,12 @@ pointer motion, and reports it as a standard BLE mouse. The onboard button is a 
 | IMU SDA | D12 | P0.04 | back-pad bus, exposed as `Wire1` |
 | IMU SCL | D11 | P0.03 | back-pad bus, exposed as `Wire1` |
 | IMU power gate | D20 / `IMU_MIC_EN` | P0.01 | shared IMU + microphone rail, must be HIGH |
+| Battery divider enable | `VBAT_EN` | P1.15 | load switch for the VBAT divider, active high — kept LOW except while reading |
+| Battery divider sense | `VBAT_READ` (A7) | P1.14 | `AIN7`, behind a 2:1 divider |
 | Left click | `PIN_BUTTON` | P0.00 | onboard button, active low |
-| Switch left | D1 | P1.05 | middle click / precision mode |
+| Switch left | D1 | P1.05 | left click, wakes the device |
 | Switch right | D10 | P2.02 | host back button |
-| Switch centre | D2 | P1.06 | left click, wakes the device |
+| Switch centre | D2 | P1.06 | middle click / precision mode |
 | Switch up | D9 | P2.04 | scroll up |
 | Switch down | D0 | P1.04 | scroll down |
 
@@ -73,7 +75,7 @@ ble=advertising as "Air Mouse" (pair from the host, HID needs an encrypted link)
 Then pair from the host: **Settings → Bluetooth → "Air Mouse"**. The console logs
 `ble=connected, pairing`, and after pairing, motion and clicks start working.
 
-The device **boots asleep** (`hid=sleep on boot, click the button or the switch centre to wake`) and
+The device **boots asleep** (`hid=sleep on boot, click the button or the switch left to wake`) and
 reports nothing until it is woken, so pairing itself does not make the pointer move — see
 [Sleep and wake](#sleep-and-wake).
 
@@ -108,7 +110,7 @@ all, so a device lying on the desk, or rattling around in a bag, cannot drift th
 the host from going idle. Pairing is unaffected: the link comes up as usual, it is only the reports that
 are withheld.
 
-- **Wake:** the primary mouse button — the onboard button **or** the switch's centre contact. The click
+- **Wake:** the primary mouse button — the onboard button **or** the switch's left contact. The click
   that wakes it is also delivered, because it is a real click; the wake is not a separate gesture. The
   switch's other four directions deliberately do **not** wake it, so a hand brushing the case cannot
   bring it out of sleep.
@@ -165,16 +167,18 @@ on the first click. What changes is what the two ends of the device are doing fo
   term in the budget. The cost is a ~20 ms rail settle on wake, paid before the first sample. The startup
   bias is kept — it describes the part — so a sleep/wake cycle never asks you to hold the board still again.
 - **The LED is blanked.** Precision mode is remembered, but a lit LED on a sleeping device is pure drain.
+- **The pack is measured on the way in.** The battery reading is taken as the device goes quiet rather than
+  on wake, and the level is pushed to the host there — see [Battery reporting](#battery-reporting).
 - **The CPU stops.** Asleep there is no sensor to sample and no host to report to, so the loop stops
   doing anything of its own: it only pumps the core (the same two calls `main()` makes between passes,
   `nrf54l15_clean_idle_service()` + `yield()`) and executes one `WFI` per iteration. Nothing polls, no
   timer of the sketch fires, no button or switch is read. The only way out is an interrupt — the two
-  click contacts (onboard button, P1.13, and centre, D2/P1.06), armed with `attachInterrupt(..., CHANGE)`,
+  click contacts (onboard button, P1.13, and left, D1/P1.05), armed with `attachInterrupt(..., CHANGE)`,
   plus the radio's own events, which the core services and immediately sleeps on again.
   A raw edge is enough to wake; whether it was a click is decided afterwards by the normal debounce,
   so a contact that never produced a stable press costs one idle timeout and reports nothing.
-  The other three switch directions are port-2 pins, which this core cannot attach an interrupt to —
-  and they are not wake sources anyway.
+  The switch's other directions are not wake sources, and the two that are port-2 pins (D9/D10) could
+  not take an interrupt from this core anyway.
 
 **Why the pump stays:** this core runs *connectable* advertising from the foreground loop, so an asleep
 device that skipped `nrf54l15_clean_idle_service()` would never advertise and could not be found from the
@@ -194,6 +198,82 @@ The saving is the sensor (~0.6 mA to zero) and the CPU (a 400 Hz loop to sleepin
 sleep that changed nothing but the reporting flag. The radio is unchanged: it still answers every 7.5 ms
 event, which is the floor this design accepts.
 
+## Battery reporting
+
+The host's own Bluetooth page shows the pack, with no app on either side, because the sketch reports the
+**standard Battery Service** — service `0x180F`, characteristic `0x2A19` (Battery Level, one byte, 0–100 %,
+Read + Notify + CCCD). Nothing custom is involved, and there is nothing to add to the GATT table: this core
+builds `0x180F`/`0x2A19` into the radio's database at fixed handles and answers a read from it even while
+the sketch's loop is parked asleep. `BLEDis`/`BLEBas` are already carried for advertising shape reasons;
+`BLEBas` is what writes the value.
+
+Advertising the service is **load-bearing on Android**, not decoration: AOSP's BAS client
+(`com.android.bluetooth.bas.BatteryService`) only connects to a bonded LE device whose advertised UUIDs
+contain the Battery Service, then connects GATT opportunistically over the existing HID link, **reads**
+`0x2A19`, and subscribes to the CCCD to follow later changes. That read becomes
+`BluetoothDevice.getBatteryLevel()` and `ACTION_BATTERY_LEVEL_CHANGED`, which is what Settings renders.
+Two caveats worth knowing before blaming the sketch:
+
+- The whole client is gated by the `bluetooth.profile.bas.client.enabled` sysprop. It is `true` on
+  Pixel/near-AOSP builds and `false` on several OEM ones. **Samsung One UI is one of them**, and that was
+  measured rather than assumed: the same phone shows no battery in Settings for a commercial BLE keyboard
+  either, while Windows shows it for both, so the phone — not the accessory — is the variable. On those
+  builds the number exists in GATT and any app reads it (`nRF Connect`: connect → Battery Service →
+  `0x2A19`); the system UI simply never starts the client.
+- Pre-Android-13 has no such client at all.
+
+**Windows** takes the same route, and it is Microsoft's documented one for LE-only accessories: a paired
+device exposing BAS gets its percentage in **Settings → Bluetooth & devices**, plus a low-battery
+notification at ≤5 %. Microsoft asks for at least 11 steps of resolution (so 0/50/100 is not enough) and for
+a level that only *decreases* unless the pack is charging. Windows 11 24H2 additionally understands BAS 1.1
+(`0x2BED` Battery Level Status, accessory-initiated low/critical alerts and a charging state) — this core
+does not implement that characteristic, so only the plain percentage is available.
+
+**How it is measured here.** The read is the core's own `BoardControl::sampleBatteryMilliVolts()` — not
+hand-rolled ADC code — because that path is the one the core maintains for a board with a switched sense
+divider: it switches the divider on, settles, samples the SAADC at **12 bits** against the 1/4-gain
+reference, applies the board's **2:1** divider, and switches the divider off again. One count is therefore
+1.76 mV of pack, and the level is the **highest of `kBatSamples`** reads — load only ever pulls a cell's
+voltage down, so the highest sample is the one least corrupted by the radio's own bursts, and the one
+`kBatCurve` describes.
+
+Just as important is what it does *not* do. Under `NRF54L15_CLEAN_POWER_LOW` every `delay()` enters the
+core's low-power board state: the RF switch's supply is power-cycled and the IMU bus is put high-Z for the
+duration. The first version of this measurement used a 10 ms `delay()` as its settle plus eight `delay(1)`s
+as its samples — nine of those entries, and sixteen 10-bit `analogRead()` conversions, twice per session, on
+a live 7.5 ms link. That version made the pointer stutter; this one takes one entry and one conversion per
+sample, three in total.
+
+A reading below `kBatNoCellMv` means **no cell on the pad** (the divider reads a few millivolts), and is
+reported as 100 %, not 0 %: a red empty battery and a low-battery notification in front of someone running
+the board on USB would be worse than useless, and the part browns out around 3.3 V, so a pack the board can
+run from never reads that low. A *failed* read is not empty either: it keeps the last good level.
+
+**When it is published.** Once at boot (`write`, since there is no link yet) and once on every transition
+*into* sleep (`notify`). Sleep is the right edge to measure on: the queues have just been cleared, the level
+will not change again until the next wake, and the wake path has to reach the button poll as fast as possible
+because the click that woke the device is a real click. The measurement costs tens of milliseconds, which is
+invisible once per idle timeout and would be a stall if it ran per report or on wake.
+`notify()` stores the byte *before* it checks for a subscriber, so its `false` return only means nobody was
+listening — the value is still there for the next read — and the notification is queued behind anything
+already pending, then sent from the radio's own connection-event handler, so it goes out even though the loop
+parks immediately afterwards. A device that sits asleep for days keeps serving its last reading, which is
+what a reconnecting host sees.
+
+To check it: `bat= 4012mV 83%` in the periodic line is the last reading to compare against a meter, nRF
+Connect shows `0x2A19` directly, `bluetoothctl` reads it with `select-attribute /org/bluez/hci0/…` and
+`read`, and `adb shell dumpsys bluetooth_manager` shows whether the phone's BAS client is running for the
+device. Expect a few percent of jitter between reads — the pack sags under load and the curve is flat in the
+middle, so this is a voltmeter, not a fuel gauge.
+
+**If the pointer feels worse after enabling this.** Nothing in the pointer path changed — the measurement
+runs at boot and again as the device goes to sleep, and the report loop is still the same code — so the two
+numbers that explain a stutter are in the periodic line, not in this section. `loop_hz=` below the link's own
+rate means the *loop* is the limit; `ci_ms=` above 7.5 means the *host* picked a slower interval, and that is
+its decision (see [HID transport](#hid-transport) — reconnect, or forget and re-pair, to get the 7.5 ms
+request granted again). If `ci_ms` is back at 7.5 and `loop_hz` is still ~350, the battery path is not the
+cause, and `kBatteryReportEnabled = false` will prove it in one flash.
+
 ## 5-way switch
 
 A 5-way tactile switch sits alongside the onboard button: common leg to GND, one contact per direction,
@@ -205,9 +285,9 @@ rather than assumed:
 | --- | --- | --- |
 | up | D9 | wheel up — one detent, then repeats while held |
 | down | D0 | wheel down |
-| centre | D2 | left click, and wakes the device |
+| centre | D2 | middle click on a tap, **precision mode** on a 2 s hold |
 | right | D10 | host back button (`MOUSE_BUTTON_BACKWARD`) |
-| left | D1 | middle click on a tap, **precision mode** on a 2 s hold |
+| left | D1 | left click, and wakes the device |
 
 The five contacts are debounced as one switch (20 ms, the same window as the onboard button), because
 they settle together and a press is not news until the whole set has held still. They are **polled**,
@@ -223,7 +303,7 @@ scrolls nothing rather than picking one.
 
 **Precision mode** halves the pointer gain (`kPrecisionGainScale`), which is what makes fine aiming
 possible: an air pointer's weakness is not speed but the last few pixels, and half the gain halves the
-smallest motion that can land on one. It is a **toggle**, triggered by holding the left contact for
+smallest motion that can land on one. It is a **toggle**, triggered by holding the centre contact for
 `kPrecisionHoldMs` (2 s), and the board's otherwise-unused LED is lit while it is on — a mode with no
 feedback is a mode you cannot tell you are in.
 
@@ -262,7 +342,7 @@ parks near `1000 / tx_s + 2` instead.
 | `ptr_dps` | roll-compensated pointer rates, (horizontal, vertical), deg/s, after the deadzone — so `0.0` at rest is the confirmation that nothing is creeping |
 | `ptr_deg` | those rates integrated — pointer movement so far, wrapped to ±180° |
 | `state` | `awake` or `sleep`. `sleep` is the boot state and means no reports are being sent — see [Sleep and wake](#sleep-and-wake) |
-| `prec` | `on` or `off` — precision mode (half gain), toggled by a 2 s hold on the switch's left contact |
+| `prec` | `on` or `off` — precision mode (half gain), toggled by a 2 s hold on the switch's centre contact |
 | `idle_ms` | time since the last click or real movement while awake. Sleeps at `kSleepIdleTimeoutMs` |
 | `sleep_rate` | pointer speed, deg/s, that the sleep check compares against `kSleepMinRateDps`. Printed while awake only, so the threshold can be set from a real capture |
 | `read_err` | failed I2C transactions / attempted. Hidden until it is non-zero |
@@ -355,6 +435,29 @@ One caveat that matters for what `read_err` means: the retry path makes a *faile
 I2C has no checksum, so a burst corrupted *without* NACKing is accepted and lands in the output as a bad
 sample. That is why the error free rate is worth caring about beyond tidiness, and why 3.47 % is a much
 worse trade than it looks.
+
+### Silence is a fault too
+
+Every rule above watches for a sensor that *answers badly*. The failure that actually strands a device is
+the opposite: a part that still answers `WHO_AM_I` but has stopped producing samples — a lost configuration,
+a wedged bus, a part that browned out. No data-ready ever rises and no read error is logged, and the old
+recovery could not help either way:
+
+- with the address still valid, discovery never ran, so nothing re-initialised the part;
+- once discovery *did* fail, it never called `imuBusRecover()` and blocked the loop for a second per attempt.
+
+Both states are permanent until the battery is pulled, and clicks keep working throughout because they never
+touch the sensor — a dead pointer with a live mouse. The sketch now walks a ladder instead:
+
+| Rung | When | Log line |
+| --- | --- | --- |
+| Reconfigure in place | no sample for `kImuStallTimeoutMs` (250 ms ≈ 100 missed samples) | `imu=stalled <ms> ms, reconfiguring (n)` |
+| Drop to discovery | after `kImuStallReconfigLimit` failed reconfigures | `imu=stalled, dropping to discovery` |
+| Reset the bus | every `kImuRecoverEveryTries` discovery misses — a slave holding SDA low needs clocks before anything can answer it | `imu=bus recovery (still not found)` |
+| Power-cycle the part | every `kImuPowerCycleEveryTries` misses — nothing else cycles the rail outside a sleep/wake, so a part wedged mid-session stays wedged | `imu=power cycle` |
+
+Discovery is rate limited (`kImuRetryMs`) rather than blocking, so the loop keeps running the whole time and
+a dead sensor no longer makes the clicks sluggish as well. The gyro bias is still never re-measured.
 
 ## Gyro zero and creep
 
@@ -606,14 +709,21 @@ compositor) adds a frame or two on top. A gyro air pointer will not feel like a 
 | `kScrollFirstRepeatMs` | 400 | Delay before a held up/down starts repeating, so a deliberate single step stays a single step |
 | `kScrollRepeatMs` | 80 | Repeat period while held — ~12 detents/s. `0` disables the repeat |
 | `kPendingWheelCap` | 8 | Ceiling on unreported detents, so a stalled link cannot dump a burst of scroll after the hand stops |
-| `kPrecisionHoldMs` | 2000 | How long the left contact must be held to toggle precision mode. Below the tap/hold boundary the release is a middle click |
+| `kPrecisionHoldMs` | 2000 | How long the centre contact must be held to toggle precision mode. Below the tap/hold boundary the release is a middle click |
 | `kPrecisionGainScale` | 0.5 | Gain multiplier while precision mode is on. `1.0f` makes the mode a no-op |
 | `kPrecisionLedEnabled` | true | Light the onboard LED while precision mode is on |
 | `kSleepIdleTimeoutMs` | 60000 | How long after the last click or real movement before the device goes back to sleep. See [Sleep and wake](#sleep-and-wake) |
 | `kSleepMinRateDps` | 10.0 | Pointer rate, in deg/s, that counts as real movement and keeps the device awake — same unit as `ptr_dps`. `0.0f` = clicks only |
 | `kSleepImuPowerDown` | true | Cut the sensor rail (`IMU_MIC_EN`) while asleep, not just its ODRs. Costs a ~20 ms rail settle on wake |
+| `kBatSettleUs` | 5000 | Load switch turn-on plus divider RC before the battery sample. See [Battery reporting](#battery-reporting) |
+| `kBatSamples` | 3 | Reads taken per measurement; the highest is used, because load only pulls a cell down |
+| `kBatNoCellMv` | 500 | Below this the battery pad is empty and the level is reported as 100 %, so a USB-powered board does not show an empty battery |
+| `kBatteryReportEnabled` | true | `false` makes the whole feature a no-op (level stays at the old placeholder) — the A/B switch for a performance complaint, not a tuning knob |
 | `kSerialLogEnabled` | true | Master switch for every print, including the periodic line — set to `false` for battery measurement. See [Serial output](#serial-output) |
-| `kImuI2cClockHz` | 400000 | IMU bus clock, at the part's ceiling. Slower is measurably *worse* here — see [I2C reliability](#i2c-reliability) |
+| `kImuI2cClockHz` | 400000 | IMU bus clock, at the part's ceiling. Slower is measurably *worse* here - see [I2C reliability](#i2c-reliability) |
+| `kImuStallTimeoutMs` / `kImuStallReconfigLimit` | 250 / 3 | Silence before the sensor counts as stalled, and reconfigures tried before dropping to discovery. See [Silence is a fault too](#silence-is-a-fault-too) |
+| `kImuRetryMs` | 1000 | Retry pacing while the sensor is missing. Non-blocking, so the loop (and clicks) keep running |
+| `kImuRecoverEveryTries` / `kImuPowerCycleEveryTries` | 3 / 6 | Discovery misses before the bus is clocked out, and before the part's supply is cycled |
 | `kLinkPollMs` / `kConnPollMs` | 50 / 100 | How often the cached link state and the connection interval are re-read. Both are polled rather than checked per pass, because each query services the whole stack |
 
 `kHidCountsPerDeg` is bounded from above by the report format, not by feel. One report carries at most
@@ -732,6 +842,14 @@ rolls.
 - A gyro cannot separate a small bias from a very slow rotation. Motion below roughly 1 °/s is therefore
   partly absorbed by the bias tracker and the deadzone. That is the sensor's precision floor, not a
   tuning failure: getting below it needs a different sensor, not a different constant.
+- The reported battery percentage is a voltmeter, not a fuel gauge: the pack sags under the link's load,
+  the LiPo curve is flat around 3.8 V, and one 12-bit count is 1.8 mV of pack, so a few percent of jitter
+  between reads is the floor. The level is not forced to be decrease-only the way Microsoft recommends,
+  because a board on USB genuinely rises while it charges and this samples too rarely to tell ripple from
+  charging. Charging state and BAS 1.1 are not reported at all.
+- Whether the phone's own settings page shows the battery is a vendor decision: AOSP's BAS client is gated
+  by `bluetooth.profile.bas.client.enabled`, off on several OEM builds. The service and the value are
+  there regardless — see [Battery reporting](#battery-reporting).
 
 ## Next steps
 

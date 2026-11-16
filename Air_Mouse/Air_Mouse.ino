@@ -10,9 +10,9 @@
  * compensation keeps the pointer axes on screen when the device is banked.
  *
  * A 5-way switch (common leg to GND) sits alongside the onboard button: up/down
- * turn the wheel, centre is left click, right is the host's back button, and left
+ * turn the wheel, left is left click, right is the host's back button, and centre
  * is a middle click on a tap or precision mode after a 2 s hold. The onboard
- * button and the centre contact both left-click and both wake the device: it
+ * button and the left contact both left-click and both wake the device: it
  * boots asleep, reports nothing, and stays awake while the pointer keeps being
  * used, going quiet again after a minute without a click or real movement.
  * Asleep is also the low-power state: the IMU's rail is cut, the LED is blanked and
@@ -22,8 +22,10 @@
  * it is a one-way trip on Android.
  *
  * Hold the board still at power-up: it measures the gyro bias first, then pair with
- * "Air Mouse" from the host's Bluetooth settings. Wiring, diagnostics, tuning and
- * the reasoning behind all of it: README.md.
+ * "Air Mouse" from the host's Bluetooth settings. The pack is measured from the
+ * board's gated divider and reported through the standard Bluetooth Battery Service,
+ * so the host's own settings page shows it without an app. Wiring, diagnostics,
+ * tuning and the reasoning behind all of it: README.md.
  */
 
 #include <Arduino.h>
@@ -35,6 +37,9 @@
 // report gets aligned with the connection event. bluefruit.h only forward
 // declares the radio, so the definition has to be pulled in explicitly.
 #include <nrf54l15_hal.h>
+
+// The board-control HAL, for its own gated battery read (see batteryReadMv).
+using xiao_nrf54l15::BoardControl;
 
 // ---------------------------------------------------------------------------
 // Serial log
@@ -120,8 +125,8 @@ enum NavIndex : uint8_t {
   kNavDown,
   kNavCount
 };
-static const uint8_t kNavPins[kNavCount] = {PIN_D1, PIN_D10, PIN_D2, PIN_D9, PIN_D0};
-static const char* const kNavNames[kNavCount] = {"left", "right", "centre", "up", "down"};
+static const uint8_t kNavPins[kNavCount] = {PIN_D2, PIN_D10, PIN_D1, PIN_D9, PIN_D0};
+static const char* const kNavNames[kNavCount] = {"centre", "right", "left", "up", "down"};
 
 // LSM6DS3TR-C register map (only the registers this sketch touches).
 static const uint8_t kRegWhoAmI  = 0x0F;  // WHO_AM_I, expected 0x6A
@@ -177,6 +182,24 @@ static const uint32_t kImuRetryBudgetUs = 3000;
 // re-measured: it describes the part, and that would need the board held still.
 static const uint16_t kImuConsecFaultLimit = 32;
 static const uint8_t  kImuRecoverLimit     = 8;
+
+// Silence is a fault too, and it is the one the error counters cannot see: a part that
+// still answers WHO_AM_I but has stopped producing samples -- a lost configuration, a
+// wedged bus, a part that browned out -- raises no data-ready and logs no read error.
+// Without a watchdog that state is permanent: the address stays valid, so nothing ever
+// re-runs discovery, and the pointer stays dead until the battery is pulled. 250 ms is
+// ~100 missed samples at 416 Hz, so it cannot fire on a good part.
+static const uint32_t kImuStallTimeoutMs     = 250;
+static const uint8_t  kImuStallReconfigLimit = 3;  // reconfigures before discovery
+
+// Retry pacing for the "not found" state, and the escalation ladder under it: reset the
+// bus every kImuRecoverEveryTries misses (a slave holding SDA low needs clocks, and
+// nothing can answer it before that), and cycle the part's supply every
+// kImuPowerCycleEveryTries. Blocking here -- it used to be delay(1000) -- stalls the
+// whole loop once a second, clicks included, and leaves no room for either recovery.
+static const uint32_t kImuRetryMs              = 1000;
+static const uint8_t  kImuRecoverEveryTries    = 3;
+static const uint8_t  kImuPowerCycleEveryTries = 6;
 
 // ---------------------------------------------------------------------------
 // Axis mapping - measured on this board
@@ -363,7 +386,7 @@ static const int8_t   kScrollUp            = 1;    // HID wheel: positive scroll
 static const int8_t   kScrollDown          = -1;
 static const int8_t   kPendingWheelCap     = 8;    // detents, so a stalled link cannot dump a burst
 
-// Left contact, which has two jobs and therefore has to be timed: a tap is a
+// Centre contact, which has two jobs and therefore has to be timed: a tap is a
 // middle click, a hold toggles precision mode. The click is emitted on release,
 // because only then is the press known not to be a hold; the toggle fires the
 // moment the hold is reached, so the release that follows does nothing.
@@ -394,6 +417,59 @@ static const bool     kHidIdleReportEnabled = false;
 static const uint32_t kHidIdleReportMs      = 100;
 
 // ---------------------------------------------------------------------------
+// Battery reporting
+// ---------------------------------------------------------------------------
+
+// The host shows this in its own Bluetooth UI because it is the standard Battery
+// Service -- 0x180F with the Battery Level characteristic 0x2A19 -- and not anything
+// custom. The core already carries that service in its GATT table and
+// hidStartAdvertising already advertises it, and the value byte is answered straight
+// from the radio, loop running or not: the only thing left to this sketch is to keep
+// that byte right. Rationale and what each host does with it: README, "Battery
+// reporting".
+
+// Set false to make battery reporting a no-op: the level stays at the placeholder it
+// used to be, nothing is measured and nothing is notified. It exists so this feature
+// can be ruled in or out of a performance complaint with one edit -- it is not a
+// tuning knob.
+static const bool kBatteryReportEnabled = true;
+
+// The read is the core's BoardControl::sampleBatteryMilliVolts, not a hand-rolled ADC
+// path: it switches the divider's load switch on, waits, samples the SAADC at 12 bits
+// against the 1/4-gain reference, applies the board's 2:1 divider and switches the
+// divider off again. That matters on a live link. Under NRF54L15_CLEAN_POWER_LOW every
+// delay() enters the core's low-power board state, which power-cycles the RF switch's
+// supply and puts the IMU bus high-Z; the first version of this measurement used a
+// 10 ms delay() as its settle plus eight delay(1)s as its samples -- nine of those
+// entries, and sixteen 10-bit analogRead conversions, twice per session. This does one
+// entry per sample and one 12-bit conversion per entry. The only choices left are the
+// settle and how many samples to take.
+static const uint32_t kBatSettleUs = 5000;  // load switch turn-on plus divider RC
+static const uint8_t  kBatSamples  = 3;     // the link only ever pulls the reading down
+
+// An unpopulated battery pad reads the bottom of the divider range, a few millivolts.
+// A cell the board can run from never reads this low, even a flat one -- the part
+// browns out around 3.3 V -- so this threshold is unambiguous, and "no cell" must not
+// be reported as 0 %: that would put a low-battery notification in front of someone
+// running the board on USB.
+static const uint16_t kBatNoCellMv = 500;
+
+// Single-cell LiPo, resting voltage against state of charge, the usual 0.2 C
+// discharge curve. Not linear, and its middle is flat -- around 3.8 V a whole
+// percentage point is worth only a few millivolts -- so a number derived from a
+// voltmeter is coarse by nature. Measured under the link's load, which is why the
+// host's number sits a little under the resting curve.
+struct BatCurvePoint {
+  uint16_t mv;
+  uint8_t  percent;
+};
+static const BatCurvePoint kBatCurve[] = {
+    {4200, 100}, {4100, 92}, {3980, 80}, {3920, 70}, {3870, 60},
+    {3820, 50},  {3790, 40}, {3770, 30}, {3740, 20}, {3680, 10},
+    {3550, 4},   {3300, 0},
+};
+
+// ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
@@ -409,6 +485,13 @@ static uint32_t g_imuReads        = 0;  // transactions attempted
 static uint32_t g_imuReadErrors   = 0;  // transactions that failed every retry
 static uint16_t g_imuConsecErrors = 0;  // consecutive failures, cleared by a success
 static uint8_t  g_imuRecoveries   = 0;  // failed bus resets since the last clean reply
+
+// Silence and retry bookkeeping (see imuTask): when a sample last arrived, how many
+// reconfigures have been tried without one, and how far the discovery ladder has got.
+static uint32_t g_imuLastSampleMs   = 0;
+static uint8_t  g_imuStallReconfigs = 0;
+static uint32_t g_imuRetryMs        = 0;
+static uint8_t  g_imuNotFoundTries  = 0;
 
 static uint32_t g_lastSampleUs = 0;
 static uint32_t g_lastPrintMs  = 0;
@@ -435,7 +518,10 @@ static bool  g_stillDirValid = false;
 // ---------------------------------------------------------------------------
 
 // BLEDis and BLEBas are carried because the core's own HID example advertises
-// HIDS alongside them, and strict Android hosts compare against that shape.
+// HIDS alongside them, and strict Android hosts compare against that shape. BLEBas
+// is not just decoration: it is the handle for the battery level the host shows, and
+// advertising it (see hidStartAdvertising) is what makes a stock Android connect to
+// it at all.
 BLEDis       bledis;
 BLEBas       blebas;
 BLEHidAdafruit blehid;
@@ -515,7 +601,7 @@ static uint8_t  g_navCandidate   = 0;  // raw level being timed
 static uint8_t  g_navDown        = 0;  // debounced
 static uint32_t g_navCandidateMs = 0;
 
-// Left contact: held-timer, whether the hold has already toggled the mode, and
+// Centre contact: held-timer, whether the hold has already toggled the mode, and
 // the middle click the release may still owe.
 static bool     g_leftHeld       = false;
 static uint32_t g_leftPressMs    = 0;
@@ -534,7 +620,15 @@ static int8_t   g_pendingWheel   = 0;
 static bool     g_awake          = false;
 static uint32_t g_lastActivityMs = 0;  // last click or deliberate move
 
-// Set by the wake interrupt -- the onboard button or the switch's centre contact -- and
+// Last battery reading and what the host was told. The log prints these rather than
+// re-reading the pack: a measurement costs tens of milliseconds, and the periodic
+// line runs at 10 Hz. Known is separate from the values because zero is a valid
+// reading on a board with no cell on the pad.
+static bool     g_batteryKnown   = false;
+static uint16_t g_batteryMv      = 0;
+static uint8_t  g_batteryPercent = 0;
+
+// Set by the wake interrupt -- the onboard button or the switch's left contact -- and
 // consumed by the asleep wait in loop(). volatile because the ISR writes it; it is one
 // byte, so no critical section is needed around the flag itself.
 static volatile bool g_wakeEdge = false;
@@ -592,6 +686,80 @@ static void hidLedWrite(bool on) {
     return;
   }
   digitalWrite(PIN_LED_BUILTIN, on ? LED_STATE_ON : !LED_STATE_ON);
+}
+
+// ---------------------------------------------------------------------------
+// Battery measurement
+// ---------------------------------------------------------------------------
+
+// The pack, in millivolts, or 0 if the read failed. Load only ever pulls the reading
+// down, so the highest of a few samples is the one least corrupted by the radio's own
+// bursts -- and therefore the one the resting-voltage curve describes.
+static uint16_t batteryReadMv() {
+  int32_t best = 0;
+  for (uint8_t i = 0; i < kBatSamples; ++i) {
+    int32_t mv = 0;
+    if (BoardControl::sampleBatteryMilliVolts(&mv, kBatSettleUs) && mv > best) {
+      best = mv;
+    }
+  }
+  return (best > 0 && best < 10000) ? static_cast<uint16_t>(best) : 0U;
+}
+
+// Linear interpolation over kBatCurve, with the ends held: above the top point the
+// pack is being charged, below the bottom one the board could not run from it.
+static uint8_t batteryPercentForMv(uint16_t mv) {
+  const size_t last = sizeof(kBatCurve) / sizeof(kBatCurve[0]) - 1;
+
+  if (mv >= kBatCurve[0].mv) {
+    return kBatCurve[0].percent;
+  }
+  if (mv <= kBatCurve[last].mv) {
+    return kBatCurve[last].percent;
+  }
+
+  for (size_t i = 0; i < last; ++i) {
+    const uint16_t hiMv = kBatCurve[i].mv;      // higher voltage
+    const uint16_t loMv = kBatCurve[i + 1].mv;
+    if (mv <= hiMv && mv >= loMv) {
+      const float pos = static_cast<float>(mv - loMv) /
+                        static_cast<float>(hiMv - loMv);
+      const float hiPct = static_cast<float>(kBatCurve[i].percent);
+      const float loPct = static_cast<float>(kBatCurve[i + 1].percent);
+      return static_cast<uint8_t>(loPct + pos * (hiPct - loPct) + 0.5f);
+    }
+  }
+  return kBatCurve[last].percent;
+}
+
+// Measures the pack and hands the level to the radio. push = notify, which is what a
+// host that has subscribed wants; notify() stores the byte before it checks for a
+// subscriber, so its false return only means "nobody listening", never that the value
+// was lost. The notification itself is deferred behind anything already queued, so it
+// cannot delay a report on the 7.5 ms link.
+static void hidPublishBattery(bool push) {
+  if (!kBatteryReportEnabled) {
+    if (!push) {
+      blebas.write(100);  // the placeholder this replaced, for the switched-off case
+    }
+    return;
+  }
+
+  const uint16_t mv = batteryReadMv();
+  if (mv == 0) {
+    return;  // a failed read is not "empty": keep the last good level
+  }
+
+  g_batteryMv = mv;
+  g_batteryPercent =
+      (g_batteryMv < kBatNoCellMv) ? 100 : batteryPercentForMv(g_batteryMv);
+  g_batteryKnown = true;
+
+  if (push) {
+    blebas.notify(g_batteryPercent);
+  } else {
+    blebas.write(g_batteryPercent);  // boot: no link yet, so there is nothing to notify
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -830,6 +998,17 @@ static void imuResume() {
   g_imuAddress = 0;
   g_filtersPrimed = false;
   g_lastSampleUs = micros();
+}
+
+// Last resort for a part that has stopped answering: give it its supply back. Nothing
+// else cycles the rail outside a sleep/wake, so a sensor that wedges mid-session stays
+// wedged until the idle timeout expires. Same 20 ms settle the wake path uses, paid only
+// after discovery has already failed for several seconds.
+static void imuPowerCycle() {
+  digitalWrite(IMU_MIC_EN, LOW);
+  delay(50);  // let the rail actually collapse rather than sag
+  imuPowerRailOn();
+  g_imuAddress = 0;
 }
 
 // Recovery, and only recovery. Called once the failures stop looking like
@@ -1171,6 +1350,16 @@ static void printState() {
   Serial.print(g_awake ? "awake" : "sleep");
   Serial.print(" prec= ");
   Serial.print(g_precision ? "on" : "off");
+  // Last measured pack voltage and the level published to the host. Printed, not
+  // re-measured: this is the number to compare against a meter when checking the
+  // divider arithmetic, and it costs nothing here.
+  if (g_batteryKnown) {
+    Serial.print(" bat= ");
+    Serial.print(g_batteryMv);
+    Serial.print("mV ");
+    Serial.print(g_batteryPercent);
+    Serial.print('%');
+  }
   if (g_awake) {
     Serial.print(" idle_ms= ");
     Serial.print(millis() - g_lastActivityMs);
@@ -1339,7 +1528,10 @@ static void hidBegin() {
   bledis.setModel("XIAO nRF54L15");
   bledis.begin();
   blebas.begin();
-  blebas.write(100);
+  // Boot value for the Battery Service, measured rather than assumed. The host reads
+  // it after pairing, so this is the number it starts from; hidSetAwake refreshes and
+  // pushes it again on the way into sleep. See "Battery reporting" in the README.
+  hidPublishBattery(false);
 
   // Compact Zephyr-style HID report, which is the shape Android and Sony HID
   // hosts compare against. It is 3 bytes -- buttons masked to three bits, no
@@ -1367,7 +1559,7 @@ static void hidBegin() {
 
   // Stated at boot because it is the one behaviour that looks like a fault: the
   // pointer does nothing until the primary button has been clicked.
-  Serial.println("hid=sleep on boot, click the button or the switch centre to wake");
+  Serial.println("hid=sleep on boot, click the button or the switch left to wake");
 }
 
 // Refreshes the cached link answer. Every query below starts by running the stack
@@ -1454,7 +1646,7 @@ static uint8_t navReadMask() {
   return mask;
 }
 
-// The onboard button and the centre contact are the same thing to the host, and
+// The onboard button and the left contact are the same thing to the host, and
 // either one wakes the device -- the switch's other directions are not allowed
 // to, so a hand brushing the case cannot bring it out of sleep.
 static bool hidPrimaryDown() {
@@ -1508,7 +1700,7 @@ static void navPollScroll(uint32_t nowMs) {
   g_scrollNextMs = nowMs + kScrollRepeatMs;
 }
 
-// The left contact's second job, and the reason it is timed at all: once the
+// The centre contact's second job, and the reason it is timed at all: once the
 // press is old enough it stops being a click and becomes a mode toggle. Firing
 // on the way *into* the hold rather than on release is what makes the toggle
 // feel immediate and lets the release be silent.
@@ -1568,7 +1760,7 @@ static void navPoll(uint32_t nowMs) {
     Serial.println(now ? " down" : " up");
   }
 
-  // Left: the press arms the hold timer, the release decides what it was.
+  // Centre: the press arms the hold timer, the release decides what it was.
   if (navDown(kNavLeft) && (previous & (1U << kNavLeft)) == 0U) {
     g_leftHeld     = true;
     g_leftPressMs  = nowMs;
@@ -1593,9 +1785,10 @@ static void navTask(uint32_t nowMs) {
   navPollScroll(nowMs);
 }
 
-// The button bits the switch is asking for right now. Centre is a plain left
-// click; right is the host's back button, which is why the report is no longer
-// the compact Zephyr one -- see hidBegin.
+// The button bits the switch is asking for right now. The kNavCenter slot is the
+// switch's left direction (see kNavPins): a plain left click. Right is the host's
+// back button, which is why the report is no longer the compact Zephyr one -- see
+// hidBegin.
 static uint8_t navButtonBits() {
   uint8_t bits = 0;
   if (navDown(kNavCenter)) {
@@ -1611,10 +1804,10 @@ static uint8_t navButtonBits() {
 }
 
 // The two contacts that mean "left click" are the only wake sources: the onboard button
-// (P1.13) and the switch's centre contact (D2, P1.06). Both are port 1, so both can take
-// an interrupt -- the other three directions are port 2, which this core cannot attach
-// (digitalPinToInterrupt returns NOT_AN_INTERRUPT) and which must not wake the device
-// anyway.
+// (P1.13) and the switch's left contact (D1, P1.05). Both are port 1, so both can take
+// an interrupt. The switch's other directions deliberately do not wake it, and the two
+// that are D9/D10 are port 2, which this core cannot attach to anyway
+// (digitalPinToInterrupt returns NOT_AN_INTERRUPT).
 //
 // CHANGE, not FALLING: the wake itself is not debounced -- a raw edge is enough -- and
 // the normal poll path decides whether it was really a click as soon as the loop runs.
@@ -1656,6 +1849,14 @@ static void hidSetAwake(bool awake) {
   g_pendingWheel = 0;
   g_middlePulses = 0;
   g_hidLastButtons = 0;
+
+  // Battery goes last, and on this side of the transition rather than on wake. The
+  // measurement costs tens of milliseconds, and the wake path has to reach the button
+  // poll as fast as possible: the click that woke the device is a real click, and the
+  // poll is what turns it into a report. Here nothing is pending -- the queues were just
+  // cleared -- and going quiet is the last moment the level will change before the next
+  // wake. The notification is queued, so the radio still sends it while the loop parks.
+  hidPublishBattery(true);
 }
 
 // Wake on a click, sleep after kSleepIdleTimeoutMs without one. Runs before the
@@ -2050,27 +2251,81 @@ static void announceSensor() {
 }
 
 static void imuTask() {
+  const uint32_t nowMs = millis();
+
   // Recover from a missing or wedged sensor without needing a reset.
   if (g_imuAddress == 0) {
+    // Rate limited rather than blocking. This used to end in delay(1000), which stopped
+    // the whole loop -- clicks included -- once per attempt, and it never ran the bus
+    // recovery: once discovery started failing, a wedged bus could never be freed, so
+    // the pointer stayed dead for good even though the recovery routine existed.
+    if (nowMs - g_imuRetryMs < kImuRetryMs) {
+      delay(1);  // yield to the radio rather than spin on a sensor that is not there
+      return;
+    }
+    g_imuRetryMs = nowMs;
+
+    // Escalation, cheapest first: clocks for a bus that a slave is holding down, then
+    // the part's supply for one that has stopped answering altogether.
+    if (g_imuNotFoundTries < 255U) {
+      ++g_imuNotFoundTries;
+    }
+    if ((g_imuNotFoundTries % kImuPowerCycleEveryTries) == 0U) {
+      Serial.println("imu=power cycle");
+      imuPowerCycle();
+    } else if ((g_imuNotFoundTries % kImuRecoverEveryTries) == 0U) {
+      Serial.println("imu=bus recovery (still not found)");
+      imuBusRecover();
+    }
+
     if (imuFind() && imuConfigure()) {
+      g_imuNotFoundTries  = 0;
+      g_imuStallReconfigs = 0;
       announceSensor();
       if (!g_biasValid) {
-        calibrateGyroBias();
+        calibrateGyroBias();  // blocks for up to ~2 s: stamp the watchdog after it
       }
-      g_lastSampleUs = micros();
-      g_lastPrintMs  = millis();
-      g_filtersPrimed = false;
+      g_lastSampleUs    = micros();
+      g_lastPrintMs     = nowMs;
+      g_imuLastSampleMs = millis();
+      g_filtersPrimed   = false;
     } else {
       g_imuAddress = 0;
       // Rate-limited: a sensor that is truly absent should say so once in a
       // while rather than every second forever.
-      static uint8_t notFoundTries = 0;
-      if ((notFoundTries++ % 5) == 0) {
+      static uint8_t logTries = 0;
+      if ((logTries++ % 5) == 0) {
         Serial.println("imu=not-found, retrying");
       }
-      delay(1000);
-      return;
     }
+    return;
+  }
+
+  // The part answers on the bus but has stopped producing samples: a configuration that
+  // was lost without an error to report. Reconfigure first -- that is the cheap
+  // explanation and the common one -- and only after a few failures assume the part is
+  // gone and go back to discovery, which escalates from there.
+  if (nowMs - g_imuLastSampleMs >= kImuStallTimeoutMs) {
+    if (g_imuStallReconfigs < kImuStallReconfigLimit) {
+      ++g_imuStallReconfigs;
+      Serial.print("imu=stalled ");
+      Serial.print(nowMs - g_imuLastSampleMs);
+      Serial.print(" ms, reconfiguring (");
+      Serial.print(g_imuStallReconfigs);
+      Serial.println(')');
+      if (imuConfigure()) {
+        g_imuLastSampleMs = nowMs;
+        g_lastSampleUs    = micros();
+        g_filtersPrimed   = false;
+      }
+    } else {
+      Serial.println("imu=stalled, dropping to discovery");
+      g_imuStallReconfigs = 0;
+      g_imuAddress        = 0;
+      g_imuRetryMs        = nowMs - kImuRetryMs;  // retry on the next pass
+      g_imuNotFoundTries  = 0;                    // start the ladder at the bus reset
+    }
+    return;
   }
 
   if (!imuDataReady()) {
@@ -2090,6 +2345,9 @@ static void imuTask() {
     return;
   }
 
+  g_imuLastSampleMs   = nowMs;
+  g_imuStallReconfigs = 0;
+
   // dt is measured, not assumed, so the integration stays correct even when
   // the loop is delayed by a long serial write.
   const uint32_t nowUs = micros();
@@ -2102,7 +2360,6 @@ static void imuTask() {
 
   updateMotion(gyroRaw, accelRaw, dtSec);
 
-  const uint32_t nowMs = millis();
   // Gated on the switch, not just the interval: printState ends with two stack-servicing
   // link queries, and there is no point paying for those ten times a second when nobody
   // is reading the line.
@@ -2124,6 +2381,11 @@ void setup() {
   Serial.println("Air_Mouse - BLE HID air mouse");
   Serial.println("bus=Wire1 (SDA=D12, SCL=D11)  target=LSM6DS3TR-C @ 0x6A/0x6B");
 
+  // The battery divider's load switch is off except while a reading is being taken,
+  // and its enable pin must not be left floating through the slow startup below.
+  pinMode(VBAT_EN, OUTPUT);
+  digitalWrite(VBAT_EN, LOW);
+
   imuPowerRailOn();
   imuBus.begin();
   imuBus.setClock(kImuI2cClockHz);
@@ -2144,6 +2406,8 @@ void setup() {
 
   g_lastSampleUs = micros();
   g_lastPrintMs  = millis();
+  // Start the silence watchdog from here: the part is configured now, so a sample is due.
+  g_imuLastSampleMs = g_lastPrintMs;
 
   // BLE starts last so the calibration instructions are on screen before the
   // device becomes connectable.
